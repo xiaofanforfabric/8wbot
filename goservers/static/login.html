@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 — 8WBot</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@cap.js/widget"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg-start: #f5f0ff;
+      --bg-end: #e8e0f8;
+      --glass-bg: rgba(255, 255, 255, 0.60);
+      --glass-border: rgba(255, 255, 255, 0.75);
+      --glass-shadow: 0 8px 32px rgba(140, 120, 200, 0.12);
+      --text-primary: #2d2a3e;
+      --text-secondary: #7a7590;
+      --accent: #7c6ae6;
+      --accent-glow: rgba(124, 106, 230, 0.20);
+      --input-bg: rgba(255, 255, 255, 0.50);
+      --input-border: rgba(124, 106, 230, 0.12);
+      --radius: 16px;
+    }
+
+    html, body {
+      height: 100%;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: linear-gradient(150deg, var(--bg-start), var(--bg-end), #f0eaff, #faf5ff);
+      background-size: 400% 400%;
+      animation: bgShift 20s ease infinite;
+      color: var(--text-primary);
+      overflow: hidden;
+    }
+
+    @keyframes bgShift {
+      0%   { background-position: 0% 50%; }
+      50%  { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+
+    /* ── Orbs ── */
+    .bg-orbs {
+      position: fixed; inset: 0; z-index: 0;
+      overflow: hidden; pointer-events: none;
+    }
+    .bg-orbs span {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(100px);
+      opacity: 0.40;
+      animation: orbFloat 20s ease-in-out infinite alternate;
+    }
+    .bg-orbs .o1 { width: 480px; height: 480px; top: -12%; left: -10%; background: linear-gradient(135deg, #f9d8e0, #d4b8f0); }
+    .bg-orbs .o2 { width: 400px; height: 400px; bottom: -10%; right: -8%; background: linear-gradient(135deg, #c8e6f8, #e0c8f8); animation-delay: -7s; }
+    .bg-orbs .o3 { width: 300px; height: 300px; top: 50%; left: 60%; background: linear-gradient(135deg, #f0d8e8, #d8e8f8); animation-delay: -14s; opacity: 0.30; }
+
+    @keyframes orbFloat {
+      0%   { transform: translate(0, 0) scale(1); }
+      100% { transform: translate(50px, -30px) scale(1.10); }
+    }
+
+    /* ── Center card ── */
+    .login-wrap {
+      position: relative; z-index: 1;
+      height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      padding: 20px;
+    }
+
+    .login-card {
+      width: 100%; max-width: 420px;
+      padding: 48px 36px 40px;
+      background: var(--glass-bg);
+      backdrop-filter: blur(24px) saturate(1.6);
+      -webkit-backdrop-filter: blur(24px) saturate(1.6);
+      border: 1px solid var(--glass-border);
+      border-radius: 24px;
+      box-shadow: var(--glass-shadow);
+      text-align: center;
+    }
+
+    .login-card .logo {
+      font-size: 1.6rem; font-weight: 700;
+      margin-bottom: 4px;
+      background: linear-gradient(135deg, #4a3f7a, #7c6ae6, #e879b0);
+      background-size: 200% 200%;
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      animation: shimmerText 5s ease infinite;
+    }
+    @keyframes shimmerText {
+      0%   { background-position: 0% 50%; }
+      50%  { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+
+    .login-card .sub {
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+      margin-bottom: 32px;
+    }
+
+    /* ── Form ── */
+    .form-group {
+      text-align: left;
+      margin-bottom: 20px;
+    }
+    .form-group label {
+      display: block;
+      font-size: 0.82rem; font-weight: 500;
+      color: var(--text-secondary);
+      margin-bottom: 6px;
+    }
+    .form-group input {
+      width: 100%;
+      padding: 12px 16px;
+      border-radius: 12px;
+      border: 1.5px solid var(--input-border);
+      background: var(--input-bg);
+      font-size: 0.95rem;
+      font-family: inherit;
+      color: var(--text-primary);
+      outline: none;
+      transition: all 0.25s ease;
+    }
+    .form-group input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(124, 106, 230, 0.12);
+      background: rgba(255, 255, 255, 0.70);
+    }
+    .form-group input::placeholder {
+      color: #b0abc8;
+    }
+
+    /* ── cap.js widget container ── */
+    .cap-wrap {
+      display: flex;
+      justify-content: center;
+      margin: 24px 0;
+      min-height: 58px;
+    }
+
+    /* ── Error / Success ── */
+    .msg-box {
+      font-size: 0.85rem;
+      padding: 10px 14px;
+      border-radius: 12px;
+      margin-bottom: 16px;
+      display: none;
+    }
+    .msg-box.error {
+      display: block;
+      background: rgba(239, 68, 68, 0.08);
+      color: #dc2626;
+      border: 1px solid rgba(239, 68, 68, 0.15);
+    }
+    .msg-box.success {
+      display: block;
+      background: rgba(34, 197, 94, 0.08);
+      color: #16a34a;
+      border: 1px solid rgba(34, 197, 94, 0.15);
+    }
+
+    /* ── Submit button ── */
+    .btn-submit {
+      width: 100%;
+      padding: 14px;
+      border-radius: 12px;
+      border: none;
+      font-size: 0.95rem; font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      background: linear-gradient(135deg, #7c6ae6, #b080e0, #e879b0);
+      background-size: 300% 300%;
+      color: #fff;
+      transition: all 0.3s ease;
+      animation: shimmerBtn 5s ease infinite;
+      opacity: 0.7;
+      pointer-events: none;
+    }
+    .btn-submit.ready {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .btn-submit:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px rgba(124, 106, 230, 0.30);
+    }
+    .btn-submit:disabled {
+      opacity: 0.4;
+      pointer-events: none;
+    }
+    @keyframes shimmerBtn {
+      0%   { background-position: 0% 50%; }
+      50%  { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+
+    .login-card .back-link {
+      display: inline-block;
+      margin-top: 18px;
+      font-size: 0.82rem;
+      color: var(--text-secondary);
+      text-decoration: none;
+      transition: color 0.2s;
+    }
+    .login-card .back-link:hover {
+      color: var(--accent);
+    }
+
+    .login-divider {
+      display: flex; align-items: center; gap: 14px;
+      margin: 22px 0 18px;
+      color: var(--text-secondary);
+      font-size: 0.78rem;
+    }
+    .login-divider::before, .login-divider::after {
+      content: ''; flex: 1;
+      height: 1px;
+      background: rgba(124, 106, 230, 0.12);
+    }
+
+    .btn-qr {
+      width: 100%; padding: 13px;
+      border-radius: 12px; border: 1.5px solid rgba(124, 106, 230, 0.15);
+      font-size: 0.90rem; font-weight: 500; font-family: inherit;
+      cursor: pointer;
+      background: rgba(255,255,255,0.40);
+      color: var(--text-primary);
+      transition: all 0.25s ease;
+    }
+    .btn-qr:hover {
+      background: rgba(255,255,255,0.65);
+      border-color: var(--accent);
+      transform: translateY(-1px);
+    }
+
+    /* ── QR modal overlay ── */
+    .modal-overlay {
+      position: fixed; inset: 0; z-index: 100;
+      background: rgba(0,0,0,0.25);
+      backdrop-filter: blur(6px);
+      display: flex; align-items: center; justify-content: center;
+      padding: 20px;
+    }
+    .modal-card {
+      width: 100%; max-width: 400px;
+      padding: 36px 28px 32px;
+      background: var(--glass-bg);
+      backdrop-filter: blur(24px) saturate(1.6);
+      -webkit-backdrop-filter: blur(24px) saturate(1.6);
+      border: 1px solid var(--glass-border);
+      border-radius: 24px;
+      box-shadow: var(--glass-shadow);
+      text-align: center;
+    }
+    .modal-card h3 {
+      font-size: 1.1rem; font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .modal-card .hint {
+      font-size: 0.82rem;
+      color: var(--text-secondary);
+      margin-bottom: 18px;
+    }
+    .qr-canvas-wrap {
+      display: flex; justify-content: center;
+      margin: 16px 0;
+      min-height: 200px;
+    }
+    .qr-canvas-wrap canvas, .qr-canvas-wrap img {
+      border-radius: 12px;
+    }
+    .modal-status {
+      font-size: 0.88rem;
+      color: var(--text-secondary);
+      margin: 12px 0;
+    }
+    .modal-status.waiting {
+      color: var(--accent);
+    }
+    .modal-status.success {
+      color: #16a34a;
+    }
+    .modal-status.expired {
+      color: #dc2626;
+    }
+    .btn-close-modal {
+      margin-top: 14px;
+      padding: 8px 24px;
+      border-radius: 100px;
+      border: 1px solid rgba(124, 106, 230, 0.12);
+      background: rgba(255,255,255,0.40);
+      font-size: 0.85rem; font-family: inherit; cursor: pointer;
+      color: var(--text-secondary);
+      transition: all 0.2s;
+    }
+    .btn-close-modal:hover {
+      background: rgba(255,255,255,0.70);
+      color: var(--text-primary);
+    }
+  </style>
+</head>
+<body>
+  <div class="bg-orbs">
+    <span class="o1"></span>
+    <span class="o2"></span>
+    <span class="o3"></span>
+  </div>
+
+  <div id="app" class="login-wrap">
+    <div class="login-card">
+      <div class="logo">8WBot</div>
+      <div class="sub">邦国崛起 · 智能挂机平台</div>
+
+      <div v-if="msg.text" :class="['msg-box', msg.type]">{{ msg.text }}</div>
+
+      <div class="form-group">
+        <label for="uid">简欢通 UID</label>
+        <input id="uid" v-model="user_id" type="text" placeholder="输入你的简欢通用户ID" @input="msg.text=''">
+      </div>
+
+      <div class="form-group">
+        <label for="code">动态验证码</label>
+        <input id="code" v-model="verify_code" type="text" placeholder="从小程序获取的验证码" @input="msg.text=''">
+      </div>
+
+      <!-- cap.js human verification widget -->
+      <div class="cap-wrap">
+        <cap-widget
+          id="main-cap"
+          data-cap-api-endpoint="https://api.xiaofanshop.cn/10beabbe56/"
+        ></cap-widget>
+      </div>
+
+      <button
+        class="btn-submit"
+        :class="{ ready: captchaToken && user_id && verify_code }"
+        :disabled="loading"
+        @click="handleLogin"
+      >
+        {{ loading ? '验证中…' : '🔑 登录' }}
+      </button>
+
+      <div class="login-divider"><span>或</span></div>
+
+      <button class="btn-qr" @click="openQRModal">📱 二维码登录</button>
+
+      <a href="/" class="back-link">← 返回首页</a>
+    </div>
+
+    <!-- ── QR Login Modal ── -->
+    <div v-if="qrModal.show" class="modal-overlay" @click.self="closeQRModal">
+      <div class="modal-card">
+        <h3>📱 扫码登录</h3>
+        <p class="hint">使用简欢通小程序扫描下方二维码</p>
+
+        <!-- Step 1: cap.js in modal -->
+        <div v-if="qrModal.step === 'captcha'" class="cap-wrap">
+          <cap-widget
+            id="qr-cap"
+            data-cap-api-endpoint="https://api.xiaofanshop.cn/10beabbe56/"
+          ></cap-widget>
+          <p v-if="qrModal.capManual" style="font-size:0.78rem;color:var(--text-secondary);margin-top:8px">
+            验证已完成？<a href="#" @click.prevent="generateQR" style="color:var(--accent)">点击继续 →</a>
+          </p>
+        </div>
+
+        <!-- Step 2: show QR code -->
+        <div v-if="qrModal.step === 'qr'">
+          <div class="qr-canvas-wrap">
+            <img :src="qrModal.qrImgSrc" alt="QR Code" style="border-radius:12px;width:200px;height:200px">
+          </div>
+          <div :class="['modal-status', qrModal.status]">
+            <template v-if="qrModal.status === 'waiting'">⏳ 等待扫码验证… ({{ qrModal.countdown }}s)</template>
+            <template v-else-if="qrModal.status === 'success'">✅ 登录成功！</template>
+            <template v-else-if="qrModal.status === 'expired'">⏰ 二维码已过期，请重试</template>
+            <template v-else-if="qrModal.status === 'error'">❌ {{ qrModal.errMsg }}</template>
+          </div>
+        </div>
+
+        <button class="btn-close-modal" @click="closeQRModal">
+          {{ qrModal.step === 'success' ? '关闭' : '取消' }}
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const { createApp, ref, reactive, onMounted } = Vue;
+
+    createApp({
+      setup() {
+        const user_id = ref('');
+        const verify_code = ref('');
+        const captchaToken = ref('');
+        const loading = ref(false);
+        const msg = reactive({ text: '', type: '' });
+
+        // QR modal state
+        const qrModal = reactive({
+          show: false,
+          step: 'captcha',
+          capToken: '',
+          sessionToken: '',
+          qrImgSrc: '',
+          status: '',
+          countdown: 0,
+          errMsg: '',
+          capManual: false
+        });
+        let qrPollTimer = null;
+        let qrCountdownTimer = null;
+
+        function setAuthCookie(token) {
+          // Set cookie with 7 day expiry, path=/, sameSite=lax
+          const d = new Date();
+          d.setTime(d.getTime() + 7 * 24 * 60 * 60 * 1000);
+          document.cookie = '8wbot_token=' + encodeURIComponent(token) +
+            '; expires=' + d.toUTCString() +
+            '; path=/; SameSite=Lax';
+        }
+
+        // Intercept fetch globally to capture cap.js tokens from any widget
+        const origFetch = window.fetch;
+        window.fetch = async function(input, init) {
+          const url = typeof input === 'string' ? input : (input instanceof Request ? input.url : '');
+          const resp = await origFetch.call(window, input, init);
+          if (url.includes('/redeem')) {
+            const clone = resp.clone();
+            try {
+              const body = await clone.json();
+              const tok = body?.token || '';
+              if (tok) {
+                captchaToken.value = tok;
+                msg.text = '';
+              }
+            } catch (e) { /* ignore */ }
+          }
+          return resp;
+        };
+
+        // Also try native event listener as fallback
+        onMounted(() => {
+          const mainCap = document.getElementById('main-cap');
+          if (mainCap) {
+            mainCap.addEventListener('success', (e) => {
+              const tok = e.detail?.token || e.detail || '';
+              if (tok) { captchaToken.value = tok; msg.text = ''; }
+            });
+          }
+        });
+
+        async function generateQR() {
+          try {
+            const res = await fetch('/api/login?cap_token=' + encodeURIComponent(qrModal.capToken));
+            const data = await res.json();
+            if (!data.qr_coder) {
+              qrModal.errMsg = data.msg || '生成二维码失败';
+              qrModal.status = 'error';
+              return;
+            }
+            qrModal.sessionToken = data.session_token;
+            qrModal.qrImgSrc = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(data.qr_coder);
+            qrModal.step = 'qr';
+            qrModal.status = 'waiting';
+            qrModal.countdown = 120;
+
+            // Start countdown
+            if (qrCountdownTimer) clearInterval(qrCountdownTimer);
+            qrCountdownTimer = setInterval(() => {
+              qrModal.countdown--;
+              if (qrModal.countdown <= 0) {
+                clearInterval(qrCountdownTimer);
+                qrModal.status = 'expired';
+                stopQRPoll();
+              }
+            }, 1000);
+
+            startQRPoll();
+          } catch (e) {
+            qrModal.errMsg = e.message;
+            qrModal.status = 'error';
+          }
+        }
+
+        function startQRPoll() {
+          stopQRPoll();
+          qrPollTimer = setInterval(async () => {
+            if (qrModal.status !== 'waiting') return;
+            try {
+              const res = await fetch('/api/login?session_token=' + encodeURIComponent(qrModal.sessionToken));
+              const data = await res.json();
+              if (data.status === 'ok') {
+                qrModal.status = 'success';
+                stopQRPoll();
+                if (qrCountdownTimer) clearInterval(qrCountdownTimer);
+                localStorage.setItem('8wbot_token', data.access_token);
+                setAuthCookie(data.access_token);
+                setTimeout(() => { window.location.href = '/dashboard.html'; }, 1500);
+              } else if (data.status === 'expired') {
+                qrModal.status = 'expired';
+                stopQRPoll();
+              }
+            } catch (e) { /* ignore */ }
+          }, 5000);
+        }
+
+        function stopQRPoll() {
+          if (qrPollTimer) { clearInterval(qrPollTimer); qrPollTimer = null; }
+        }
+
+        function openQRModal() {
+          msg.text = '';
+          qrModal.show = true;
+          qrModal.step = 'captcha';
+          qrModal.capToken = '';
+          qrModal.sessionToken = '';
+          qrModal.qrImgSrc = '';
+          qrModal.status = '';
+          qrModal.countdown = 0;
+          qrModal.errMsg = '';
+          qrModal.capManual = false;
+
+          // If main form already has a cap token, use it directly
+          if (captchaToken.value) {
+            qrModal.capToken = captchaToken.value;
+            generateQR();
+            return;
+          }
+
+          // Otherwise intercept fetch to catch cap.js redeem token
+          const origFetch = window.fetch;
+          window.__origFetch = origFetch;
+          window.fetch = async function(input, init) {
+            const url = typeof input === 'string' ? input : (input instanceof Request ? input.url : '');
+            const resp = await origFetch.call(window, input, init);
+            if (url.includes('/redeem')) {
+              const clone = resp.clone();
+              try {
+                const body = await clone.json();
+                const tok = body?.token || '';
+                if (tok && !qrModal.capToken) {
+                  qrModal.capToken = tok;
+                  if (qrModal.step === 'captcha') generateQR();
+                }
+              } catch (e) { /* ignore */ }
+            }
+            return resp;
+          };
+
+          Vue.nextTick(() => {
+            setTimeout(() => {
+              if (!qrModal.capToken && qrModal.step === 'captcha') qrModal.capManual = true;
+            }, 6000);
+          });
+        }
+
+        function closeQRModal() {
+          qrModal.show = false;
+          stopQRPoll();
+          if (qrCountdownTimer) { clearInterval(qrCountdownTimer); qrCountdownTimer = null; }
+          // Restore original fetch
+          if (window.__origFetch) { window.fetch = window.__origFetch; window.__origFetch = null; }
+        }
+
+        async function handleLogin() {
+          if (!user_id.value || !verify_code.value || !captchaToken.value) return;
+          loading.value = true;
+          msg.text = '';
+          try {
+            const res = await fetch('/api/login', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                user_id: user_id.value,
+                verify_code: verify_code.value,
+                cap_token: captchaToken.value
+              })
+            });
+            const data = await res.json();
+            if (data.code === 200) {
+              msg.text = '✅ ' + (data.msg || '登录成功');
+              msg.type = 'success';
+              localStorage.setItem('8wbot_token', data.accesstoken);
+              localStorage.setItem('8wbot_user', JSON.stringify(data.user_info));
+              setAuthCookie(data.accesstoken);
+              setTimeout(() => { window.location.href = '/dashboard.html'; }, 1200);
+            } else {
+              msg.text = '❌ ' + (data.msg || '验证失败');
+              msg.type = 'error';
+              captchaToken.value = '';
+            }
+          } catch (e) {
+            msg.text = '❌ 网络错误: ' + e.message;
+            msg.type = 'error';
+          } finally {
+            loading.value = false;
+          }
+        }
+
+        return {
+          user_id, verify_code, captchaToken, loading, msg,
+          handleLogin,
+          qrModal, openQRModal, closeQRModal
+        };
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>

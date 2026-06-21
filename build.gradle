@@ -1,0 +1,68 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'com.xiaofan'
+version = '1.0-SNAPSHOT'
+
+repositories {
+    mavenCentral()
+    maven {
+        url = uri('https://jitpack.io')
+    }
+    // OpenCollab repositories (MCProtocolLib artifacts published here)
+    maven {
+        name = 'opencollab-main'
+        url = 'https://repo.opencollab.dev/main/'
+    }
+    maven {
+        name = 'opencollab-maven'
+        url = 'https://repo.opencollab.dev/maven'
+    }
+    // Additional common paths for OpenCollab-hosted releases
+    maven {
+        name = 'opencollab-releases'
+        url = 'https://repo.opencollab.dev/repository/maven-releases/'
+    }
+    maven {
+        name = 'opencollab-public'
+        url = 'https://repo.opencollab.dev/repository/maven-public/'
+    }
+    // snapshots (if you need snapshot builds)
+    maven {
+        name = 'opencollab-snapshots'
+        url = 'https://repo.opencollab.dev/maven-snapshots/'
+    }
+    maven {
+        name "opencollabRepositoryMavenReleases"
+        url "https://repo.opencollab.dev/maven-releases"
+    }
+}
+
+application {
+    // Use the fully-qualified main class so `./gradlew run` works
+    mainClass.set('com.xiaofan.Main')
+}
+
+dependencies {
+    testImplementation platform('org.junit:junit-bom:5.10.0')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+
+    // MCProtocolLib (GeyserMC) - using development snapshot from OpenCollab snapshots
+    implementation 'org.geysermc.mcprotocollib:protocol:1.21.4-SNAPSHOT'
+
+    // WebSocket server library (lightweight)
+    implementation 'org.java-websocket:Java-WebSocket:1.5.4'
+}
+
+test {
+    useJUnitPlatform()
+}
+
+// Use Java 17 toolchain because some deps (MCProtocolLib) target newer Java
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
