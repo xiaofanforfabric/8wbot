@@ -30,14 +30,26 @@ const (
 )
 
 type UserData struct {
-	JhtUID      string `json:"jht_uid"`
-	AccessToken string `json:"accesstoken"`
-	BotName     string `json:"bot_name"`
-	LevelID     int64  `json:"level_id"`
-	SimpassUID  int64  `json:"simpass_uid"`
-	CreateTime  string `json:"create_time"`
-	Level       int64  `json:"level"`
-	Risky       bool   `json:"risky"`
+	JhtUID        string `json:"jht_uid"`
+	AccessToken   string `json:"accesstoken"`
+	RemainingBotCreationQuantity int64  `json:"remaining_bot_creation_quantity"`
+	LevelID       int64  `json:"level_id"`
+	SimpassUID    int64  `json:"simpass_uid"`
+	CreateTime    string `json:"create_time"`
+	Level         int64  `json:"level"`
+	Risky         bool   `json:"risky"`
+	LastLoginTime string `json:"last_login_time"`
+	Status        string `json:"status"`       // "ok" or "ban"
+	StatusInfo    string `json:"status_info"`  // reason
+}
+
+// BotData represents a Minecraft bot bound to a user.
+type BotData struct {
+	Belong       string `json:"belong"`        // 简欢通UID
+	CreationTime string `json:"creation_time"` // 创建时间
+	Username     string `json:"username"`      // 游戏内用户名
+	DSL          bool   `json:"dsl"`           // 是否启用DSL脚本
+	Status       string `json:"status"`        // no / confirmed
 }
 
 func loadEnv(path string) map[string]string {
@@ -62,6 +74,8 @@ func loadEnv(path string) map[string]string {
 var jwtSecret []byte
 var devUUID string
 var capSecret string
+var capAPIEndpoint string
+var capSiteverifyURL string
 
 // OTP session store (in-memory)
 type otpSession struct {
@@ -76,6 +90,8 @@ type otpSession struct {
 }
 
 var otpSessions sync.Map
+var bannedUsers sync.Map // jht_uid -> true
+var globalDB *sql.DB // accessible from ssh/webuser commands
 
 func generateToken(n int) string {
 	b := make([]byte, n)
@@ -105,11 +121,21 @@ func main() {
 	}
 	capSecret = envVars["CAP_SECRET"]
 	if capSecret == "" {
-		capSecret = "sk-mRQIS4lQqqMICYvAaEg3P3rScMYhMt0hbRs22bMuAPI"
-		log.Printf("using default CAP_SECRET")
-	} else {
-		log.Printf("CAP_SECRET loaded from .env")
+		log.Fatalf("FATAL: CAP_SECRET not set in .env! cap.js verification will not work.")
 	}
+	log.Printf("CAP_SECRET loaded from .env")
+
+	capAPIEndpoint = envVars["CAP_API_ENDPOINT"]
+	if capAPIEndpoint == "" {
+		log.Fatalf("FATAL: CAP_API_ENDPOINT not set in .env! cap.js widget will not work.")
+	}
+	log.Printf("CAP_API_ENDPOINT loaded from .env")
+
+	capSiteverifyURL = envVars["CAP_SITEVERIFY_URL"]
+	if capSiteverifyURL == "" {
+		log.Fatalf("FATAL: CAP_SITEVERIFY_URL not set in .env! cap.js verification will not work.")
+	}
+	log.Printf("CAP_SITEVERIFY_URL loaded from .env")
 
 	// load or create jwt secret
 	secretPath := filepath.Join(baseDir, "jwt.secret")
@@ -126,11 +152,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
+	globalDB = db
 	defer db.Close()
 
 	if err := migrate(db); err != nil {
 		log.Fatalf("migrate: %v", err)
 	}
+
+	// Start SSH server (non-blocking)
+	StartSSHServer(baseDir)
 
 	mux := http.NewServeMux()
 
@@ -259,36 +289,33 @@ func main() {
 		}
 		if u == nil {
 			u = &UserData{
-				JhtUID:     uidStr,
-				BotName:    mcUsername,
-				LevelID:    10001,
-				SimpassUID: simpassResp.UserInfo.SimpassUID,
-				CreateTime: simpassResp.UserInfo.CreateTime,
-				Level:      simpassResp.UserInfo.Level,
-				Risky:      simpassResp.UserInfo.Risky,
+				JhtUID:                    uidStr,
+				RemainingBotCreationQuantity: 1,
+				LevelID:                   10001,
+				SimpassUID:                simpassResp.UserInfo.SimpassUID,
+				CreateTime:                simpassResp.UserInfo.CreateTime,
+				Level:                     simpassResp.UserInfo.Level,
+				Risky:                     simpassResp.UserInfo.Risky,
 			}
 		} else {
 			u.SimpassUID = simpassResp.UserInfo.SimpassUID
 			u.CreateTime = simpassResp.UserInfo.CreateTime
 			u.Level = simpassResp.UserInfo.Level
 			u.Risky = simpassResp.UserInfo.Risky
-			if mcUsername != "" {
-				u.BotName = mcUsername
-			}
 		}
 
 		// Issue JWT
 		now := time.Now()
 		exp := now.Add(tokenValidity)
 		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-			"jht_uid": u.JhtUID,
-			"bot":     u.BotName,
-			"level":   u.LevelID,
-			"sim_uid": simpassResp.UserInfo.SimpassUID,
-			"sim_lv":  simpassResp.UserInfo.Level,
-			"risky":   simpassResp.UserInfo.Risky,
-			"exp":     exp.Unix(),
-			"iat":     now.Unix(),
+			"jht_uid":             u.JhtUID,
+			"remaining_bots":      u.RemainingBotCreationQuantity,
+			"level":               u.LevelID,
+			"sim_uid":             simpassResp.UserInfo.SimpassUID,
+			"sim_lv":              simpassResp.UserInfo.Level,
+			"risky":               simpassResp.UserInfo.Risky,
+			"exp":                 exp.Unix(),
+			"iat":                 now.Unix(),
 		})
 		tokStr, err := token.SignedString(jwtSecret)
 		if err != nil {
@@ -438,7 +465,7 @@ func main() {
 
 			// verify cap
 			capBody, _ := json.Marshal(map[string]string{"secret": capSecret, "response": capTok})
-			capResp, err := http.Post("https://api.xiaofanshop.cn/siteverify", "application/json", bytes.NewReader(capBody))
+			capResp, err := http.Post(capSiteverifyURL, "application/json", bytes.NewReader(capBody))
 			if err != nil {
 				w.WriteHeader(http.StatusBadGateway)
 				json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "verification service unavailable"})
@@ -532,7 +559,7 @@ func main() {
 			return
 		}
 		capBody, _ := json.Marshal(map[string]string{"secret": capSecret, "response": req.CapToken})
-		capResp, err := http.Post("https://api.xiaofanshop.cn/siteverify", "application/json", bytes.NewReader(capBody))
+		capResp, err := http.Post(capSiteverifyURL, "application/json", bytes.NewReader(capBody))
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "verification service unavailable"})
@@ -629,9 +656,212 @@ func main() {
 		})
 	})
 
-	// --- Static file serving ---
+	// --- POST /api/userdata : 获取用户数据 ---
+	mux.HandleFunc("/api/userdata", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 405, "msg": "method not allowed"})
+			return
+		}
+
+		var req struct {
+			AccessToken string `json:"access_token"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccessToken == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token required"})
+			return
+		}
+
+		// Parse & validate JWT
+		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "msg": "access_token error, invalid or expired"})
+			return
+		}
+
+		claims, ok := token.Claims.(jwt.MapClaims)
+		if !ok {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "msg": "access_token error, invalid or expired"})
+			return
+		}
+
+		jhtUID, _ := claims["jht_uid"].(string)
+		if jhtUID == "" {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "msg": "access_token error, invalid or expired"})
+			return
+		}
+
+		// Check ban list (in memory for now)
+		if _, banned := bannedUsers.Load(jhtUID); banned {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "you are banned this server:attack server"})
+			return
+		}
+
+		u, err := findUser(db, jhtUID)
+		if err != nil || u == nil {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "user not found"})
+			return
+		}
+
+		// Update last login time
+		u.LastLoginTime = time.Now().Format("2006-01-02 15:04:05")
+		upsertUser(db, u)
+
+		// Real bot count
+		botCount, _ := countBotsByUser(db, jhtUID)
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"code":            "200",
+			"user_id":         u.JhtUID,
+			"level_uid":       u.LevelID,
+			"last_login_time": u.LastLoginTime,
+			"reg_time":        u.CreateTime,
+			"bots":            botCount,
+		})
+	})
+
+	// --- POST /api/createbot : 创建机器人 ---
+	mux.HandleFunc("/api/createbot", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 405, "msg": "method not allowed"})
+			return
+		}
+
+		var req struct {
+			AccessToken string `json:"access_token"`
+			BotName    string `json:"bot_name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccessToken == "" || req.BotName == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token and bot_name required"})
+			return
+		}
+
+		// Validate JWT
+		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		claims, _ := token.Claims.(jwt.MapClaims)
+		jhtUID, _ := claims["jht_uid"].(string)
+		if jhtUID == "" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		// Check remaining creation quota
+		user, _ := findUser(db, jhtUID)
+		if user == nil || user.RemainingBotCreationQuantity <= 0 {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"code":    403,
+				"message": "你没有创建bot的次数了，如需创建更多bot请向管理员提交申请！",
+			})
+			return
+		}
+
+		// Check if bot username already exists
+		existing, err := findBotByUsername(db, req.BotName)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "msg": "db error"})
+			return
+		}
+
+		if existing != nil && existing.Status == "confirmed" {
+			// 409: username already registered by someone else and confirmed
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"code":    409,
+				"message": "此bot用户名已被其他用户注册并通过认证，请确认账户所有权，必要时请联系管理员！",
+			})
+			return
+		}
+
+		if existing != nil && existing.Status == "no" {
+			// Reassign to new owner
+			if err := updateBotOwner(db, req.BotName, jhtUID); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "msg": "db error"})
+				return
+			}
+		} else {
+			// Create new bot
+			bot := &BotData{
+				Belong:       jhtUID,
+				CreationTime: time.Now().Format("2006-01-02 15:04:05"),
+				Username:     req.BotName,
+				DSL:          false,
+				Status:       "no",
+			}
+			if err := createBot(db, bot); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "msg": "db error"})
+				return
+			}
+		}
+
+		// Decrement remaining creation quota
+		user.RemainingBotCreationQuantity--
+		upsertUser(db, user)
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"code":     "200",
+			"status":   "To be confirmed",
+			"bot_name": req.BotName,
+			"message":  "机器人创建成功，但需要验证用户所有权后才能正常使用",
+		})
+	})
+
+	// --- GET /api/config : 前端配置 ---
+	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"cap_api_endpoint": capAPIEndpoint,
+		})
+	})
+
+	// --- Static file serving with config injection ---
 	staticDir := filepath.Join(baseDir, "static")
-	mux.Handle("/", http.FileServer(http.Dir(staticDir)))
+	fileServer := http.FileServer(http.Dir(staticDir))
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Inject cap endpoint into login.html on the fly
+		if r.URL.Path == "/login.html" || r.URL.Path == "/login" {
+			loginPath := filepath.Join(staticDir, "login.html")
+			if data, err := os.ReadFile(loginPath); err == nil {
+				content := strings.ReplaceAll(string(data), "{{CAP_API_ENDPOINT}}", capAPIEndpoint)
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.Write([]byte(content))
+				return
+			}
+		}
+		fileServer.ServeHTTP(w, r)
+	}))
 
 	srv := &http.Server{Addr: listenAddr, Handler: loggedMux}
 	log.Printf("listening %s", listenAddr)
@@ -656,21 +886,46 @@ func migrate(db *sql.DB) error {
 		jht_uid TEXT PRIMARY KEY,
 		accesstoken TEXT,
 		bot_name TEXT,
+		remaining_bot_creation_quantity INTEGER DEFAULT 1,
 		level_id INTEGER,
 		simpass_uid INTEGER,
 		create_time TEXT,
 		sim_level INTEGER,
-		risky INTEGER
+		risky INTEGER,
+		last_login_time TEXT,
+		status TEXT DEFAULT 'ok',
+		status_info TEXT DEFAULT ''
 	);`
-	_, err := db.Exec(sqlStmt)
-	return err
+	if _, err := db.Exec(sqlStmt); err != nil {
+		return err
+	}
+	// Add columns if table already existed without them (ignore errors)
+	db.Exec("ALTER TABLE userdata ADD COLUMN last_login_time TEXT")
+	db.Exec("ALTER TABLE userdata ADD COLUMN status TEXT DEFAULT 'ok'")
+	db.Exec("ALTER TABLE userdata ADD COLUMN status_info TEXT DEFAULT ''")
+	db.Exec("ALTER TABLE userdata ADD COLUMN remaining_bot_creation_quantity INTEGER DEFAULT 1")
+
+	// Bots table
+	botsStmt := `CREATE TABLE IF NOT EXISTS bots (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		belong TEXT NOT NULL,
+		creation_time TEXT NOT NULL,
+		username TEXT NOT NULL,
+		dsl INTEGER DEFAULT 0,
+		status TEXT DEFAULT 'no'
+	);`
+	if _, err := db.Exec(botsStmt); err != nil {
+		return err
+	}
+	db.Exec("ALTER TABLE bots ADD COLUMN status TEXT DEFAULT 'no'")
+	return nil
 }
 
 func findUser(db *sql.DB, uid string) (*UserData, error) {
-	row := db.QueryRow("SELECT jht_uid, accesstoken, bot_name, level_id, simpass_uid, create_time, sim_level, risky FROM userdata WHERE jht_uid = ?", uid)
+	row := db.QueryRow("SELECT jht_uid, accesstoken, COALESCE(remaining_bot_creation_quantity,1), level_id, simpass_uid, create_time, sim_level, risky, COALESCE(last_login_time,''), COALESCE(status,'ok'), COALESCE(status_info,'') FROM userdata WHERE jht_uid = ?", uid)
 	var u UserData
 	var riskyInt int64
-	err := row.Scan(&u.JhtUID, &u.AccessToken, &u.BotName, &u.LevelID, &u.SimpassUID, &u.CreateTime, &u.Level, &riskyInt)
+	err := row.Scan(&u.JhtUID, &u.AccessToken, &u.RemainingBotCreationQuantity, &u.LevelID, &u.SimpassUID, &u.CreateTime, &u.Level, &riskyInt, &u.LastLoginTime, &u.Status, &u.StatusInfo)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -686,16 +941,19 @@ func upsertUser(db *sql.DB, u *UserData) error {
 	if u.Risky {
 		riskyInt = 1
 	}
-	_, err := db.Exec(`INSERT INTO userdata(jht_uid, accesstoken, bot_name, level_id, simpass_uid, create_time, sim_level, risky)
-		VALUES(?,?,?,?,?,?,?,?)
+	_, err := db.Exec(`INSERT INTO userdata(jht_uid, accesstoken, remaining_bot_creation_quantity, level_id, simpass_uid, create_time, sim_level, risky, last_login_time, status, status_info)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(jht_uid) DO UPDATE SET
 			accesstoken=excluded.accesstoken,
-			bot_name=excluded.bot_name,
+			remaining_bot_creation_quantity=excluded.remaining_bot_creation_quantity,
 			level_id=excluded.level_id,
 			simpass_uid=excluded.simpass_uid,
 			create_time=excluded.create_time,
 			sim_level=excluded.sim_level,
-			risky=excluded.risky;`,
-		u.JhtUID, u.AccessToken, u.BotName, u.LevelID, u.SimpassUID, u.CreateTime, u.Level, riskyInt)
+			risky=excluded.risky,
+			last_login_time=excluded.last_login_time,
+			status=excluded.status,
+			status_info=excluded.status_info;`,
+		u.JhtUID, u.AccessToken, u.RemainingBotCreationQuantity, u.LevelID, u.SimpassUID, u.CreateTime, u.Level, riskyInt, u.LastLoginTime, u.Status, u.StatusInfo)
 	return err
 }

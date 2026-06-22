@@ -46,6 +46,7 @@ bin/
 **/.env
 jwt.secret
 **/jwt.secret
+ssh_host_key
 
 ### Database ###
 *.sqlite

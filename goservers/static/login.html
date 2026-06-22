@@ -7,6 +7,11 @@
   <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@cap.js/widget"></script>
   <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700&display=swap" rel="stylesheet">
+
+  <!-- Pre-fetch cap config before Vue mounts so cap-widgets get the endpoint ASAP -->
+  <script>
+    window.__capConfig = { cap_api_endpoint: '{{CAP_API_ENDPOINT}}' };
+  </script>
   <style>
     *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -212,6 +217,18 @@
       color: var(--accent);
     }
 
+    .auto-login-msg {
+      text-align: center; padding: 16px 0; font-size: 0.90rem;
+      color: var(--text-secondary);
+    }
+    .auto-login-msg .spinner-sm {
+      display: inline-block; width: 18px; height: 18px;
+      border: 2px solid rgba(124,106,230,0.15); border-top-color: var(--accent);
+      border-radius: 50%; animation: spin 0.8s linear infinite;
+      vertical-align: middle; margin-right: 10px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
     .login-divider {
       display: flex; align-items: center; gap: 14px;
       margin: 22px 0 18px;
@@ -317,7 +334,14 @@
       <div class="logo">8WBot</div>
       <div class="sub">邦国崛起 · 智能挂机平台</div>
 
+      <!-- Auto-login toast -->
+      <div v-if="autoChecking" class="auto-login-msg">
+        <span class="spinner-sm"></span>尝试自动登录…
+      </div>
+
       <div v-if="msg.text" :class="['msg-box', msg.type]">{{ msg.text }}</div>
+
+      <div v-if="!autoChecking">
 
       <div class="form-group">
         <label for="uid">简欢通 UID</label>
@@ -333,7 +357,7 @@
       <div class="cap-wrap">
         <cap-widget
           id="main-cap"
-          data-cap-api-endpoint="https://api.xiaofanshop.cn/10beabbe56/"
+          :data-cap-api-endpoint="capEndpoint"
         ></cap-widget>
       </div>
 
@@ -351,6 +375,8 @@
       <button class="btn-qr" @click="openQRModal">📱 二维码登录</button>
 
       <a href="/" class="back-link">← 返回首页</a>
+
+      </div>
     </div>
 
     <!-- ── QR Login Modal ── -->
@@ -363,7 +389,7 @@
         <div v-if="qrModal.step === 'captcha'" class="cap-wrap">
           <cap-widget
             id="qr-cap"
-            data-cap-api-endpoint="https://api.xiaofanshop.cn/10beabbe56/"
+            :data-cap-api-endpoint="capEndpoint"
           ></cap-widget>
           <p v-if="qrModal.capManual" style="font-size:0.78rem;color:var(--text-secondary);margin-top:8px">
             验证已完成？<a href="#" @click.prevent="generateQR" style="color:var(--accent)">点击继续 →</a>
@@ -400,6 +426,7 @@
         const captchaToken = ref('');
         const loading = ref(false);
         const msg = reactive({ text: '', type: '' });
+        const autoChecking = ref(false);
 
         // QR modal state
         const qrModal = reactive({
@@ -416,6 +443,9 @@
         let qrPollTimer = null;
         let qrCountdownTimer = null;
 
+        // Cap endpoint — set synchronously by server-injected script
+        const capEndpoint = ref(window.__capConfig?.cap_api_endpoint || 'https://api.xiaofanshop.cn/10beabbe56/');
+
         function setAuthCookie(token) {
           // Set cookie with 7 day expiry, path=/, sameSite=lax
           const d = new Date();
@@ -423,6 +453,11 @@
           document.cookie = '8wbot_token=' + encodeURIComponent(token) +
             '; expires=' + d.toUTCString() +
             '; path=/; SameSite=Lax';
+        }
+
+        function getCookie(name) {
+          const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+          return match ? decodeURIComponent(match[2]) : '';
         }
 
         // Intercept fetch globally to capture cap.js tokens from any widget
@@ -444,8 +479,25 @@
           return resp;
         };
 
-        // Also try native event listener as fallback
+        // Native event listener fallback for main cap
         onMounted(() => {
+          // Auto-login: check cookie
+          const token = getCookie('8wbot_token') || localStorage.getItem('8wbot_token');
+          if (token) {
+            autoChecking.value = true;
+            fetch('/api/userdata', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ access_token: token })
+            }).then(r => r.json()).then(data => {
+              if (data.code === '200') {
+                window.location.href = '/user.html';
+              } else {
+                autoChecking.value = false; // show login form
+              }
+            }).catch(() => { autoChecking.value = false; });
+          }
+
           const mainCap = document.getElementById('main-cap');
           if (mainCap) {
             mainCap.addEventListener('success', (e) => {
@@ -501,7 +553,7 @@
                 if (qrCountdownTimer) clearInterval(qrCountdownTimer);
                 localStorage.setItem('8wbot_token', data.access_token);
                 setAuthCookie(data.access_token);
-                setTimeout(() => { window.location.href = '/dashboard.html'; }, 1500);
+                setTimeout(() => { window.location.href = '/user.html'; }, 1500);
               } else if (data.status === 'expired') {
                 qrModal.status = 'expired';
                 stopQRPoll();
@@ -589,7 +641,7 @@
               localStorage.setItem('8wbot_token', data.accesstoken);
               localStorage.setItem('8wbot_user', JSON.stringify(data.user_info));
               setAuthCookie(data.accesstoken);
-              setTimeout(() => { window.location.href = '/dashboard.html'; }, 1200);
+              setTimeout(() => { window.location.href = '/user.html'; }, 1200);
             } else {
               msg.text = '❌ ' + (data.msg || '验证失败');
               msg.type = 'error';
@@ -604,7 +656,7 @@
         }
 
         return {
-          user_id, verify_code, captchaToken, loading, msg,
+          user_id, verify_code, captchaToken, loading, msg, capEndpoint, autoChecking,
           handleLogin,
           qrModal, openQRModal, closeQRModal
         };
