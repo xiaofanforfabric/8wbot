@@ -30,17 +30,17 @@ const (
 )
 
 type UserData struct {
-	JhtUID        string `json:"jht_uid"`
-	AccessToken   string `json:"accesstoken"`
+	JhtUID                       string `json:"jht_uid"`
+	AccessToken                  string `json:"accesstoken"`
 	RemainingBotCreationQuantity int64  `json:"remaining_bot_creation_quantity"`
-	LevelID       int64  `json:"level_id"`
-	SimpassUID    int64  `json:"simpass_uid"`
-	CreateTime    string `json:"create_time"`
-	Level         int64  `json:"level"`
-	Risky         bool   `json:"risky"`
-	LastLoginTime string `json:"last_login_time"`
-	Status        string `json:"status"`       // "ok" or "ban"
-	StatusInfo    string `json:"status_info"`  // reason
+	LevelID                      int64  `json:"level_id"`
+	SimpassUID                   int64  `json:"simpass_uid"`
+	CreateTime                   string `json:"create_time"`
+	Level                        int64  `json:"level"`
+	Risky                        bool   `json:"risky"`
+	LastLoginTime                string `json:"last_login_time"`
+	Status                       string `json:"status"`      // "ok" or "ban"
+	StatusInfo                   string `json:"status_info"` // reason
 }
 
 // BotData represents a Minecraft bot bound to a user.
@@ -91,7 +91,7 @@ type otpSession struct {
 
 var otpSessions sync.Map
 var bannedUsers sync.Map // jht_uid -> true
-var globalDB *sql.DB // accessible from ssh/webuser commands
+var globalDB *sql.DB     // accessible from ssh/webuser commands
 
 func generateToken(n int) string {
 	b := make([]byte, n)
@@ -289,13 +289,13 @@ func main() {
 		}
 		if u == nil {
 			u = &UserData{
-				JhtUID:                    uidStr,
+				JhtUID:                       uidStr,
 				RemainingBotCreationQuantity: 1,
-				LevelID:                   10001,
-				SimpassUID:                simpassResp.UserInfo.SimpassUID,
-				CreateTime:                simpassResp.UserInfo.CreateTime,
-				Level:                     simpassResp.UserInfo.Level,
-				Risky:                     simpassResp.UserInfo.Risky,
+				LevelID:                      10001,
+				SimpassUID:                   simpassResp.UserInfo.SimpassUID,
+				CreateTime:                   simpassResp.UserInfo.CreateTime,
+				Level:                        simpassResp.UserInfo.Level,
+				Risky:                        simpassResp.UserInfo.Risky,
 			}
 		} else {
 			u.SimpassUID = simpassResp.UserInfo.SimpassUID
@@ -308,14 +308,14 @@ func main() {
 		now := time.Now()
 		exp := now.Add(tokenValidity)
 		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-			"jht_uid":             u.JhtUID,
-			"remaining_bots":      u.RemainingBotCreationQuantity,
-			"level":               u.LevelID,
-			"sim_uid":             simpassResp.UserInfo.SimpassUID,
-			"sim_lv":              simpassResp.UserInfo.Level,
-			"risky":               simpassResp.UserInfo.Risky,
-			"exp":                 exp.Unix(),
-			"iat":                 now.Unix(),
+			"jht_uid":        u.JhtUID,
+			"remaining_bots": u.RemainingBotCreationQuantity,
+			"level":          u.LevelID,
+			"sim_uid":        simpassResp.UserInfo.SimpassUID,
+			"sim_lv":         simpassResp.UserInfo.Level,
+			"risky":          simpassResp.UserInfo.Risky,
+			"exp":            exp.Unix(),
+			"iat":            now.Unix(),
 		})
 		tokStr, err := token.SignedString(jwtSecret)
 		if err != nil {
@@ -744,7 +744,7 @@ func main() {
 
 		var req struct {
 			AccessToken string `json:"access_token"`
-			BotName    string `json:"bot_name"`
+			BotName     string `json:"bot_name"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccessToken == "" || req.BotName == "" {
 			w.WriteHeader(http.StatusBadRequest)
