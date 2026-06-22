@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>用户中心 — 8WBot</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --bg-start: #f5f0ff; --bg-end: #e8e0f8;
+      --glass-bg: rgba(255,255,255,0.55); --glass-border: rgba(255,255,255,0.72);
+      --glass-shadow: 0 8px 32px rgba(140,120,200,0.12);
+      --text-primary: #2d2a3e; --text-secondary: #7a7590;
+      --accent: #7c6ae6; --radius: 20px;
+    }
+    html, body {
+      height: 100%;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: linear-gradient(150deg, var(--bg-start), var(--bg-end), #f0eaff, #faf5ff);
+      background-size: 400% 400%;
+      animation: bgShift 20s ease infinite;
+      color: var(--text-primary);
+      overflow-x: hidden;
+    }
+    @keyframes bgShift {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+    .bg-orbs { position: fixed; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; }
+    .bg-orbs span { position: absolute; border-radius: 50%; filter: blur(100px); opacity: 0.40; animation: orbFloat 20s ease-in-out infinite alternate; }
+    .bg-orbs .o1 { width: 480px; height: 480px; top: -12%; left: -10%; background: linear-gradient(135deg,#f9d8e0,#d4b8f0); }
+    .bg-orbs .o2 { width: 400px; height: 400px; bottom: -10%; right: -8%; background: linear-gradient(135deg,#c8e6f8,#e0c8f8); animation-delay: -7s; }
+    .bg-orbs .o3 { width: 300px; height: 300px; top: 50%; left: 60%; background: linear-gradient(135deg,#f0d8e8,#d8e8f8); animation-delay: -14s; opacity: 0.30; }
+    @keyframes orbFloat {
+      0% { transform: translate(0,0) scale(1); }
+      100% { transform: translate(50px,-30px) scale(1.10); }
+    }
+    .app-wrap { position: relative; z-index: 1; max-width: 520px; margin: 0 auto; padding: 48px 20px 60px; }
+    .glass {
+      background: var(--glass-bg); backdrop-filter: blur(20px) saturate(1.6);
+      -webkit-backdrop-filter: blur(20px) saturate(1.6);
+      border: 1px solid var(--glass-border); border-radius: var(--radius);
+      box-shadow: var(--glass-shadow);
+    }
+    .card { padding: 36px 28px 32px; text-align: center; }
+    .card .avatar {
+      width: 72px; height: 72px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      margin: 0 auto 16px;
+      font-size: 2rem;
+      background: linear-gradient(135deg, rgba(124,106,230,0.12), rgba(232,121,176,0.12));
+      border: 2px solid rgba(124,106,230,0.12);
+    }
+    .card h2 { font-size: 1.3rem; font-weight: 600; margin-bottom: 4px; }
+    .card .sub { font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 24px; }
+    .card .level-badge {
+      display: inline-block; padding: 4px 16px; border-radius: 100px;
+      font-size: 0.78rem; font-weight: 500;
+      margin-bottom: 20px;
+    }
+    .level-root { background: rgba(239,68,68,0.10); color: #dc2626; border: 1px solid rgba(239,68,68,0.15); }
+    .level-system { background: rgba(124,106,230,0.10); color: var(--accent); border: 1px solid rgba(124,106,230,0.15); }
+    .level-ssh { background: rgba(0,206,201,0.10); color: #00a8a3; border: 1px solid rgba(0,206,201,0.15); }
+    .level-user { background: rgba(255,255,255,0.40); color: var(--text-secondary); border: 1px solid rgba(124,106,230,0.08); }
+
+    .info-grid { display: flex; flex-direction: column; gap: 12px; text-align: left; }
+    .info-row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 10px 16px; border-radius: 12px;
+      background: rgba(255,255,255,0.30);
+    }
+    .info-row .label { font-size: 0.82rem; color: var(--text-secondary); }
+    .info-row .value { font-size: 0.90rem; font-weight: 500; }
+    .loading-state, .error-state { padding: 40px 20px; text-align: center; }
+    .loading-state .spinner {
+      width: 36px; height: 36px; margin: 0 auto 16px;
+      border: 3px solid rgba(124,106,230,0.12); border-top-color: var(--accent);
+      border-radius: 50%; animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .error-state .err-icon { font-size: 2.5rem; margin-bottom: 12px; }
+    .error-state h3 { font-size: 1.1rem; margin-bottom: 6px; }
+    .error-state p { font-size: 0.85rem; color: var(--text-secondary); }
+    .btn-retry {
+      display: inline-block; margin-top: 16px; padding: 10px 28px;
+      border-radius: 100px; border: none; font-family: inherit; font-size: 0.88rem; font-weight: 500;
+      background: var(--accent); color: #fff; cursor: pointer; transition: all 0.2s;
+    }
+    .btn-retry:hover { transform: translateY(-2px); box-shadow: 0 4px 16px rgba(124,106,230,0.25); }
+    .back-link { display: inline-block; margin-top: 18px; font-size: 0.82rem; color: var(--text-secondary); text-decoration: none; }
+    .back-link:hover { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="bg-orbs"><span class="o1"></span><span class="o2"></span><span class="o3"></span></div>
+  <div id="app" class="app-wrap">
+    <!-- Loading -->
+    <div v-if="state === 'loading'" class="card glass loading-state">
+      <div class="spinner"></div>
+      <p>正在验证身份…</p>
+    </div>
+
+    <!-- Error / Banned -->
+    <div v-else-if="state === 'error'" class="card glass error-state">
+      <div class="err-icon">⛔</div>
+      <h3 v-if="errorCode === 401">账号已被封禁</h3>
+      <h3 v-else>验证失败</h3>
+      <p>{{ errorMsg }}</p>
+      <button class="btn-retry" @click="loadUserData">重试</button>
+      <br><a href="/login.html" class="back-link">← 重新登录</a>
+    </div>
+
+    <!-- User data -->
+    <div v-else-if="state === 'loaded'" class="card glass">
+      <div class="avatar">👤</div>
+      <h2>用户中心</h2>
+      <p class="sub">8WBot · 邦国崛起</p>
+      <div :class="['level-badge', levelClass]">{{ levelLabel }}</div>
+      <div class="info-grid">
+        <div class="info-row"><span class="label">简欢通 UID</span><span class="value">{{ userData.user_id }}</span></div>
+        <div class="info-row"><span class="label">权限等级</span><span class="value">{{ userData.level_uid }}</span></div>
+        <div class="info-row"><span class="label">注册时间</span><span class="value">{{ userData.reg_time }}</span></div>
+        <div class="info-row"><span class="label">上次登录</span><span class="value">{{ userData.last_login_time }}</span></div>
+        <div class="info-row"><span class="label">机器人数量</span><span class="value">{{ userData.bots }}</span></div>
+      </div>
+      <a href="/" class="back-link">← 返回首页</a>
+    </div>
+  </div>
+
+  <script>
+    const { createApp, ref, reactive, onMounted } = Vue;
+    createApp({
+      setup() {
+        const state = ref('loading');
+        const userData = reactive({ user_id: '', level_uid: '', reg_time: '', last_login_time: '', bots: 0 });
+        const errorMsg = ref('');
+        const errorCode = ref(0);
+
+        const levelClass = ref('level-user');
+        const levelLabel = ref('普通用户');
+
+        function updateLevel(levelId) {
+          const id = parseInt(levelId);
+          if (id === 0) { levelClass.value = 'level-root'; levelLabel.value = '🔴 根用户 (Root)'; }
+          else if (id <= 1000) { levelClass.value = 'level-system'; levelLabel.value = '🟣 系统管理员 (System)'; }
+          else if (id <= 2000) { levelClass.value = 'level-ssh'; levelLabel.value = '🟢 SSH 用户'; }
+          else { levelClass.value = 'level-user'; levelLabel.value = '⚪ 普通用户'; }
+        }
+
+        function getCookie(name) {
+          const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+          return match ? decodeURIComponent(match[2]) : '';
+        }
+
+        async function loadUserData() {
+          state.value = 'loading';
+          const token = getCookie('8wbot_token') || localStorage.getItem('8wbot_token');
+          if (!token) {
+            state.value = 'error';
+            errorCode.value = 403;
+            errorMsg.value = '未登录，请先登录';
+            return;
+          }
+          try {
+            const res = await fetch('/api/userdata', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ access_token: token })
+            });
+            const data = await res.json();
+            if (data.code === '200') {
+              Object.assign(userData, data);
+              updateLevel(data.level_uid);
+              state.value = 'loaded';
+              // If no bots, redirect to create page
+              if (data.bots === 0) {
+                window.location.href = '/createBot.html';
+                return;
+              }
+            } else if (data.code === '401') {
+              state.value = 'error';
+              errorCode.value = 401;
+              errorMsg.value = data.message || '账号已被封禁';
+            } else {
+              state.value = 'error';
+              errorCode.value = 403;
+              errorMsg.value = data.msg || '登录已过期，请重新登录';
+            }
+          } catch (e) {
+            state.value = 'error';
+            errorCode.value = 0;
+            errorMsg.value = '网络错误: ' + e.message;
+          }
+        }
+
+        onMounted(loadUserData);
+        return { state, userData, errorMsg, errorCode, levelClass, levelLabel, loadUserData };
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>
