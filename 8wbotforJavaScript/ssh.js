@@ -11,7 +11,7 @@ const path = require('path');
 module.exports = function startSshServer(opts = {}, handlers = {}) {
   const port = parseInt(opts.port || process.env.SSH_PORT || 2222, 10);
   const username = opts.username || process.env.SSH_USER || 'root';
-  const password = opts.password || process.env.SSH_PASSWORD || '';
+  const password = opts.password || process.env.SSH_PASSWORD || process.env.SSH_ROOT_USER_PASSWORD || '';
   const echoEnabled = typeof opts.echo !== 'undefined' ? !!opts.echo : (process.env.SSH_ECHO !== 'false');
 
   // Warn if no password set
