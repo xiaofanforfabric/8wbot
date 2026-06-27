@@ -92,112 +92,407 @@
     .btn-retry:hover { transform: translateY(-2px); box-shadow: 0 4px 16px rgba(124,106,230,0.25); }
     .back-link { display: inline-block; margin-top: 18px; font-size: 0.82rem; color: var(--text-secondary); text-decoration: none; }
     .back-link:hover { color: var(--accent); }
+
+    /* ── Hamburger & Drawer ── */
+    .hamburger {
+      position: fixed; top: 18px; left: 20px; z-index: 60;
+      width: 40px; height: 40px; border-radius: 12px;
+      border: 1px solid rgba(124,106,230,0.10);
+      background: rgba(255,255,255,0.50);
+      backdrop-filter: blur(12px);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.3rem; cursor: pointer;
+      transition: all 0.2s ease;
+      user-select: none;
+    }
+    .hamburger:hover { background: rgba(255,255,255,0.75); border-color: var(--accent); }
+
+    .drawer-overlay {
+      position: fixed; inset: 0; z-index: 70;
+      background: rgba(0,0,0,0.15);
+      backdrop-filter: blur(4px);
+      opacity: 0; pointer-events: none;
+      transition: opacity 0.3s ease;
+    }
+    .drawer-overlay.open { opacity: 1; pointer-events: auto; }
+
+    .drawer {
+      position: fixed; top: 0; left: 0; bottom: 0; z-index: 80;
+      width: 280px; max-width: 75vw;
+      background: rgba(255,255,255,0.85);
+      backdrop-filter: blur(24px) saturate(1.6);
+      border-right: 1px solid var(--glass-border);
+      box-shadow: 4px 0 24px rgba(140,120,200,0.10);
+      transform: translateX(-100%);
+      transition: transform 0.3s ease;
+      padding: 24px 16px;
+      display: flex; flex-direction: column;
+    }
+    .drawer.open { transform: translateX(0); }
+
+    .drawer .drawer-logo {
+      font-size: 1.2rem; font-weight: 700; margin-bottom: 24px; padding: 0 8px;
+      background: linear-gradient(135deg,#4a3f7a,#7c6ae6,#e879b0);
+      background-size: 200% 200%;
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+    }
+    .drawer .nav-item {
+      display: flex; align-items: center; gap: 12px;
+      padding: 12px 14px; border-radius: 12px;
+      font-size: 0.92rem; font-weight: 500; cursor: pointer;
+      transition: all 0.2s ease;
+      color: var(--text-primary);
+      text-decoration: none;
+    }
+    .drawer .nav-item:hover { background: rgba(124,106,230,0.08); }
+    .drawer .nav-item.active { background: rgba(124,106,230,0.12); color: var(--accent); }
+    .drawer .nav-divider { flex: 1; }
+    .drawer .nav-footer { font-size: 0.78rem; color: var(--text-secondary); padding: 8px 14px; }
+
+    /* ── Bot list (BotManage component) ── */
+    .bot-item {
+      display:flex; align-items:center; justify-content:space-between;
+      padding:14px 16px; border-radius:14px;
+      background:rgba(255,255,255,0.30); margin-bottom:10px;
+      text-align:left; transition:all .2s ease;
+    }
+    .bot-item:hover { background:rgba(255,255,255,0.50); }
+    .bot-item .bot-info { display:flex; flex-direction:column; gap:2px; }
+    .bot-item .bot-name { font-size:.95rem; font-weight:600; }
+    .bot-item .bot-meta { font-size:.78rem; color:var(--text-secondary); }
+    .bot-item .bot-status {
+      font-size:.75rem; padding:3px 12px; border-radius:100px; font-weight:500; white-space:nowrap;
+    }
+    .status-confirmed { background:rgba(34,197,94,0.10); color:#16a34a; border:1px solid rgba(34,197,94,0.15); }
+    .status-no { background:rgba(234,179,8,0.10); color:#ca8a04; border:1px solid rgba(234,179,8,0.15); }
+    .empty-state { text-align:center; padding:32px 0; }
+    .empty-state .icon { font-size:2.5rem; margin-bottom:12px; }
+    .empty-state p { font-size:.88rem; color:var(--text-secondary); }
+    .btn-primary {
+      display:inline-block; padding:10px 28px; border-radius:100px; border:none;
+      background:var(--accent); color:#fff; text-decoration:none; cursor:pointer;
+      font-family:inherit; font-size:.88rem; font-weight:500; transition:all .2s;
+    }
+    .btn-primary:hover { transform:translateY(-2px); box-shadow:0 4px 16px rgba(124,106,230,0.25); }
   </style>
 </head>
 <body>
   <div class="bg-orbs"><span class="o1"></span><span class="o2"></span><span class="o3"></span></div>
+
   <div id="app" class="app-wrap">
-    <!-- Loading -->
-    <div v-if="state === 'loading'" class="card glass loading-state">
-      <div class="spinner"></div>
-      <p>正在验证身份…</p>
+    <!-- Hamburger -->
+    <div class="hamburger" @click="drawerOpen = !drawerOpen" v-if="authState === 'loaded'">☰</div>
+    <div :class="['drawer-overlay', { open: drawerOpen }]" @click="drawerOpen = false"></div>
+    <div :class="['drawer', { open: drawerOpen }]">
+      <div class="drawer-logo">8WBot</div>
+      <div class="nav-item" :class="{ active: currentView === 'UserInfo' }" @click="switchView('UserInfo')">👤 用户信息</div>
+      <div class="nav-item" :class="{ active: currentView === 'BotManage' }" @click="switchView('BotManage')">🤖 Bot 管理</div>
+      <div class="nav-item" :class="{ active: currentView === 'UserSettings' }" @click="switchView('UserSettings')">⚙️ 用户设置</div>
+      <div class="nav-divider"></div>
+      <div class="nav-item" @click="logout">🚪 退出登录</div>
+      <div class="nav-footer">8WBot · v0.0.1</div>
     </div>
 
-    <!-- Error / Banned -->
-    <div v-else-if="state === 'error'" class="card glass error-state">
+    <!-- Auth loading -->
+    <div v-if="authState === 'loading'" class="card glass loading-state">
+      <div class="spinner"></div><p>正在验证身份…</p>
+    </div>
+    <!-- Auth error -->
+    <div v-else-if="authState === 'error'" class="card glass error-state">
       <div class="err-icon">⛔</div>
-      <h3 v-if="errorCode === 401">账号已被封禁</h3>
+      <h3 v-if="authErrorCode === 401">账号已被封禁</h3>
       <h3 v-else>验证失败</h3>
-      <p>{{ errorMsg }}</p>
-      <button class="btn-retry" @click="loadUserData">重试</button>
+      <p>{{ authErrorMsg }}</p>
+      <button class="btn-retry" @click="initAuth">重试</button>
       <br><a href="/login.html" class="back-link">← 重新登录</a>
     </div>
-
-    <!-- User data -->
-    <div v-else-if="state === 'loaded'" class="card glass">
-      <div class="avatar">👤</div>
-      <h2>用户中心</h2>
-      <p class="sub">8WBot · 邦国崛起</p>
-      <div :class="['level-badge', levelClass]">{{ levelLabel }}</div>
-      <div class="info-grid">
-        <div class="info-row"><span class="label">简欢通 UID</span><span class="value">{{ userData.user_id }}</span></div>
-        <div class="info-row"><span class="label">权限等级</span><span class="value">{{ userData.level_uid }}</span></div>
-        <div class="info-row"><span class="label">注册时间</span><span class="value">{{ userData.reg_time }}</span></div>
-        <div class="info-row"><span class="label">上次登录</span><span class="value">{{ userData.last_login_time }}</span></div>
-        <div class="info-row"><span class="label">机器人数量</span><span class="value">{{ userData.bots }}</span></div>
-      </div>
-      <a href="/" class="back-link">← 返回首页</a>
-    </div>
+    <!-- Dynamic page -->
+    <component v-else-if="authState === 'loaded'" :is="currentView" />
   </div>
 
   <script>
-    const { createApp, ref, reactive, onMounted } = Vue;
-    createApp({
-      setup() {
-        const state = ref('loading');
-        const userData = reactive({ user_id: '', level_uid: '', reg_time: '', last_login_time: '', bots: 0 });
-        const errorMsg = ref('');
-        const errorCode = ref(0);
+    const { createApp, ref, reactive, defineComponent, provide, inject, onMounted } = Vue;
 
+    /* ===== UserInfo Component ===== */
+    const UserInfo = defineComponent({
+      setup() {
+        const userData = inject('userData');
         const levelClass = ref('level-user');
         const levelLabel = ref('普通用户');
-
-        function updateLevel(levelId) {
-          const id = parseInt(levelId);
-          if (id === 0) { levelClass.value = 'level-root'; levelLabel.value = '🔴 根用户 (Root)'; }
-          else if (id <= 1000) { levelClass.value = 'level-system'; levelLabel.value = '🟣 系统管理员 (System)'; }
-          else if (id <= 2000) { levelClass.value = 'level-ssh'; levelLabel.value = '🟢 SSH 用户'; }
+        function updateLevel(id) {
+          const n = parseInt(id);
+          if (n === 0) { levelClass.value = 'level-root'; levelLabel.value = '🔴 根用户 (Root)'; }
+          else if (n <= 1000) { levelClass.value = 'level-system'; levelLabel.value = '🟣 系统管理员 (System)'; }
+          else if (n <= 2000) { levelClass.value = 'level-ssh'; levelLabel.value = '🟢 SSH 用户'; }
           else { levelClass.value = 'level-user'; levelLabel.value = '⚪ 普通用户'; }
+        }
+        onMounted(() => updateLevel(userData.level_uid));
+        return { userData, levelClass, levelLabel };
+      },
+      template: `
+        <div class="card glass">
+          <div class="avatar">👤</div>
+          <h2>用户中心</h2>
+          <p class="sub">8WBot · 邦国崛起</p>
+          <div :class="['level-badge', levelClass]">{{ levelLabel }}</div>
+          <div class="info-grid">
+            <div class="info-row"><span class="label">简欢通 UID</span><span class="value">{{ userData.user_id }}</span></div>
+            <div class="info-row"><span class="label">权限等级</span><span class="value">{{ userData.level_uid }}</span></div>
+            <div class="info-row"><span class="label">注册时间</span><span class="value">{{ userData.reg_time }}</span></div>
+            <div class="info-row"><span class="label">上次登录</span><span class="value">{{ userData.last_login_time }}</span></div>
+            <div class="info-row"><span class="label">机器人数量</span><span class="value">{{ userData.bots }}</span></div>
+          </div>
+          <a href="/" class="back-link">← 返回首页</a>
+        </div>`
+    });
+
+    /* ===== BotManage Component ===== */
+    const BotManage = defineComponent({
+      setup() {
+        const bots = ref([]);
+        const loading = ref(true);
+        const error = ref('');
+        const token = inject('token');
+        const verifying = ref('');       // bot_name being verified
+        const verifyStep = ref('start');  // start | code | success | fail
+        const verifyChat = ref('');
+        const verifyUid = ref('');
+        const verifyCode = ref('');
+        const verifyMsg = ref('');
+        const verifyTimeout = ref(120);
+
+        async function load() {
+          loading.value = true; error.value = '';
+          try {
+            const r = await fetch('/api/getmybotslist', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ access_token: token.value })
+            });
+            const d = await r.json();
+            if (d.code === '200') bots.value = d.data || [];
+            else error.value = d.message || '获取失败';
+          } catch (e) { error.value = e.message; }
+          finally { loading.value = false; }
+        }
+        onMounted(load);
+
+        async function startVerify(bot) {
+          verifying.value = bot.bot_name;
+          verifyStep.value = 'start';
+          verifyChat.value = '';
+          verifyUid.value = '';
+          verifyMsg.value = '';
+          verifyTimeout.value = 120;
+
+          try {
+            const r = await fetch('/api/verifybot', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ access_token: token.value, bot_name: bot.bot_name })
+            });
+            const d = await r.json();
+            if (d.code === '200') {
+              verifyChat.value = d.chat || '';
+              verifyUid.value = d.bot_simpass_uid || '';
+              verifyMsg.value = '请输入简欢通验证码以证明此账户属于你';
+              verifyStep.value = 'code';
+              // Start countdown
+              const t = setInterval(() => {
+                verifyTimeout.value--;
+                if (verifyTimeout.value <= 0) {
+                  clearInterval(t);
+                  verifyStep.value = 'fail';
+                  verifyMsg.value = '验证超时，请重新开始验证';
+                }
+              }, 1000);
+              setTimeout(() => clearInterval(t), 120000);
+            } else {
+              verifyMsg.value = d.message || '启动失败';
+              verifyStep.value = 'fail';
+            }
+          } catch (e) {
+            verifyMsg.value = '网络错误: ' + e.message;
+            verifyStep.value = 'fail';
+          }
+        }
+
+        async function submitCode() {
+          if (!verifyCode.value) return;
+          try {
+            const r = await fetch('/api/verifycode', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ access_token: token.value, bot_name: verifying.value, code: verifyCode.value })
+            });
+            const d = await r.json();
+            if (d.code === '200' && (d.message || '').includes('成功')) {
+              verifyStep.value = 'success';
+              verifyMsg.value = '验证成功！5秒后自动关闭机器人，请前往控制台使用此机器人';
+              load(); // refresh list
+              setTimeout(() => { window.location.href = '/user.html'; }, 5000);
+            } else {
+              // Verification failed — redirect back to user center
+              window.location.href = '/user.html';
+            }
+          } catch (e) {
+            verifyMsg.value = '网络错误: ' + e.message;
+            verifyStep.value = 'retry';
+          }
+        }
+
+        function cancelVerify() {
+          verifying.value = '';
+          window.location.href = '/user.html';
+        }
+
+        return { bots, loading, error, load, verifying, verifyStep, verifyChat, verifyUid, verifyCode, verifyMsg, verifyTimeout, startVerify, submitCode, cancelVerify };
+      },
+      template: `
+        <div class="card glass">
+          <h2>🤖 Bot 管理</h2>
+          <p class="sub">共 {{ bots.length }} 个机器人</p>
+
+          <div v-if="loading" class="loading-state" style="padding:24px 0">
+            <div class="spinner" style="width:28px;height:28px;margin:0 auto 10px"></div>
+            <p style="font-size:.85rem;color:var(--text-secondary)">加载中…</p>
+          </div>
+          <div v-else-if="error" class="error-state" style="padding:16px 0">
+            <p style="font-size:.85rem;color:#dc2626">{{ error }}</p>
+            <button class="btn-primary" style="margin-top:10px" @click="load">重试</button>
+          </div>
+
+          <div v-else-if="bots.length === 0" class="empty-state">
+            <div class="icon">📭</div>
+            <p>还没有机器人</p>
+            <a href="/createBot.html" class="btn-primary" style="margin-top:14px;display:inline-block">➕ 创建机器人</a>
+          </div>
+
+          <!-- Bot list items -->
+          <div v-for="b in bots" :key="b.bot_name" class="bot-item">
+            <div class="bot-info">
+              <span class="bot-name">{{ b.bot_name }}</span>
+              <span class="bot-meta">创建时间: {{ b.create_time }}</span>
+              <span class="bot-meta" v-if="b.DSL">🧠 DSL: 已启用</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <span :class="['bot-status', b.status === 'confirmed' ? 'status-confirmed' : 'status-no']">
+                {{ b.status === 'confirmed' ? '✓ 已确认' : '⏳ 待确认' }}
+              </span>
+              <button v-if="b.status !== 'confirmed' && !verifying" class="btn-primary" style="padding:6px 14px;font-size:.78rem" @click="startVerify(b)">验证</button>
+              <a :href="'/console.html?botname=' + b.bot_name" class="btn-primary" style="padding:6px 14px;font-size:.78rem;text-decoration:none">控制台</a>
+            </div>
+          </div>
+
+          <!-- Verify modal -->
+          <div v-if="verifying" style="margin-top:20px;padding:20px;border-radius:16px;background:rgba(255,255,255,0.30)">
+            <h3 style="font-size:1rem;margin-bottom:8px">验证机器人: {{ verifying }}</h3>
+
+            <div v-if="verifyStep === 'start'" style="text-align:center;padding:16px 0">
+              <div class="spinner" style="width:28px;height:28px;margin:0 auto 10px"></div>
+              <p style="font-size:.85rem;color:var(--text-secondary)">正在启动机器人并检测服务器…</p>
+            </div>
+
+            <div v-else-if="verifyStep === 'code' || verifyStep === 'retry'" style="text-align:center">
+              <p style="font-size:.85rem;color:var(--text-secondary);margin-bottom:12px">{{ verifyMsg }}</p>
+              <p v-if="verifyChat" style="font-size:.80rem;color:var(--accent);margin-bottom:8px;word-break:break-all">检测到: {{ verifyChat }}</p>
+              <p v-if="verifyUid" style="font-size:.80rem;color:var(--text-secondary);margin-bottom:8px">简欢通 UID: {{ verifyUid }}</p>
+              <p style="font-size:.78rem;color:#ca8a04;margin-bottom:10px">剩余时间: {{ verifyTimeout }}s</p>
+              <input v-model="verifyCode" type="text" maxlength="6" placeholder="输入6位验证码"
+                style="width:180px;padding:10px 14px;border-radius:10px;border:1.5px solid rgba(124,106,230,0.12);font-size:1.1rem;text-align:center;letter-spacing:4px;outline:none"
+                @keyup.enter="submitCode">
+              <br>
+              <button class="btn-primary" style="margin-top:12px" @click="submitCode">确认验证</button>
+              <p v-if="verifyStep === 'retry'" style="font-size:.82rem;color:#dc2626;margin-top:8px">{{ verifyMsg }}</p>
+            </div>
+
+            <div v-else-if="verifyStep === 'success'" style="text-align:center;padding:16px 0">
+              <p style="font-size:2rem">✅</p>
+              <p style="color:#16a34a;margin-top:8px">{{ verifyMsg }}</p>
+              <p style="font-size:.82rem;color:var(--text-secondary);margin-top:8px">即将跳转至控制台...</p>
+            </div>
+
+            <div v-else-if="verifyStep === 'fail'" style="text-align:center;padding:16px 0">
+              <p style="font-size:2rem">⏰</p>
+              <p style="color:#dc2626;margin-top:8px">{{ verifyMsg }}</p>
+              <button class="btn-primary" style="margin-top:12px" @click="cancelVerify">返回用户中心</button>
+            </div>
+          </div>
+        </div>`
+    });
+
+    /* ===== UserSettings Component ===== */
+    const UserSettings = defineComponent({
+      template: `
+        <div class="card glass">
+          <div class="avatar">⚙️</div>
+          <h2>用户设置</h2>
+          <p class="sub">账户与偏好设置</p>
+          <p style="margin-top:16px;font-size:0.85rem;color:var(--text-secondary)">设置功能即将上线</p>
+        </div>`
+    });
+
+    /* ===== Root App ===== */
+    createApp({
+      components: { UserInfo, BotManage, UserSettings },
+      setup() {
+        const authState = ref('loading');
+        const authErrorMsg = ref('');
+        const authErrorCode = ref(0);
+        const userData = reactive({ user_id:'', level_uid:'', reg_time:'', last_login_time:'', bots:0 });
+        const drawerOpen = ref(false);
+        const currentView = ref('UserInfo');
+        const token = ref('');
+
+        provide('token', token);
+        provide('userData', userData);
+
+        function switchView(name) {
+          currentView.value = name;
+          drawerOpen.value = false;
+        }
+
+        function logout() {
+          document.cookie = '8wbot_token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/';
+          localStorage.removeItem('8wbot_token');
+          localStorage.removeItem('8wbot_user');
+          window.location.href = '/login.html';
         }
 
         function getCookie(name) {
-          const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
-          return match ? decodeURIComponent(match[2]) : '';
+          const m = document.cookie.match(new RegExp('(^| )'+name+'=([^;]+)'));
+          return m ? decodeURIComponent(m[2]) : '';
         }
 
-        async function loadUserData() {
-          state.value = 'loading';
-          const token = getCookie('8wbot_token') || localStorage.getItem('8wbot_token');
-          if (!token) {
-            state.value = 'error';
-            errorCode.value = 403;
-            errorMsg.value = '未登录，请先登录';
-            return;
+        async function initAuth() {
+          authState.value = 'loading';
+          token.value = getCookie('8wbot_token') || localStorage.getItem('8wbot_token') || '';
+          if (!token.value) {
+            authState.value = 'error'; authErrorCode.value = 403;
+            authErrorMsg.value = '未登录，请先登录'; return;
           }
           try {
-            const res = await fetch('/api/userdata', {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ access_token: token })
+            const r = await fetch('/api/userdata', {
+              method: 'POST', headers:{'content-type':'application/json'},
+              body: JSON.stringify({ access_token: token.value })
             });
-            const data = await res.json();
-            if (data.code === '200') {
-              Object.assign(userData, data);
-              updateLevel(data.level_uid);
-              state.value = 'loaded';
-              // If no bots, redirect to create page
-              if (data.bots === 0) {
-                window.location.href = '/createBot.html';
-                return;
-              }
-            } else if (data.code === '401') {
-              state.value = 'error';
-              errorCode.value = 401;
-              errorMsg.value = data.message || '账号已被封禁';
+            const d = await r.json();
+            if (d.code === '200') {
+              Object.assign(userData, d);
+              authState.value = 'loaded';
+              if (d.bots === 0) { window.location.href = '/createBot.html'; return; }
+            } else if (d.code === '401') {
+              authState.value = 'error'; authErrorCode.value = 401;
+              authErrorMsg.value = d.message || '账号已被封禁';
             } else {
-              state.value = 'error';
-              errorCode.value = 403;
-              errorMsg.value = data.msg || '登录已过期，请重新登录';
+              authState.value = 'error'; authErrorCode.value = 403;
+              authErrorMsg.value = d.msg || '登录已过期';
             }
-          } catch (e) {
-            state.value = 'error';
-            errorCode.value = 0;
-            errorMsg.value = '网络错误: ' + e.message;
+          } catch(e) {
+            authState.value = 'error'; authErrorCode.value = 0;
+            authErrorMsg.value = '网络错误: ' + e.message;
           }
         }
 
-        onMounted(loadUserData);
-        return { state, userData, errorMsg, errorCode, levelClass, levelLabel, loadUserData };
+        onMounted(initAuth);
+        return { authState, authErrorMsg, authErrorCode, userData, drawerOpen, currentView, switchView, logout, initAuth };
       }
     }).mount('#app');
   </script>
