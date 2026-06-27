@@ -67,3 +67,7 @@ node_modules/
 ### Logs ###
 *.log
 **/*.log
+
+### 构建产物 ###
+*.exe
+goservers/goservers

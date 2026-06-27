@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<title>8WBot 控制台</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+:root {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-dim: #8b949e;
+  --accent: #58a6ff;
+  --green: #3fb950;
+  --red: #f85149;
+  --yellow: #d29922;
+  --font: 'Cascadia Code','Fira Code','Consolas',monospace;
+}
+body { background:var(--bg); color:var(--text); font-family:var(--font); font-size:14px; height:100vh; display:flex; flex-direction:column; }
+/* Top bar */
+.topbar { display:flex; align-items:center; gap:12px; padding:8px 16px; background:var(--surface); border-bottom:1px solid var(--border); flex-shrink:0; }
+.topbar h1 { font-size:16px; font-weight:600; }
+.topbar .meta { margin-left:auto; font-size:12px; color:var(--text-dim); display:flex; align-items:center; gap:8px; }
+.dot { display:inline-block; width:8px; height:8px; border-radius:50%; }
+.dot.online { background:var(--green); box-shadow:0 0 6px var(--green); }
+.dot.offline { background:var(--red); }
+/* Bot selector */
+.selector { display:flex; align-items:center; gap:8px; padding:8px 16px; background:var(--surface); border-bottom:1px solid var(--border); flex-shrink:0; }
+.selector select, .selector input { background:#0d1117; color:var(--text); border:1px solid var(--border); border-radius:4px; padding:4px 8px; font-family:var(--font); font-size:13px; }
+.selector select { min-width:160px; }
+.selector input { flex:1; max-width:200px; }
+.selector button { background:var(--accent); color:#fff; border:none; border-radius:4px; padding:4px 16px; cursor:pointer; font-size:13px; font-family:var(--font); }
+.selector button:hover { opacity:.85; }
+.selector .status { font-size:12px; color:var(--text-dim); margin-left:auto; display:flex; align-items:center; gap:6px; }
+/* Terminal */
+.terminal { flex:1; overflow-y:auto; padding:8px 16px; font-family:var(--font); font-size:13px; line-height:1.5; background:#0d1117; }
+.terminal .line { white-space:pre-wrap; word-break:break-all; }
+.terminal .time { color:var(--text-dim); margin-right:8px; font-size:11px; }
+.terminal .sys { color:var(--yellow); }
+.terminal .chat { color:var(--green); }
+.terminal .msg { color:var(--accent); }
+.terminal .err { color:var(--red); }
+.terminal .sep { border-top:1px solid var(--border); margin:4px 0; padding-top:4px; }
+/* Input bar */
+.inputbar { display:flex; align-items:center; gap:8px; padding:8px 16px; background:var(--surface); border-top:1px solid var(--border); flex-shrink:0; }
+.inputbar .prompt { color:var(--green); font-family:var(--font); font-size:13px; }
+.inputbar input { flex:1; background:#0d1117; color:var(--text); border:1px solid var(--border); border-radius:4px; padding:6px 8px; font-family:var(--font); font-size:13px; outline:none; }
+.inputbar input:focus { border-color:var(--accent); }
+.inputbar button { background:var(--accent); color:#fff; border:none; border-radius:4px; padding:6px 16px; cursor:pointer; font-size:13px; font-family:var(--font); }
+.inputbar button:hover { opacity:.85; }
+/* Disconnected overlay */
+.overlay { position:fixed; inset:0; background:rgba(0,0,0,.6); display:flex; align-items:center; justify-content:center; z-index:100; }
+.overlay .card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:24px 32px; text-align:center; max-width:400px; }
+.overlay .card h2 { margin-bottom:8px; font-size:18px; }
+.overlay .card p { color:var(--text-dim); font-size:13px; margin-bottom:16px; }
+.overlay .card button { background:var(--accent); color:#fff; border:none; border-radius:4px; padding:8px 24px; cursor:pointer; font-size:14px; font-family:var(--font); }
+.loading { text-align:center; padding:40px; color:var(--text-dim); }
+.map-image-box { padding:8px 0; text-align:center; }
+.map-image { max-width:100%; height:auto; border-radius:4px; image-rendering:pixelated; }
+/* Toggle switch */
+.toggle-bar { display:flex; align-items:center; gap:8px; padding:4px 16px 8px; background:var(--surface); flex-shrink:0; font-size:12px; color:var(--text-dim); }
+.toggle-switch { position:relative; width:36px; height:20px; flex-shrink:0; cursor:pointer; }
+.toggle-switch input { opacity:0; width:0; height:0; }
+.toggle-slider { position:absolute; inset:0; background:var(--border); border-radius:10px; transition:.2s; }
+.toggle-slider::before { content:''; position:absolute; left:2px; top:2px; width:16px; height:16px; background:#fff; border-radius:50%; transition:.2s; }
+.toggle-switch input:checked + .toggle-slider { background:var(--green); }
+.toggle-switch input:checked + .toggle-slider::before { transform:translateX(16px); }
+</style>
+</head>
+<body>
+
+<div id="app">
+  <!-- Disconnected overlay -->
+  <div v-if="state === 'disconnected'" class="overlay">
+    <div class="card">
+      <h2>🔌 连接已断开</h2>
+      <p>{{ disconnectReason }}</p>
+      <button @click="connect">重新连接</button>
+    </div>
+  </div>
+
+  <!-- Top bar -->
+  <div class="topbar">
+    <h1>⚡ 8WBot 控制台</h1>
+    <div class="meta">
+      <span class="dot" :class="online ? 'online' : 'offline'"></span>
+      <span>{{ online ? '在线' : '离线' }}</span>
+      <span v-if="botName">| {{ botName }}</span>
+      <span v-if="server">| {{ server }}</span>
+      <a href="/user.html" style="color:var(--accent);text-decoration:none;font-size:12px;margin-left:8px">← 返回</a>
+    </div>
+  </div>
+
+  <!-- Bot selector -->
+  <div class="selector">
+    <select v-model="selectedBot">
+      <option value="">-- 选择机器人 --</option>
+      <option v-for="b in botList" :key="b.bot_name" :value="b.bot_name">{{ b.bot_name }} ({{ b.status }})</option>
+    </select>
+    <button @click="connectBot" :disabled="!selectedBot || state === 'connecting'">连接</button>
+    <button @click="disconnect" :disabled="state !== 'connected'" style="background:var(--red)">断开</button>
+    <button v-if="state === 'connected' && !online" @click="startBot" :disabled="starting" style="background:var(--green)">{{ starting ? '启动中...' : '🚀 启动机器人' }}</button>
+    <button v-if="state === 'connected' && online" @click="stopBot" style="background:var(--red)">⏹ 关闭机器人</button>
+    <div class="status">
+      <span>{{ statusText }}</span>
+    </div>
+  </div>
+
+  <!-- Terminal -->
+  <div class="terminal" ref="terminal" @click="focusInput">
+    <div v-if="state === 'connecting'" class="loading">连接中...</div>
+    <div v-for="(line, i) in lines" :key="i" class="line">
+      <template v-if="line.type === 'image'">
+        <div class="map-image-box" v-if="showMapImage">
+          <img :src="'data:image/png;base64,' + line.data" class="map-image" />
+        </div>
+      </template>
+      <template v-else>
+        <span class="time">{{ line.time }}</span>
+        <span :class="line.cls">{{ line.text }}</span>
+      </template>
+    </div>
+  </div>
+
+  <!-- Input bar -->
+  <div class="inputbar">
+    <span class="prompt">$</span>
+    <input ref="cmdInput" v-model="cmdText" placeholder="输入命令或聊天内容..." @keyup.enter="sendCmd" :disabled="state !== 'connected' || !online">
+    <button @click="sendCmd" :disabled="state !== 'connected' || !online || !cmdText.trim()">发送</button>
+  </div>
+
+  <!-- Map toggle -->
+  <div class="toggle-bar">
+    <label class="toggle-switch">
+      <input type="checkbox" :checked="showMapImage" @change="toggleMapImage">
+      <span class="toggle-slider"></span>
+    </label>
+    <span>显示手持地图图形 {{ showMapImage ? '🖼️' : '🚫' }}</span>
+  </div>
+
+  <!-- Feature toggles -->
+  <div class="toggle-bar" style="border-top:1px solid var(--border);padding-top:6px">
+    <label class="toggle-switch" style="opacity:0.4;cursor:not-allowed">
+      <input type="checkbox" disabled>
+      <span class="toggle-slider" style="background:var(--border)"></span>
+    </label>
+    <span style="color:var(--text-dim)">DSL 机器人自动化编程功能（敬请期待）</span>
+    <span style="flex:1"></span>
+    <label class="toggle-switch">
+      <input type="checkbox" :checked="autoReconnect" @change="toggleAutoReconnect">
+      <span class="toggle-slider"></span>
+    </label>
+    <span>自动重连 {{ autoReconnect ? '✅' : '❌' }}</span>
+    <span style="flex:1"></span>
+    <label class="toggle-switch">
+      <input type="checkbox" :checked="autoRestore" @change="toggleAutoRestore">
+      <span class="toggle-slider"></span>
+    </label>
+    <span>自动恢复民心 {{ autoRestore ? '✅' : '❌' }}</span>
+  </div>
+</div>
+
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script>
+const { createApp, ref, onMounted, nextTick, watch } = Vue;
+
+createApp({
+  setup() {
+    const state = ref('init'); // init | connecting | connected | disconnected
+    const disconnectReason = ref('');
+    const botName = ref('');
+    const server = ref('');
+    const online = ref(false);
+    const starting = ref(false);
+    const selectedBot = ref('');
+    const botList = ref([]);
+    const lines = ref([]);
+    const cmdText = ref('');
+    const terminal = ref(null);
+    const cmdInput = ref(null);
+
+    const showMapImage = ref(true);
+    const autoReconnect = ref(true);
+    const autoRestore = ref(true);
+    let ws = null;
+    const token = ref('');
+
+    function getCookie(name) {
+      const parts = ('; '+document.cookie).split('; '+name+'=');
+      return parts.length === 2 ? parts.pop().split(';').shift() : null;
+    }
+
+    function setCookie(name, value, days) {
+      const d = new Date();
+      d.setTime(d.getTime()+(days||365)*24*60*60*1000);
+      document.cookie = name+'='+encodeURIComponent(value)+';expires='+d.toUTCString()+';path=/';
+    }
+
+    function loadAutoReconnect() {
+      const v = getCookie('8wbot_auto_reconnect');
+      autoReconnect.value = v === null ? true : v === 'true';
+    }
+
+    function toggleAutoReconnect(e) {
+      const on = e.target.checked;
+      autoReconnect.value = on;
+      setCookie('8wbot_auto_reconnect', on ? 'true' : 'false');
+      console.log('[8WBot] auto reconnect:', on ? '✅ 开启' : '❌ 关闭');
+      // 同步到数据库
+      fetch('/api/updatebotconfig', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ access_token: token.value, botname: botName.value, auto_reconnect: on })
+      }).then(r => r.json()).then(d => {
+        if (d.code !== 200) console.log('[8WBot] updatebotconfig error:', d.message);
+      }).catch(e => console.log('[8WBot] updatebotconfig network error:', e.message));
+    }
+
+    function loadAutoRestore() {
+      const v = getCookie('8wbot_auto_restore');
+      autoRestore.value = v === null ? true : v === 'true';
+    }
+
+    function toggleAutoRestore(e) {
+      const on = e.target.checked;
+      autoRestore.value = on;
+      setCookie('8wbot_auto_restore', on ? 'true' : 'false');
+      console.log('[8WBot] auto restore:', on ? '✅ 开启' : '❌ 关闭');
+      fetch('/api/updatebotconfig', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ access_token: token.value, botname: botName.value, auto_restore: on })
+      }).then(r => r.json()).then(d => {
+        if (d.code !== 200) console.log('[8WBot] updatebotconfig error:', d.message);
+      }).catch(e => console.log('[8WBot] updatebotconfig network error:', e.message));
+    }
+
+    function loadMapToggle() {
+      console.log('[8WBot] document.cookie:', document.cookie);
+      let raw = getCookie('8wbot_show_map');
+      console.log('[8WBot] cookie raw value:', JSON.stringify(raw));
+      // 首次访问：写入默认值 true，确保后续都能读到 cookie
+      if (raw === null) {
+        setCookie('8wbot_show_map', 'true');
+        raw = 'true';
+        console.log('[8WBot] initialized cookie to true');
+      }
+      showMapImage.value = raw === 'true';
+      console.log('[8WBot] 手持地图开关状态 (加载):', showMapImage.value ? '🖼️ 显示' : '🚫 隐藏');
+    }
+
+    function toggleMapImage(e) {
+      const on = e.target.checked;
+      showMapImage.value = on;
+      // 关闭时清除已渲染的图片
+      if (!on) {
+        lines.value = lines.value.filter(l => l.type !== 'image');
+      }
+      const val = on ? 'true' : 'false';
+      console.log('[8WBot] toggle map:', on ? '🖼️ 显示' : '🚫 隐藏', 'cookie=', val);
+      setCookie('8wbot_show_map', val);
+      console.log('[8WBot] document.cookie:', document.cookie);
+    }
+
+    function getToken() {
+      const m = document.cookie.match(/8wbot_token=([^;]+)/);
+      if (m) return decodeURIComponent(m[1]);
+      return localStorage.getItem('8wbot_token') || '';
+    }
+
+    function addLine(text, cls = '') {
+      const now = new Date();
+      const t = now.getHours().toString().padStart(2,'0') + ':' +
+                now.getMinutes().toString().padStart(2,'0') + ':' +
+                now.getSeconds().toString().padStart(2,'0');
+      lines.value.push({ time: t, text, cls });
+      nextTick(() => {
+        const el = terminal.value;
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+    }
+
+    function classify(chat) {
+      if (chat.startsWith('[系统]')) return 'sys';
+      if (chat.startsWith('[聊天]')) return 'chat';
+      if (chat.startsWith('[消息]')) return 'msg';
+      return '';
+    }
+
+    async function loadBotList() {
+      token.value = getToken();
+      if (!token.value) {
+        addLine('[错误] 未登录，请先登录', 'err');
+        return;
+      }
+      try {
+        const r = await fetch('/api/getmybotslist', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ access_token: token.value })
+        });
+        const d = await r.json();
+        if (d.code === '200' && d.data) {
+          botList.value = d.data;
+        }
+      } catch (e) {
+        addLine('[错误] 加载机器人列表失败: ' + e.message, 'err');
+      }
+    }
+
+    async function connectBot() {
+      if (!selectedBot.value) return;
+      if (ws) { ws.close(); ws = null; }
+      lines.value = [];
+      botName.value = selectedBot.value;
+      state.value = 'connecting';
+      addLine('[系统] 正在连接控制台...', 'sys');
+
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = protocol + '//' + location.host + '/ws/api/connectbot';
+
+      try {
+        ws = new WebSocket(wsUrl);
+        ws.onopen = () => {
+          // Send auth
+          ws.send(JSON.stringify({ accesstoken: token.value, botname: botName.value }));
+        };
+        ws.onmessage = (evt) => {
+          try {
+            const msg = JSON.parse(evt.data);
+            if (msg.code === '200' && msg.data) {
+              // History message
+              for (const item of msg.data) {
+                if (item.log) {
+                  const decoded = new TextDecoder('utf-8').decode(
+                    Uint8Array.from(atob(item.log), c => c.charCodeAt(0))
+                  );
+                  if (decoded) {
+                    addLine('--- 历史日志 (最近100条) ---', 'sys');
+                    decoded.split('\n').forEach(l => {
+                      if (l.trim()) addLine(l, classify(l));
+                    });
+                    addLine('--- 实时日志 ---', 'sys');
+                  }
+                }
+              }
+              state.value = 'connected';
+              online.value = true;
+              addLine('[系统] 已连接，等待日志...', 'sys');
+              fetchStatus();
+            } else if (msg.code === '200' && msg.online === false) {
+              // Bot is offline
+              state.value = 'connected';
+              online.value = false;
+              addLine('[系统] 已连接，机器人当前离线', 'sys');
+              fetchStatus();
+            } else if (msg.code === 401 || msg.code === 403) {
+              addLine('[错误] ' + (msg.message || '认证失败'), 'err');
+              state.value = 'disconnected';
+              disconnectReason.value = msg.message || '认证失败';
+            } else if (msg.code === 502) {
+              addLine('[错误] ' + (msg.message || '机器人不可用'), 'err');
+              state.value = 'disconnected';
+              disconnectReason.value = msg.message || '机器人不可用';
+            } else if (msg.type === 'map_image' && msg.image) {
+              if (showMapImage.value) {
+                // Minecraft map rendered as PNG image (auth QR code)
+                addLine('', '');
+                addLine('╔══════════════════════════════════════════════╗', 'sys');
+                addLine('║        📷 手持地图 - 请扫描二维码          ║', 'sys');
+                addLine('╚══════════════════════════════════════════════╝', 'sys');
+                const now = new Date();
+                const t = now.getHours().toString().padStart(2,'0') + ':' +
+                          now.getMinutes().toString().padStart(2,'0') + ':' +
+                          now.getSeconds().toString().padStart(2,'0');
+                lines.value.push({ time: t, type: 'image', data: msg.image, cls: '' });
+              }
+            } else if (msg.type === 'auto_reconnect' && msg.msg) {
+              addLine('[系统] ' + msg.msg, 'sys');
+              online.value = true;
+            } else if (Array.isArray(msg) && msg.length > 0) {
+              // Event array from bot
+              for (const ev of msg) {
+                if (ev.data) {
+                  for (const d of ev.data) {
+                    if (d.chat) addLine(d.chat, classify(d.chat));
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            // Not JSON, ignore
+          }
+        };
+        ws.onerror = () => {
+          addLine('[错误] WebSocket 连接错误', 'err');
+          state.value = 'disconnected';
+          disconnectReason.value = 'WebSocket 连接错误';
+        };
+        ws.onclose = () => {
+          if (state.value !== 'disconnected') {
+            state.value = 'disconnected';
+            disconnectReason.value = '连接已关闭';
+            addLine('[系统] 连接已关闭', 'sys');
+          }
+        };
+      } catch (e) {
+        state.value = 'disconnected';
+        disconnectReason.value = e.message;
+        addLine('[错误] ' + e.message, 'err');
+      }
+    }
+
+    async function startBot() {
+      if (!botName.value) return;
+      starting.value = true;
+      addLine('[系统] 正在启动机器人...', 'sys');
+
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const url = protocol + '//' + location.host + '/ws/api/startbot';
+
+      try {
+        const startWs = new WebSocket(url);
+        startWs.onopen = () => {
+          startWs.send(JSON.stringify({ access_token: token.value, botname: botName.value }));
+        };
+        startWs.onmessage = (evt) => {
+          try {
+            const msg = JSON.parse(evt.data);
+            if (msg.code === 200) {
+              addLine('[系统] 机器人启动成功！', 'sys');
+              online.value = true;
+              starting.value = false;
+              // Reconnect the log console to start receiving events
+              connectBot();
+            } else if (msg.code === 409) {
+              addLine('[系统] 机器人已在运行', 'sys');
+              online.value = true;
+              starting.value = false;
+              connectBot();
+            } else {
+              addLine('[错误] 启动失败: ' + (msg.message || '未知错误'), 'err');
+              starting.value = false;
+            }
+          } catch (e) {
+            addLine('[错误] 启动响应解析失败', 'err');
+            starting.value = false;
+          }
+          startWs.close();
+        };
+        startWs.onerror = () => {
+          addLine('[错误] 无法连接到启动服务', 'err');
+          starting.value = false;
+        };
+      } catch (e) {
+        addLine('[错误] ' + e.message, 'err');
+        starting.value = false;
+      }
+    }
+
+    async function stopBot() {
+      if (!botName.value) return;
+      addLine('[系统] 正在关闭机器人...', 'sys');
+
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const url = protocol + '//' + location.host + '/ws/api/stopbot';
+
+      try {
+        const stopWs = new WebSocket(url);
+        stopWs.onopen = () => {
+          stopWs.send(JSON.stringify({ access_token: token.value, botname: botName.value }));
+        };
+        stopWs.onmessage = (evt) => {
+          try {
+            const msg = JSON.parse(evt.data);
+            if (msg.code === 200) {
+              addLine('[系统] 机器人已关闭', 'sys');
+              online.value = false;
+            } else {
+              addLine('[错误] 关闭失败: ' + (msg.message || '未知错误'), 'err');
+            }
+          } catch (e) {
+            addLine('[错误] 关闭响应解析失败', 'err');
+          }
+          stopWs.close();
+        };
+        stopWs.onerror = () => {
+          addLine('[错误] 无法连接到关闭服务', 'err');
+        };
+      } catch (e) {
+        addLine('[错误] ' + e.message, 'err');
+      }
+    }
+
+    async function fetchStatus() {
+      try {
+        const r = await fetch('/api/getbotstatus', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ access_token: token.value, botname: botName.value })
+        });
+        const d = await r.json();
+        if (d.code === '200') {
+          online.value = d.online;
+          server.value = d.server || '';
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    async function sendCmd() {
+      const text = cmdText.value.trim();
+      if (!text || state.value !== 'connected' || !botName.value) return;
+      cmdText.value = '';
+
+      // If it starts with /, it's a command
+      if (text.startsWith('/')) {
+        addLine('[系统] 发送命令: ' + text, 'sys');
+      } else {
+        addLine('[聊天] 我: ' + text, 'chat');
+      }
+
+      // Send via REST API
+      try {
+        const r = await fetch('/api/sendinfo', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ access_token: token.value, bot_name: botName.value, data: [{ chat: text }] })
+        });
+        const d = await r.json();
+        if (d.code !== '200') {
+          addLine('[错误] 发送失败: ' + (d.message || '未知'), 'err');
+        }
+      } catch (e) {
+        addLine('[错误] 网络错误: ' + e.message, 'err');
+      }
+    }
+
+    function disconnect() {
+      if (ws) { ws.close(); ws = null; }
+      state.value = 'disconnected';
+      disconnectReason.value = '用户断开';
+      addLine('[系统] 已主动断开', 'sys');
+    }
+
+    function focusInput() {
+      if (cmdInput.value) cmdInput.value.focus();
+    }
+
+    onMounted(() => {
+      loadAutoReconnect();
+      loadAutoRestore();
+      loadMapToggle();
+      const t = getToken();
+      if (!t) {
+        addLine('[错误] 未登录，即将跳转登录页...', 'err');
+        setTimeout(() => { window.location.href = '/login.html'; }, 1500);
+        return;
+      }
+      token.value = t;
+
+      // Check URL param: ?botname=xxx
+      const params = new URLSearchParams(window.location.search);
+      const urlBot = params.get('botname');
+      if (urlBot) {
+        selectedBot.value = urlBot;
+        // Load list first to verify, then connect
+        loadBotList().then(() => {
+          const exists = botList.value.some(b => b.bot_name === urlBot);
+          if (exists) {
+            connectBot();
+          } else {
+            addLine('[警告] 机器人 "' + urlBot + '" 不在你的列表中，已加载列表供选择', 'err');
+          }
+        });
+      } else {
+        loadBotList();
+      }
+    });
+
+    return {
+      state, disconnectReason, botName, server, online, starting, selectedBot, botList,
+      lines, cmdText, terminal, cmdInput, connectBot, sendCmd, disconnect, focusInput,
+      startBot, stopBot, statusText: '就绪',
+      showMapImage, toggleMapImage, autoReconnect, toggleAutoReconnect,
+      autoRestore, toggleAutoRestore
+    };
+  }
+}).mount('#app');
+</script>
+</body>
+</html>

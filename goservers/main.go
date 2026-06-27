@@ -1,15 +1,23 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"log"
 	"mime/multipart"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,6 +26,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/gorilla/websocket"
 	_ "modernc.org/sqlite"
 )
 
@@ -45,11 +54,13 @@ type UserData struct {
 
 // BotData represents a Minecraft bot bound to a user.
 type BotData struct {
-	Belong       string `json:"belong"`        // 简欢通UID
-	CreationTime string `json:"creation_time"` // 创建时间
-	Username     string `json:"username"`      // 游戏内用户名
-	DSL          bool   `json:"dsl"`           // 是否启用DSL脚本
-	Status       string `json:"status"`        // no / confirmed
+	Belong        string `json:"belong"`         // 简欢通UID
+	CreationTime  string `json:"creation_time"`  // 创建时间
+	Username      string `json:"username"`       // 游戏内用户名
+	DSL           bool   `json:"dsl"`            // 是否启用DSL脚本
+	Status        string `json:"status"`         // no / confirmed
+	AutoRestore   bool   `json:"auto_restore"`   // 是否自动恢复连接
+	AutoReconnect bool   `json:"auto_reconnect"` // 是否自动重连
 }
 
 func loadEnv(path string) map[string]string {
@@ -161,6 +172,49 @@ func main() {
 
 	// Start SSH server (non-blocking)
 	StartSSHServer(baseDir)
+
+	// Start WS client to JS bot launcher (non-blocking)
+	InitWSClient()
+	log.Println("[WS] client connecting to JS bot launcher at ws://127.0.0.1:8889")
+
+	// Global auto-restore: every 5 minutes, send restore command for all bots with auto_restore enabled
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			rows, err := db.Query("SELECT username FROM bots WHERE auto_restore = 1")
+			if err != nil {
+				continue
+			}
+			var names []string
+			for rows.Next() {
+				var name string
+				rows.Scan(&name)
+				names = append(names, name)
+			}
+			rows.Close()
+			if len(names) == 0 {
+				continue
+			}
+			log.Printf("[AUTO-RESTORE] sending restore command to %d bot(s)", len(names))
+			for _, name := range names {
+				su := url.URL{Scheme: "ws", Host: "127.0.0.1:8889", Path: "/ws/api/sendinfo"}
+				sc, _, serr := (&websocket.Dialer{}).Dial(su.String(), nil)
+				if serr != nil {
+					continue
+				}
+				sc.SetReadDeadline(time.Now().Add(3 * time.Second))
+				_, _, _ = sc.ReadMessage()
+				sc.SetReadDeadline(time.Time{})
+				sreq, _ := json.Marshal(map[string]interface{}{
+					"botname": name,
+					"data":    []map[string]string{{"command": "u restore confirm"}},
+				})
+				sc.WriteMessage(websocket.TextMessage, sreq)
+				sc.Close()
+			}
+		}
+	}()
 
 	mux := http.NewServeMux()
 
@@ -410,12 +464,13 @@ func main() {
 				u, _ := findUser(db, uidStr)
 				if u == nil {
 					u = &UserData{
-						JhtUID:     uidStr,
-						LevelID:    10001,
-						SimpassUID: otpStatus.UserInfo.SimpassUID,
-						CreateTime: otpStatus.UserInfo.CreateTime,
-						Level:      otpStatus.UserInfo.Level,
-						Risky:      otpStatus.UserInfo.Risky,
+						JhtUID:                       uidStr,
+						LevelID:                      10001,
+						RemainingBotCreationQuantity: 1,
+						SimpassUID:                   otpStatus.UserInfo.SimpassUID,
+						CreateTime:                   otpStatus.UserInfo.CreateTime,
+						Level:                        otpStatus.UserInfo.Level,
+						Risky:                        otpStatus.UserInfo.Risky,
 					}
 				} else {
 					u.SimpassUID = otpStatus.UserInfo.SimpassUID
@@ -617,12 +672,13 @@ func main() {
 		u, _ := findUser(db, uidStr)
 		if u == nil {
 			u = &UserData{
-				JhtUID:     uidStr,
-				LevelID:    10001,
-				SimpassUID: simpassResp.UserInfo.SimpassUID,
-				CreateTime: simpassResp.UserInfo.CreateTime,
-				Level:      simpassResp.UserInfo.Level,
-				Risky:      simpassResp.UserInfo.Risky,
+				JhtUID:                       uidStr,
+				LevelID:                      10001,
+				RemainingBotCreationQuantity: 1,
+				SimpassUID:                   simpassResp.UserInfo.SimpassUID,
+				CreateTime:                   simpassResp.UserInfo.CreateTime,
+				Level:                        simpassResp.UserInfo.Level,
+				Risky:                        simpassResp.UserInfo.Risky,
 			}
 		} else {
 			u.SimpassUID = simpassResp.UserInfo.SimpassUID
@@ -817,6 +873,7 @@ func main() {
 				Username:     req.BotName,
 				DSL:          false,
 				Status:       "no",
+				AutoRestore:  true,
 			}
 			if err := createBot(db, bot); err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
@@ -838,12 +895,829 @@ func main() {
 		})
 	})
 
+	// --- POST /api/getmybotslist : 获取我的机器人列表 ---
+	mux.HandleFunc("/api/getmybotslist", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 405, "msg": "method not allowed"})
+			return
+		}
+
+		var req struct {
+			AccessToken string `json:"access_token"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccessToken == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token required"})
+			return
+		}
+
+		// Validate JWT
+		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		claims, _ := token.Claims.(jwt.MapClaims)
+		jhtUID, _ := claims["jht_uid"].(string)
+		if jhtUID == "" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		bots, err := getBotsByUser(db, jhtUID)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "msg": "db error"})
+			return
+		}
+
+		type botItem struct {
+			BotName     string `json:"bot_name"`
+			CreateTime  string `json:"create_time"`
+			DSL         bool   `json:"DSL"`
+			Status      string `json:"status"`
+			AutoRestore bool   `json:"auto_restore"`
+		}
+		var items []botItem
+		for _, b := range bots {
+			items = append(items, botItem{
+				BotName:     b.Username,
+				CreateTime:  b.CreationTime,
+				DSL:         b.DSL,
+				Status:      b.Status,
+				AutoRestore: b.AutoRestore,
+			})
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"code": "200",
+			"bots": len(items),
+			"data": items,
+		})
+	})
+
+	// --- POST /api/verifybot : 验证机器人 ---
+	mux.HandleFunc("/api/verifybot", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 405, "msg": "method not allowed"})
+			return
+		}
+
+		var req struct {
+			AccessToken string `json:"access_token"`
+			BotName     string `json:"bot_name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccessToken == "" || req.BotName == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token and bot_name required"})
+			return
+		}
+
+		// Validate JWT
+		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+		claims, _ := token.Claims.(jwt.MapClaims)
+		jhtUID, _ := claims["jht_uid"].(string)
+		if jhtUID == "" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		// Start bot via WS and monitor events
+		client := InitWSClient()
+		chat, uid, err := client.StartBotAndDetect(req.BotName, 120*time.Second)
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "启动或监控失败: " + err.Error()})
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"code":            "200",
+			"bot_simpass_uid": uid,
+			"server":          "auth",
+			"chat":            chat,
+		})
+	})
+
+	// --- POST /api/verifycode : 提交验证码 ---
+	mux.HandleFunc("/api/verifycode", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 405, "msg": "method not allowed"})
+			return
+		}
+
+		var req struct {
+			AccessToken string `json:"access_token"`
+			BotName     string `json:"bot_name"`
+			Code        string `json:"code"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "code required"})
+			return
+		}
+
+		// Validate JWT
+		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+		claims, _ := token.Claims.(jwt.MapClaims)
+		jhtUID, _ := claims["jht_uid"].(string)
+		if jhtUID == "" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		// Send code to bot via WS and monitor result
+		client := InitWSClient()
+		chat, err := client.SendCommandAndDetect(req.BotName, req.Code, 120*time.Second)
+		if err != nil {
+			errMsg := err.Error()
+			if errMsg == "verify_failed" {
+				// Stop the bot immediately on failure
+				if stopErr := client.StopBot(req.BotName); stopErr != nil {
+					log.Printf("[WS] stopbot error: %v", stopErr)
+				}
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "message": "验证失败：ID或验证码错误"})
+			} else {
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "发送验证码失败: " + errMsg})
+			}
+			return
+		}
+
+		// Success — "验证成功" found in chat
+		setBotDSL(globalDB, jhtUID, req.BotName, false)
+		updateBotStatus(globalDB, req.BotName, "confirmed")
+		json.NewEncoder(w).Encode(map[string]interface{}{"code": "200", "message": "验证成功，机器人已确认归属", "chat": chat})
+
+		// Stop the bot after 5s (async)
+		go func() {
+			time.Sleep(5 * time.Second)
+			if stopErr := client.StopBot(req.BotName); stopErr != nil {
+				log.Printf("[WS] stopbot after verify success: %v", stopErr)
+			}
+		}()
+	})
+
+	// --- POST /api/getbotstatus : 查询机器人状态 ---
+	mux.HandleFunc("/api/getbotstatus", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 405, "msg": "method not allowed"})
+			return
+		}
+
+		var req struct {
+			AccessToken string `json:"access_token"`
+			BotName     string `json:"botname"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccessToken == "" || req.BotName == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token and botname required"})
+			return
+		}
+
+		// Validate JWT
+		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+		claims, _ := token.Claims.(jwt.MapClaims)
+		jhtUID, _ := claims["jht_uid"].(string)
+		if jhtUID == "" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		// Check bot exists and belongs to user
+		bot, err := findBotByUsername(globalDB, req.BotName)
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "bad gateway!!!机器人服务异常，请联系管理员!"})
+			return
+		}
+		if bot == nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 404, "message": "不存在此机器人，请确认用户名"})
+			return
+		}
+		if bot.Belong != jhtUID {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
+			return
+		}
+
+		// Query online status from JS launcher
+		client := InitWSClient()
+		online, err := client.GetBotStatus(req.BotName)
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "bad gateway!!!机器人服务异常，请联系管理员!"})
+			return
+		}
+
+		server := "main"
+		// If online, we could determine server from context; default to "main"
+		if !online {
+			server = ""
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"code":           "200",
+			"online":         online,
+			"DSL":            bot.DSL,
+			"auto_restore":   bot.AutoRestore,
+			"auto_reconnect": bot.AutoReconnect,
+			"server":         server,
+		})
+	})
+
+	// --- POST /api/updatebotconfig : 更新机器人配置 ---
+	mux.HandleFunc("/api/updatebotconfig", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 405, "msg": "method not allowed"})
+			return
+		}
+
+		var req struct {
+			AccessToken   string `json:"access_token"`
+			BotName       string `json:"botname"`
+			AutoReconnect *bool  `json:"auto_reconnect"`
+			AutoRestore   *bool  `json:"auto_restore"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccessToken == "" || req.BotName == "" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token and botname required"})
+			return
+		}
+
+		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+		claims, _ := token.Claims.(jwt.MapClaims)
+		jhtUID, _ := claims["jht_uid"].(string)
+		if jhtUID == "" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		bot, err := findBotByUsername(globalDB, req.BotName)
+		if err != nil || bot == nil || bot.Belong != jhtUID {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
+			return
+		}
+
+		if req.AutoReconnect != nil {
+			if err := setBotAutoReconnect(globalDB, req.BotName, *req.AutoReconnect); err != nil {
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "msg": "db error"})
+				return
+			}
+			log.Printf("[API] auto_reconnect for %s set to %v", req.BotName, *req.AutoReconnect)
+		}
+		if req.AutoRestore != nil {
+			if err := setBotAutoRestore(globalDB, req.BotName, *req.AutoRestore); err != nil {
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "msg": "db error"})
+				return
+			}
+			log.Printf("[API] auto_restore for %s set to %v", req.BotName, *req.AutoRestore)
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{"code": 200, "message": "配置已更新"})
+	})
+
+	// --- POST /api/sendinfo : 发送命令到机器人 ---
+	mux.HandleFunc("/api/sendinfo", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 405, "msg": "method not allowed"})
+			return
+		}
+
+		var req struct {
+			AccessToken string `json:"access_token"`
+			BotName     string `json:"bot_name"`
+			Data        []struct {
+				Chat    string `json:"chat"`
+				Command string `json:"command"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccessToken == "" || req.BotName == "" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token, bot_name and data required"})
+			return
+		}
+
+		// Validate JWT
+		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+		claims, _ := token.Claims.(jwt.MapClaims)
+		jhtUID, _ := claims["jht_uid"].(string)
+		if jhtUID == "" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		// Check bot belongs to user
+		bot, err := findBotByUsername(globalDB, req.BotName)
+		if err != nil || bot == nil || bot.Belong != jhtUID {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
+			return
+		}
+
+		// Send via sendinfo WS
+		u := url.URL{Scheme: "ws", Host: "127.0.0.1:8889", Path: "/ws/api/sendinfo"}
+		wsConn, _, err := (&websocket.Dialer{}).Dial(u.String(), nil)
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "bad gateway!!!机器人服务异常，请联系管理员!"})
+			return
+		}
+		defer wsConn.Close()
+
+		wsConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_, _, _ = wsConn.ReadMessage()
+		wsConn.SetReadDeadline(time.Time{})
+
+		sendReq, _ := json.Marshal(map[string]interface{}{
+			"botname": req.BotName,
+			"data":    req.Data,
+		})
+		if err := wsConn.WriteMessage(websocket.TextMessage, sendReq); err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "发送失败"})
+			return
+		}
+
+		wsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, resp, err := wsConn.ReadMessage()
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "未收到确认"})
+			return
+		}
+		var result map[string]interface{}
+		json.Unmarshal(resp, &result)
+		json.NewEncoder(w).Encode(result)
+	})
+
 	// --- GET /api/config : 前端配置 ---
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"cap_api_endpoint": capAPIEndpoint,
 		})
+	})
+
+	// --- WebSocket: /ws/api/connectbot : 机器人日志流 ---
+	var wsUpgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+
+	// wsKeepAlive sets up ping/pong heartbeat on a WebSocket connection.
+	// Returns a stop function to clean up the goroutine.
+	wsKeepAlive := func(conn *websocket.Conn) func() {
+		const (
+			pongWait   = 60 * time.Second
+			pingPeriod = 30 * time.Second
+		)
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		conn.SetPongHandler(func(string) error {
+			conn.SetReadDeadline(time.Now().Add(pongWait))
+			return nil
+		})
+		stop := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(pingPeriod)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+					if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+						return
+					}
+				case <-stop:
+					return
+				}
+			}
+		}()
+		return func() { close(stop) }
+	}
+
+	mux.HandleFunc("/ws/api/connectbot", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := wsUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("[WS] upgrade error: %v", err)
+			return
+		}
+		defer conn.Close()
+		stopHeartbeat := wsKeepAlive(conn)
+		defer stopHeartbeat()
+
+		// Read auth message
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		_, authMsg, err := conn.ReadMessage()
+		conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			log.Printf("[WS] connectbot auth read error: %v", err)
+			return
+		}
+		var auth struct {
+			AccessToken string `json:"accesstoken"`
+			BotName     string `json:"botname"`
+		}
+		if err := json.Unmarshal(authMsg, &auth); err != nil || auth.AccessToken == "" || auth.BotName == "" {
+			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "accesstoken and botname required"})
+			return
+		}
+
+		// Validate JWT
+		token, err := jwt.Parse(auth.AccessToken, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			conn.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+		claims, _ := token.Claims.(jwt.MapClaims)
+		jhtUID, _ := claims["jht_uid"].(string)
+		if jhtUID == "" {
+			conn.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		// Check bot belongs to user
+		bot, err := findBotByUsername(globalDB, auth.BotName)
+		if err != nil || bot == nil || bot.Belong != jhtUID {
+			conn.WriteJSON(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
+			return
+		}
+
+		// Build history file path
+		logsDir := filepath.Join(baseDir, "botlogs")
+		os.MkdirAll(logsDir, 0755)
+		logFile := filepath.Join(logsDir, auth.BotName+".log")
+
+		// Load last 100 lines as base64 history
+		var historyLines []string
+		if f, err := os.Open(logFile); err == nil {
+			defer f.Close()
+			data, _ := io.ReadAll(f)
+			allLines := strings.Split(string(data), "\n")
+			start := 0
+			if len(allLines) > 100 {
+				start = len(allLines) - 100
+			}
+			for i := start; i < len(allLines); i++ {
+				if allLines[i] != "" {
+					historyLines = append(historyLines, allLines[i])
+				}
+			}
+		}
+		historyB64 := base64.StdEncoding.EncodeToString([]byte(strings.Join(historyLines, "\n")))
+
+		// Send history to browser
+		conn.WriteJSON(map[string]interface{}{
+			"code": "200",
+			"data": []map[string]string{{"log": historyB64}},
+		})
+
+		// Connect to JS launcher botlogs WS
+		client := InitWSClient()
+		jsConn, err := client.BotLogs(auth.BotName)
+		if err != nil {
+			// Bot offline — notify browser and keep connection open
+			log.Printf("[WS] connectbot botlogs (bot offline): %v", err)
+			conn.WriteJSON(map[string]interface{}{
+				"code":   "200",
+				"online": false,
+			})
+			// Stay connected until browser disconnects
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}
+		defer jsConn.Close()
+
+		// Forward events from JS to browser + save to log file
+		autoReconnect := bot.AutoReconnect
+		botName := auth.BotName
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+			for {
+				_, msg, err := jsConn.ReadMessage()
+				if err != nil {
+					return
+				}
+				// Check for mapdata before forwarding
+				var mapEvents []struct {
+					BotName string `json:"botname"`
+					Data    []struct {
+						MapData    string `json:"mapdata"`
+						Width      int    `json:"width"`
+						BotOffline bool   `json:"bot_offline"`
+						Reason     string `json:"reason"`
+					} `json:"data"`
+				}
+				if json.Unmarshal(msg, &mapEvents) == nil {
+					for _, ev := range mapEvents {
+						for _, d := range ev.Data {
+							if d.MapData != "" && d.Width > 0 {
+								pngB64 := mapDataToPNG(d.MapData, d.Width)
+								if pngB64 != "" {
+									conn.WriteJSON(map[string]interface{}{
+										"type":    "map_image",
+										"botname": ev.BotName,
+										"image":   pngB64,
+									})
+								}
+							}
+							// Auto-reconnect on bot offline
+							if d.BotOffline && autoReconnect && ev.BotName == botName {
+								log.Printf("[WS] bot %s offline (reason: %s), auto-reconnect in 10s", ev.BotName, d.Reason)
+								go func(name string) {
+									time.Sleep(10 * time.Second)
+									// Try to restart: connect to JS startbot WS
+									restartURL := url.URL{Scheme: "ws", Host: "127.0.0.1:8889", Path: "/ws/api/startbot"}
+									rc, _, rerr := (&websocket.Dialer{}).Dial(restartURL.String(), nil)
+									if rerr != nil {
+										log.Printf("[WS] auto-reconnect dial failed for %s: %v", name, rerr)
+										return
+									}
+									defer rc.Close()
+									rc.SetReadDeadline(time.Now().Add(3 * time.Second))
+									_, _, _ = rc.ReadMessage()
+									rc.SetReadDeadline(time.Time{})
+									rreq, _ := json.Marshal(map[string]string{"username": name})
+									rc.WriteMessage(websocket.TextMessage, rreq)
+									rc.SetReadDeadline(time.Now().Add(10 * time.Second))
+									_, rresp, rerr := rc.ReadMessage()
+									if rerr != nil {
+										log.Printf("[WS] auto-reconnect start failed for %s: %v", name, rerr)
+										return
+									}
+									var rresult map[string]interface{}
+									json.Unmarshal(rresp, &rresult)
+									if code, _ := rresult["code"].(float64); code == 200 {
+										log.Printf("[WS] auto-reconnect success for %s", name)
+										// Notify browser
+										conn.WriteJSON(map[string]interface{}{
+											"type": "auto_reconnect",
+											"msg":  "机器人已自动重连",
+										})
+									}
+								}(ev.BotName)
+							}
+						}
+					}
+				}
+				// Forward to browser
+				if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+					return
+				}
+				// Save to log file
+				var events []struct {
+					BotName string `json:"botname"`
+					Data    []struct {
+						Chat string `json:"chat"`
+					} `json:"data"`
+				}
+				if json.Unmarshal(msg, &events) == nil {
+					f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+					if err == nil {
+						for _, ev := range events {
+							for _, d := range ev.Data {
+								f.WriteString(time.Now().Format("2006-01-02 15:04:05") + " " + d.Chat + "\n")
+							}
+						}
+						f.Close()
+					}
+				}
+			}
+		}()
+		<-done
+	})
+
+	// --- WebSocket: /ws/api/startbot : 启动机器人 ---
+	mux.HandleFunc("/ws/api/startbot", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := wsUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("[WS] startbot upgrade error: %v", err)
+			return
+		}
+		defer conn.Close()
+		stopHeartbeat := wsKeepAlive(conn)
+		defer stopHeartbeat()
+
+		// Read auth message
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		_, authMsg, err := conn.ReadMessage()
+		conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			log.Printf("[WS] startbot auth read error: %v", err)
+			return
+		}
+		var req struct {
+			AccessToken string `json:"access_token"`
+			BotName     string `json:"botname"`
+		}
+		if err := json.Unmarshal(authMsg, &req); err != nil || req.AccessToken == "" || req.BotName == "" {
+			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "access_token and botname required"})
+			return
+		}
+
+		// Validate JWT
+		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			conn.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+		claims, _ := token.Claims.(jwt.MapClaims)
+		jhtUID, _ := claims["jht_uid"].(string)
+		if jhtUID == "" {
+			conn.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		// Check bot belongs to user
+		bot, err := findBotByUsername(globalDB, req.BotName)
+		if err != nil || bot == nil || bot.Belong != jhtUID {
+			conn.WriteJSON(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
+			return
+		}
+
+		// Connect to JS launcher and start the bot
+		jsURL := url.URL{Scheme: "ws", Host: "127.0.0.1:8889", Path: "/ws/api/startbot"}
+		jsConn, _, err := (&websocket.Dialer{}).Dial(jsURL.String(), nil)
+		if err != nil {
+			conn.WriteJSON(map[string]interface{}{"code": 502, "message": "bad gateway!!!无法连接到机器人服务"})
+			return
+		}
+		defer jsConn.Close()
+
+		// Consume welcome
+		jsConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_, _, _ = jsConn.ReadMessage()
+		jsConn.SetReadDeadline(time.Time{})
+
+		// Send start command
+		startReq, _ := json.Marshal(map[string]string{"username": req.BotName})
+		if err := jsConn.WriteMessage(websocket.TextMessage, startReq); err != nil {
+			conn.WriteJSON(map[string]interface{}{"code": 502, "message": "发送启动命令失败"})
+			return
+		}
+
+		// Read start response from JS
+		jsConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		_, jsResp, err := jsConn.ReadMessage()
+		if err != nil {
+			conn.WriteJSON(map[string]interface{}{"code": 502, "message": "启动超时，未收到机器人响应"})
+			return
+		}
+		var jsResult map[string]interface{}
+		json.Unmarshal(jsResp, &jsResult)
+
+		// Forward JS response to browser
+		conn.WriteJSON(jsResult)
+
+		// If bot started successfully, forward events to browser in real-time
+		if code, _ := jsResult["code"].(float64); code == 200 {
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				for {
+					_, evtMsg, err := jsConn.ReadMessage()
+					if err != nil {
+						return
+					}
+					if err := conn.WriteMessage(websocket.TextMessage, evtMsg); err != nil {
+						return
+					}
+				}
+			}()
+			<-done
+		}
+	})
+
+	// --- WebSocket: /ws/api/stopbot : 关闭机器人 ---
+	mux.HandleFunc("/ws/api/stopbot", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := wsUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("[WS] stopbot upgrade error: %v", err)
+			return
+		}
+		defer conn.Close()
+		stopHeartbeat := wsKeepAlive(conn)
+		defer stopHeartbeat()
+
+		// Read auth message
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		_, authMsg, err := conn.ReadMessage()
+		conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			log.Printf("[WS] stopbot auth read error: %v", err)
+			return
+		}
+		var req struct {
+			AccessToken string `json:"access_token"`
+			BotName     string `json:"botname"`
+		}
+		if err := json.Unmarshal(authMsg, &req); err != nil || req.AccessToken == "" || req.BotName == "" {
+			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "access_token and botname required"})
+			return
+		}
+
+		// Validate JWT
+		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			conn.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+		claims, _ := token.Claims.(jwt.MapClaims)
+		jhtUID, _ := claims["jht_uid"].(string)
+		if jhtUID == "" {
+			conn.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		// Check bot belongs to user
+		bot, err := findBotByUsername(globalDB, req.BotName)
+		if err != nil || bot == nil || bot.Belong != jhtUID {
+			conn.WriteJSON(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
+			return
+		}
+
+		// Connect to JS launcher stopbot
+		client := InitWSClient()
+		if err := client.StopBot(req.BotName); err != nil {
+			log.Printf("[WS] stopbot error: %v", err)
+			conn.WriteJSON(map[string]interface{}{"code": 502, "message": "关闭失败: " + err.Error()})
+			return
+		}
+
+		conn.WriteJSON(map[string]interface{}{"code": 200, "message": "机器人已断开"})
 	})
 
 	// --- Static file serving with config injection ---
@@ -881,6 +1755,14 @@ func (lrw *loggingResponseWriter) WriteHeader(code int) {
 	lrw.ResponseWriter.WriteHeader(code)
 }
 
+// Hijack implements http.Hijacker so gorilla/websocket can upgrade connections.
+func (lrw *loggingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hijacker, ok := lrw.ResponseWriter.(http.Hijacker); ok {
+		return hijacker.Hijack()
+	}
+	return nil, nil, fmt.Errorf("loggingResponseWriter: underlying ResponseWriter does not implement http.Hijacker")
+}
+
 func migrate(db *sql.DB) error {
 	sqlStmt := `CREATE TABLE IF NOT EXISTS userdata (
 		jht_uid TEXT PRIMARY KEY,
@@ -912,12 +1794,16 @@ func migrate(db *sql.DB) error {
 		creation_time TEXT NOT NULL,
 		username TEXT NOT NULL,
 		dsl INTEGER DEFAULT 0,
-		status TEXT DEFAULT 'no'
+		status TEXT DEFAULT 'no',
+		auto_restore INTEGER DEFAULT 1,
+		auto_reconnect INTEGER DEFAULT 1
 	);`
 	if _, err := db.Exec(botsStmt); err != nil {
 		return err
 	}
 	db.Exec("ALTER TABLE bots ADD COLUMN status TEXT DEFAULT 'no'")
+	db.Exec("ALTER TABLE bots ADD COLUMN auto_restore INTEGER DEFAULT 1")
+	db.Exec("ALTER TABLE bots ADD COLUMN auto_reconnect INTEGER DEFAULT 1")
 	return nil
 }
 
@@ -956,4 +1842,394 @@ func upsertUser(db *sql.DB, u *UserData) error {
 			status_info=excluded.status_info;`,
 		u.JhtUID, u.AccessToken, u.RemainingBotCreationQuantity, u.LevelID, u.SimpassUID, u.CreateTime, u.Level, riskyInt, u.LastLoginTime, u.Status, u.StatusInfo)
 	return err
+}
+
+func contains(s, sub string) bool {
+	return len(s) >= len(sub) && s != "" && sub != "" && len(s)-len(sub) >= 0 && containsStr(s, sub)
+}
+
+func containsStr(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+func extractSimpassUID(chat string) string {
+	// Try to extract UID from patterns like "UID：XXXXXX", "UID: XXXXXX" or "UID是：XXXXXX"
+	for _, prefix := range []string{"UID是：", "UID是:", "UID：", "UID:", "uid是：", "uid是:", "uid：", "uid:"} {
+		idx := strings.Index(chat, prefix)
+		if idx >= 0 {
+			rest := chat[idx+len(prefix):]
+			// Trim leading spaces/colons
+			rest = strings.TrimLeft(rest, " :：")
+			end := strings.IndexAny(rest, " \n\r")
+			if end > 0 {
+				return rest[:end]
+			}
+			return rest
+		}
+	}
+	return ""
+}
+
+// Minecraft map color palette (post-1.16), indexed by color ID (0-255).
+// Source: Minecraft's MapColor.COLORS array.
+var mapColors = []color.RGBA{
+	{0, 0, 0, 0},         // 0
+	{127, 178, 56, 255},  // 1
+	{247, 233, 163, 255}, // 2
+	{199, 199, 199, 255}, // 3
+	{255, 255, 255, 255}, // 4
+	{160, 160, 255, 255}, // 5
+	{167, 167, 167, 255}, // 6
+	{0, 124, 0, 255},     // 7
+	{255, 255, 255, 255}, // 8
+	{164, 168, 184, 255}, // 9
+	{151, 109, 77, 255},  // 10
+	{112, 112, 112, 255}, // 11
+	{64, 64, 255, 255},   // 12
+	{143, 119, 72, 255},  // 13
+	{255, 252, 245, 255}, // 14
+	{216, 127, 51, 255},  // 15
+	{178, 76, 216, 255},  // 16
+	{102, 153, 216, 255}, // 17
+	{229, 229, 51, 255},  // 18
+	{127, 204, 25, 255},  // 19
+	{242, 127, 165, 255}, // 20
+	{76, 76, 76, 255},    // 21
+	{153, 153, 153, 255}, // 22
+	{76, 127, 153, 255},  // 23
+	{127, 63, 178, 255},  // 24
+	{51, 76, 178, 255},   // 25
+	{102, 76, 51, 255},   // 26
+	{102, 127, 51, 255},  // 27
+	{153, 51, 51, 255},   // 28
+	{25, 25, 25, 255},    // 29
+	{250, 238, 77, 255},  // 30
+	{92, 219, 213, 255},  // 31
+	{74, 128, 255, 255},  // 32
+	{0, 217, 58, 255},    // 33
+	{129, 86, 49, 255},   // 34
+	{112, 2, 0, 255},     // 35
+	{209, 177, 161, 255}, // 36
+	{159, 144, 104, 255}, // 37
+	{104, 96, 80, 255},   // 38
+	{255, 255, 255, 255}, // 39
+	{255, 255, 255, 255}, // 40
+	{255, 255, 255, 255}, // 41
+	{255, 255, 255, 255}, // 42
+	{255, 255, 255, 255}, // 43
+	{255, 255, 255, 255}, // 44
+	{255, 255, 255, 255}, // 45
+	{255, 255, 255, 255}, // 46
+	{255, 255, 255, 255}, // 47
+	{255, 255, 255, 255}, // 48
+	{255, 255, 255, 255}, // 49
+	{255, 255, 255, 255}, // 50
+	{255, 255, 255, 255}, // 51
+	{255, 255, 255, 255}, // 52
+	{255, 255, 255, 255}, // 53
+	{255, 255, 255, 255}, // 54
+	{255, 255, 255, 255}, // 55
+	{255, 255, 255, 255}, // 56
+	{255, 255, 255, 255}, // 57
+	{255, 255, 255, 255}, // 58
+	{255, 255, 255, 255}, // 59
+	{255, 255, 255, 255}, // 60
+	{255, 255, 255, 255}, // 61
+	{255, 255, 255, 255}, // 62
+	{255, 255, 255, 255}, // 63
+	// Indices 64-143 from Minecraft's full palette (biome colors, etc.)
+	{0, 0, 0, 0},         // 64
+	{127, 178, 56, 255},  // 65
+	{247, 233, 163, 255}, // 66
+	{167, 167, 167, 255}, // 67
+	{255, 255, 255, 255}, // 68
+	{160, 160, 255, 255}, // 69
+	{167, 167, 167, 255}, // 70
+	{0, 124, 0, 255},     // 71
+	{255, 255, 255, 255}, // 72
+	{164, 168, 184, 255}, // 73
+	{151, 109, 77, 255},  // 74
+	{112, 112, 112, 255}, // 75
+	{64, 64, 255, 255},   // 76
+	{143, 119, 72, 255},  // 77
+	{255, 252, 245, 255}, // 78
+	{216, 127, 51, 255},  // 79
+	{178, 76, 216, 255},  // 80
+	{102, 153, 216, 255}, // 81
+	{229, 229, 51, 255},  // 82
+	{127, 204, 25, 255},  // 83
+	{242, 127, 165, 255}, // 84
+	{76, 76, 76, 255},    // 85
+	{153, 153, 153, 255}, // 86
+	{76, 127, 153, 255},  // 87
+	{127, 63, 178, 255},  // 88
+	{51, 76, 178, 255},   // 89
+	{102, 76, 51, 255},   // 90
+	{102, 127, 51, 255},  // 91
+	{153, 51, 51, 255},   // 92
+	{25, 25, 25, 255},    // 93
+	{250, 238, 77, 255},  // 94
+	{92, 219, 213, 255},  // 95
+	{74, 128, 255, 255},  // 96
+	{0, 217, 58, 255},    // 97
+	{129, 86, 49, 255},   // 98
+	{112, 2, 0, 255},     // 99
+	{209, 177, 161, 255}, // 100
+	{159, 144, 104, 255}, // 101
+	{104, 96, 80, 255},   // 102
+	{255, 255, 255, 255}, // 103
+	{255, 255, 255, 255}, // 104
+	{255, 255, 255, 255}, // 105
+	{255, 255, 255, 255}, // 106
+	{255, 255, 255, 255}, // 107
+	{255, 255, 255, 255}, // 108
+	{255, 255, 255, 255}, // 109
+	{255, 255, 255, 255}, // 110
+	{255, 255, 255, 255}, // 111
+	{255, 255, 255, 255}, // 112
+	{255, 255, 255, 255}, // 113
+	{255, 255, 255, 255}, // 114
+	{255, 255, 255, 255}, // 115
+	{255, 255, 255, 255}, // 116
+	{255, 255, 255, 255}, // 117
+	{255, 255, 255, 255}, // 118
+	{255, 255, 255, 255}, // 119
+	{255, 255, 255, 255}, // 120
+	{255, 255, 255, 255}, // 121
+	{255, 255, 255, 255}, // 122
+	{255, 255, 255, 255}, // 123
+	{255, 255, 255, 255}, // 124
+	{255, 255, 255, 255}, // 125
+	{255, 255, 255, 255}, // 126
+	{255, 255, 255, 255}, // 127
+	// Extended biome colors (indices 128-255)
+	{0, 0, 0, 0}, // 128+
+	{127, 178, 56, 255},
+	{247, 233, 163, 255},
+	{199, 199, 199, 255},
+	{255, 255, 255, 255},
+	{160, 160, 255, 255},
+	{167, 167, 167, 255},
+	{0, 124, 0, 255},
+	{255, 255, 255, 255},
+	{164, 168, 184, 255},
+	{151, 109, 77, 255},
+	{112, 112, 112, 255},
+	{64, 64, 255, 255},
+	{143, 119, 72, 255},
+	{255, 252, 245, 255},
+	{216, 127, 51, 255},
+	{178, 76, 216, 255},
+	{102, 153, 216, 255},
+	{229, 229, 51, 255},
+	{127, 204, 25, 255},
+	{242, 127, 165, 255},
+	{76, 76, 76, 255},
+	{153, 153, 153, 255},
+	{76, 127, 153, 255},
+	{127, 63, 178, 255},
+	{51, 76, 178, 255},
+	{102, 76, 51, 255},
+	{102, 127, 51, 255},
+	{153, 51, 51, 255},
+	{25, 25, 25, 255},
+	{250, 238, 77, 255},
+	{92, 219, 213, 255},
+	{74, 128, 255, 255},
+	{0, 217, 58, 255},
+	{129, 86, 49, 255},
+	{112, 2, 0, 255},
+	{209, 177, 161, 255},
+	{159, 144, 104, 255},
+	{104, 96, 80, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{255, 255, 255, 255},
+	{0, 0, 0, 0},
+	{0, 0, 0, 0},
+	{0, 0, 0, 0},
+	{0, 0, 0, 0},
+}
+
+// getMapColor returns the RGBA color for a Minecraft map color ID (0-255).
+// Out-of-range IDs return transparent black.
+func getMapColor(id int) color.RGBA {
+	if id >= 0 && id < len(mapColors) {
+		return mapColors[id]
+	}
+	return color.RGBA{0, 0, 0, 0}
+}
+
+// mapDataToPNG converts Minecraft map pixel data (base64) to a PNG image
+// encoded as base64. width is the pixel dimension (128 or 256).
+func mapDataToPNG(b64Data string, width int) string {
+	raw, err := base64.StdEncoding.DecodeString(b64Data)
+	if err != nil || len(raw) == 0 {
+		return ""
+	}
+
+	height := len(raw) / width
+	if height == 0 {
+		return ""
+	}
+
+	// Create RGBA image at 4x scale for better visibility
+	scale := 4
+	img := image.NewRGBA(image.Rect(0, 0, width*scale, height*scale))
+
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			idx := y*width + x
+			if idx >= len(raw) {
+				continue
+			}
+			c := getMapColor(int(raw[idx]))
+			// Fill a scale×scale block with the same color
+			for dy := 0; dy < scale; dy++ {
+				for dx := 0; dx < scale; dx++ {
+					img.SetRGBA(x*scale+dx, y*scale+dy, c)
+				}
+			}
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
 }
