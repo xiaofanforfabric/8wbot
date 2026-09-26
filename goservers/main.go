@@ -14,7 +14,6 @@ import (
 	"image/png"
 	"io"
 	"log"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -154,6 +153,48 @@ func corsOriginAllowed(origin string) bool {
 		}
 	}
 	return false
+}
+
+// verifyCapToken 调用 Cap 服务端校验人机验证 token。
+//
+// 同时发送 token 与 response 两个字段名以兼容不同版本的 Cap 实例：
+//   - 新版 Cap 读取 token
+//   - 部分自建/旧版实例（如 cap.fanverify.cn）仍读取 response
+//
+// 只发 token 时旧实例取不到该字段，会返回 500 Internal server error，
+// 进而被误判为"人机验证失败"，表现为前端始终收到 403。
+func verifyCapToken(capTok string) (bool, error) {
+	if capTok == "" {
+		return false, nil
+	}
+	verifyURL := capServerURL + "/siteverify"
+	payload := map[string]string{
+		"secret":   capSecretKey,
+		"token":    capTok,
+		"response": capTok,
+	}
+	capBody, _ := json.Marshal(payload)
+
+	resp, err := http.Post(verifyURL, "application/json", bytes.NewReader(capBody))
+	if err != nil {
+		return false, fmt.Errorf("siteverify request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+
+	var result struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}
+	_ = json.Unmarshal(raw, &result)
+
+	if !result.Success {
+		// 保留原始响应，便于区分"token 失效"与"实例内部错误"
+		log.Printf("[CAP] siteverify 校验未通过 (http %d): %s", resp.StatusCode, string(raw))
+		return false, nil
+	}
+	return true, nil
 }
 
 // OTP session store (in-memory)
@@ -635,22 +676,15 @@ func main() {
 			capTok := r.URL.Query().Get("cap_token")
 
 			// verify cap token using Cap siteverify API
-			verifyURL := capServerURL + "/siteverify"
-			capBody, _ := json.Marshal(map[string]string{"secret": capSecretKey, "token": capTok})
-			capResp, err := http.Post(verifyURL, "application/json", bytes.NewReader(capBody))
-			if err != nil {
+			capOK, capErr := verifyCapToken(capTok)
+			if capErr != nil {
 				w.WriteHeader(http.StatusBadGateway)
-				json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "verification service unavailable"})
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "人机验证服务暂时不可用，请稍后重试"})
 				return
 			}
-			defer capResp.Body.Close()
-			var capResult struct {
-				Success bool `json:"success"`
-			}
-			json.NewDecoder(capResp.Body).Decode(&capResult)
-			if !capResult.Success {
+			if !capOK {
 				w.WriteHeader(http.StatusForbidden)
-				json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "msg": "human verification failed"})
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "msg": "人机验证未通过，请重新完成验证"})
 				return
 			}
 
@@ -727,91 +761,97 @@ func main() {
 		// Cap human verification
 		if req.CapToken == "" {
 			w.WriteHeader(http.StatusForbidden)
-			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "msg": "human verification required"})
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "msg": "请先完成人机验证"})
 			return
 		}
-		verifyURL := capServerURL + "/siteverify"
-		capBody, _ := json.Marshal(map[string]string{"secret": capSecretKey, "token": req.CapToken})
-		capResp, err := http.Post(verifyURL, "application/json", bytes.NewReader(capBody))
-		if err != nil {
+		capOK, capErr := verifyCapToken(req.CapToken)
+		if capErr != nil {
 			w.WriteHeader(http.StatusBadGateway)
-			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "verification service unavailable"})
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "人机验证服务暂时不可用，请稍后重试"})
 			return
 		}
-		defer capResp.Body.Close()
-		var capResult struct {
-			Success bool `json:"success"`
-		}
-		json.NewDecoder(capResp.Body).Decode(&capResult)
-		if !capResult.Success {
+		if !capOK {
 			w.WriteHeader(http.StatusForbidden)
-			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "msg": "human verification failed"})
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "msg": "人机验证未通过，请重新完成验证"})
 			return
 		}
 
-		// Proxy to simpass
-		bodyBuf := &bytes.Buffer{}
-		writer := multipart.NewWriter(bodyBuf)
-		writer.WriteField("uuid", devUUID)
-		writer.WriteField("user_id", req.UserID)
-		writer.WriteField("verify_code", req.VerifyCode)
-		writer.Close()
+		// 调用 FanVerify 开放平台校验动态通行码
+		// （旧版简幻通 simpass 接口已废弃，继续调用会直接连接失败返回 502）
+		apiURL := fmt.Sprintf("%s/openapi/user_verify?accesstoken=%s&uid=%s&pass_code=%s",
+			fanverifyAPIBase, fanverifyAccessToken, url.QueryEscape(req.UserID), url.QueryEscape(req.VerifyCode))
 
-		resp, err := http.Post(simpassAPIBase+"/api/dev/auth", writer.FormDataContentType(), bodyBuf)
+		resp, err := http.Get(apiURL)
 		if err != nil {
-			log.Printf("[AUTH] simpass request error: %v", err)
+			log.Printf("[AUTH] fanverify request error: %v", err)
 			w.WriteHeader(http.StatusBadGateway)
-			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "upstream request failed"})
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "账号验证服务连接失败，请稍后重试"})
 			return
 		}
 		defer resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
-		log.Printf("[AUTH] simpass response for user_id=%s: code=%d body=%s", req.UserID, resp.StatusCode, string(respBody))
+		log.Printf("[AUTH] fanverify response for uid=%s: code=%d body=%s", req.UserID, resp.StatusCode, string(respBody))
 
-		var simpassResp struct {
-			Code     int    `json:"code"`
-			Msg      string `json:"msg"`
-			UserInfo *struct {
-				SimpassUID int64  `json:"simpass_uid"`
-				CreateTime string `json:"create_time"`
-				Level      int64  `json:"level"`
-				Risky      bool   `json:"risky"`
-			} `json:"user_info"`
+		var fanverifyResp struct {
+			Status string `json:"status"`
+			Error  string `json:"error"`
+			Data   []struct {
+				UID     int64  `json:"uid"`
+				RegTime string `json:"reg_time"`
+				Level   string `json:"level"`
+				Tag     string `json:"tag"`
+			} `json:"data"`
 		}
-		json.Unmarshal(respBody, &simpassResp)
-
-		if simpassResp.Code != 200 || simpassResp.UserInfo == nil {
-			w.WriteHeader(http.StatusOK)
-			w.Write(respBody)
+		if err := json.Unmarshal(respBody, &fanverifyResp); err != nil {
+			log.Printf("[AUTH] fanverify parse error: %v", err)
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "账号验证服务返回异常"})
 			return
 		}
 
-		uidStr := strconv.FormatInt(simpassResp.UserInfo.SimpassUID, 10)
+		if fanverifyResp.Status != "ok" || len(fanverifyResp.Data) == 0 {
+			reason := fanverifyResp.Error
+			if reason == "" {
+				reason = "UID 或动态通行码错误"
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "msg": "验证失败：" + reason})
+			return
+		}
+
+		userInfo := fanverifyResp.Data[0]
+		uidStr := strconv.FormatInt(userInfo.UID, 10)
+
+		levelInt, err := strconv.ParseInt(userInfo.Level, 10, 64)
+		if err != nil {
+			levelInt = 1
+		}
+
 		u, _ := findUser(db, uidStr)
 		if u == nil {
 			u = &UserData{
 				JhtUID:                       uidStr,
 				LevelID:                      10001,
 				RemainingBotCreationQuantity: 1,
-				FanverifyUID:                 simpassResp.UserInfo.SimpassUID,
-				CreateTime:                   simpassResp.UserInfo.CreateTime,
-				Level:                        simpassResp.UserInfo.Level,
-				Tag:                          "verified",
+				FanverifyUID:                 userInfo.UID,
+				CreateTime:                   userInfo.RegTime,
+				Level:                        levelInt,
+				Tag:                          userInfo.Tag,
 			}
 		} else {
-			u.FanverifyUID = simpassResp.UserInfo.SimpassUID
-			u.CreateTime = simpassResp.UserInfo.CreateTime
-			u.Level = simpassResp.UserInfo.Level
-			u.Tag = "verified"
+			u.FanverifyUID = userInfo.UID
+			u.CreateTime = userInfo.RegTime
+			u.Level = levelInt
+			u.Tag = userInfo.Tag
 		}
 
 		now := time.Now()
 		exp := now.Add(tokenValidity)
 		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 			"jht_uid": u.JhtUID, "level": u.LevelID,
-			"fan_uid": simpassResp.UserInfo.SimpassUID,
-			"fan_lv":  simpassResp.UserInfo.Level,
-			"tag":     "verified",
+			"fan_uid": userInfo.UID,
+			"fan_lv":  levelInt,
+			"tag":     userInfo.Tag,
 			"exp":     exp.Unix(), "iat": now.Unix(),
 		})
 		tokStr, _ := token.SignedString(jwtSecret)
@@ -821,10 +861,10 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"code": 200, "msg": "Authentication successful",
 			"user_info": map[string]interface{}{
-				"simpass_uid": simpassResp.UserInfo.SimpassUID,
-				"create_time": simpassResp.UserInfo.CreateTime,
-				"level":       simpassResp.UserInfo.Level,
-				"risky":       simpassResp.UserInfo.Risky,
+				"fanverify_uid": userInfo.UID,
+				"create_time":   userInfo.RegTime,
+				"level":         levelInt,
+				"tag":           userInfo.Tag,
 			},
 			"accesstoken": tokStr, "expires_at": exp.Unix(),
 		})
