@@ -52,6 +52,25 @@ var (
 	corsOriginList       []string
 )
 
+// extractAccessToken 从请求中取出访问令牌。
+//
+// 优先使用 body 中的 access_token 字段；若为空则回退到
+// Authorization: Bearer <token> 请求头 —— 前端 axios 拦截器统一注入的正是后者。
+// 早期实现只认 body 字段，导致前端所有机器人管理接口都因取不到令牌而失败。
+func extractAccessToken(r *http.Request, bodyToken string) string {
+	if bodyToken != "" {
+		return bodyToken
+	}
+	h := strings.TrimSpace(r.Header.Get("Authorization"))
+	if h == "" {
+		return ""
+	}
+	if len(h) > 7 && strings.EqualFold(h[:7], "Bearer ") {
+		return strings.TrimSpace(h[7:])
+	}
+	return h
+}
+
 // upstreamHTTPClient 用于所有对外部服务的调用。
 //
 // 必须显式设置超时：默认的 http.Get / http.Post 没有任何超时，一旦上游不可达
@@ -307,10 +326,19 @@ func main() {
 	}
 
 	dbPath := filepath.Join(baseDir, dbFile)
-	db, err := sql.Open("sqlite", dbPath)
+
+	// SQLite 并发参数：
+	//   busy_timeout —— 遇到锁时等待而不是立刻失败（否则并发请求会随机报 "db error"）
+	//   journal_mode(WAL) —— 允许读写并发，写入不再阻塞读取
+	// 另外把连接池限制为 1，彻底串行化访问。本服务并发量很低，
+	// 串行化的代价可以忽略，却能根除 SQLITE_BUSY。
+	dsn := dbPath + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	globalDB = db
 	defer db.Close()
 
@@ -323,7 +351,7 @@ func main() {
 
 	// Start WS client to JS bot launcher (non-blocking)
 	InitWSClient()
-	log.Println("[WS] client connecting to JS bot launcher at ws://127.0.0.1:8889")
+	log.Printf("[WS] client connecting to JS bot launcher at %s", getJSNodeURL(""))
 
 	// Global auto-restore: every 5 minutes, send restore command for all bots with auto_restore enabled
 	go func() {
@@ -925,7 +953,13 @@ func main() {
 		var req struct {
 			AccessToken string `json:"access_token"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccessToken == "" {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "invalid json"})
+			return
+		}
+		req.AccessToken = extractAccessToken(r, req.AccessToken)
+		if req.AccessToken == "" {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token required"})
 			return
@@ -1002,8 +1036,18 @@ func main() {
 		var req struct {
 			AccessToken string `json:"access_token"`
 			BotName     string `json:"bot_name"`
+			Username    string `json:"username"` // 字段别名，兼容前端既有写法
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccessToken == "" || req.BotName == "" {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "invalid json"})
+			return
+		}
+		req.AccessToken = extractAccessToken(r, req.AccessToken)
+		if req.BotName == "" {
+			req.BotName = strings.TrimSpace(req.Username)
+		}
+		if req.AccessToken == "" || req.BotName == "" {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token and bot_name required"})
 			return
@@ -1108,7 +1152,13 @@ func main() {
 		var req struct {
 			AccessToken string `json:"access_token"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccessToken == "" {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "invalid json"})
+			return
+		}
+		req.AccessToken = extractAccessToken(r, req.AccessToken)
+		if req.AccessToken == "" {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token required"})
 			return
@@ -1181,7 +1231,13 @@ func main() {
 			AccessToken string `json:"access_token"`
 			BotName     string `json:"bot_name"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccessToken == "" || req.BotName == "" {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "invalid json"})
+			return
+		}
+		req.AccessToken = extractAccessToken(r, req.AccessToken)
+		if req.AccessToken == "" || req.BotName == "" {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token and bot_name required"})
 			return
@@ -1235,7 +1291,12 @@ func main() {
 			BotName     string `json:"bot_name"`
 			Code        string `json:"code"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "invalid json"})
+			return
+		}
+		req.AccessToken = extractAccessToken(r, req.AccessToken)
+		if req.Code == "" {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "code required"})
 			return
 		}
@@ -1380,7 +1441,13 @@ func main() {
 			AutoReconnect *bool  `json:"auto_reconnect"`
 			AutoRestore   *bool  `json:"auto_restore"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccessToken == "" || req.BotName == "" {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "invalid json"})
+			return
+		}
+		req.AccessToken = extractAccessToken(r, req.AccessToken)
+		if req.AccessToken == "" || req.BotName == "" {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token and botname required"})
 			return
 		}
@@ -1443,7 +1510,12 @@ func main() {
 				Command string `json:"command"`
 			} `json:"data"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccessToken == "" || req.BotName == "" {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "invalid json"})
+			return
+		}
+		req.AccessToken = extractAccessToken(r, req.AccessToken)
+		if req.AccessToken == "" || req.BotName == "" {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token, bot_name and data required"})
 			return
 		}
@@ -1473,9 +1545,9 @@ func main() {
 			return
 		}
 
-		// Send via sendinfo WS
-		u := url.URL{Scheme: "ws", Host: "127.0.0.1:8889", Path: "/ws/api/sendinfo"}
-		wsConn, _, err := (&websocket.Dialer{}).Dial(u.String(), nil)
+		// Send via sendinfo WS (目标为内地 JS 节点，自动附带内部鉴权 secret)
+		targetURL := getJSNodeURL("/ws/api/sendinfo")
+		wsConn, _, err := (&websocket.Dialer{}).Dial(targetURL, nil)
 		if err != nil {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "bad gateway!!!机器人服务异常，请联系管理员!"})
 			return
@@ -1745,9 +1817,9 @@ func main() {
 								log.Printf("[WS] bot %s offline (reason: %s), auto-reconnect in 10s", ev.BotName, d.Reason)
 								go func(name string) {
 									time.Sleep(10 * time.Second)
-									// Try to restart: connect to JS startbot WS
-									restartURL := url.URL{Scheme: "ws", Host: "127.0.0.1:8889", Path: "/ws/api/startbot"}
-									rc, _, rerr := (&websocket.Dialer{}).Dial(restartURL.String(), nil)
+									// Try to restart: connect to JS startbot WS (内地节点 + 内部鉴权)
+									restartURL := getJSNodeURL("/ws/api/startbot")
+									rc, _, rerr := (&websocket.Dialer{}).Dial(restartURL, nil)
 									if rerr != nil {
 										log.Printf("[WS] auto-reconnect dial failed for %s: %v", name, rerr)
 										return
@@ -1859,9 +1931,9 @@ func main() {
 			return
 		}
 
-		// Connect to JS launcher and start the bot
-		jsURL := url.URL{Scheme: "ws", Host: "127.0.0.1:8889", Path: "/ws/api/startbot"}
-		jsConn, _, err := (&websocket.Dialer{}).Dial(jsURL.String(), nil)
+		// Connect to JS launcher and start the bot (内地节点 + 内部鉴权)
+		jsURL := getJSNodeURL("/ws/api/startbot")
+		jsConn, _, err := (&websocket.Dialer{}).Dial(jsURL, nil)
 		if err != nil {
 			conn.WriteJSON(map[string]interface{}{"code": 502, "message": "bad gateway!!!无法连接到机器人服务"})
 			return
