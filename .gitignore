@@ -80,3 +80,6 @@ FANVERIFY_MIGRATION.md
 MIGRATION_STATUS.md
 VUE_MIGRATION_COMPLETE.md
 
+
+# JS 节点运行期数据（机器人上次退出原因）
+8wbotforJavaScript/bot-exit-reasons.json

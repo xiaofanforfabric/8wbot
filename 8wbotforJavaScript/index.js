@@ -4,6 +4,82 @@ require('dotenv').config();
 const mineflayer = require('mineflayer');
 const WebSocket = require('ws');
 const url = require('url');
+const fs = require('fs');
+const path = require('path');
+
+// ════════════════════════════════════════════════════════════════
+// 上次退出原因记录
+//
+// 背景: mineflayer 的 end 事件 reason 来自底层 socket，永远是
+// 'socketClosed'，真正的原因（被踢/抢占登录/掉线）只在 kicked 事件里。
+// 这里把真实原因记录下来并落盘，供后台与前端查询。
+// ════════════════════════════════════════════════════════════════
+const EXIT_LOG_FILE = path.join(__dirname, 'bot-exit-reasons.json');
+
+let exitReasons = {};
+try {
+  exitReasons = JSON.parse(fs.readFileSync(EXIT_LOG_FILE, 'utf8')) || {};
+} catch (_) {
+  exitReasons = {};
+}
+
+// 把聊天组件压平成纯文本。
+// MC 1.20.3+ 的踢出原因是 NBT 格式（prismarine-nbt），形如:
+//   { type:'compound', value:{ text:{ type:'string', value:'§c原因...' } } }
+// 旧版本则是 JSON 聊天组件: { text:'...', extra:[...] }
+// 这里把三种形态（纯字符串 / JSON 组件 / NBT）统一处理。
+function flattenChat(msg) {
+  if (msg == null) return '';
+  if (typeof msg === 'string') return msg;
+  if (typeof msg === 'number' || typeof msg === 'boolean') return String(msg);
+  if (Buffer.isBuffer(msg)) return msg.toString('utf8');
+  if (Array.isArray(msg)) return msg.map(flattenChat).join('');
+
+  if (typeof msg === 'object') {
+    // NBT 包装节点: { type:'compound'|'string'|'list'|..., value:... }
+    if ('type' in msg && 'value' in msg) {
+      return flattenChat(msg.value);
+    }
+    let out = '';
+    if (msg.text !== undefined) out += flattenChat(msg.text);
+    if (msg.translate !== undefined) out += flattenChat(msg.translate);
+    if (msg.extra !== undefined) out += flattenChat(msg.extra);
+    // 仅在没有任何可读文本时才退回 with，避免重复拼接
+    if (!out && msg.with !== undefined) out += flattenChat(msg.with);
+    return out;
+  }
+  return '';
+}
+
+// 去掉 Minecraft 颜色/格式代码（§c、§l 等），便于阅读与入库
+function stripMinecraftColors(text) {
+  return String(text || '').replace(/\u00a7[0-9a-fk-orx]/gi, '').trim();
+}
+
+/**
+ * 记录某个机器人的退出原因
+ * @param {string} username
+ * @param {string} reason  原始原因文本
+ * @param {string} type    kicked(被服务器踢) | error(连接错误) | stopped(主动下线) | end(连接结束)
+ */
+function recordExitReason(username, reason, type) {
+  const text = stripMinecraftColors(flattenChat(reason)) || '未知原因';
+  exitReasons[username] = {
+    reason: text,
+    type: type || 'unknown',
+    time: new Date().toISOString()
+  };
+  try {
+    fs.writeFileSync(EXIT_LOG_FILE, JSON.stringify(exitReasons, null, 2));
+  } catch (e) {
+    console.warn(`[${username}] 退出原因落盘失败:`, e && e.message);
+  }
+  console.log(`[${username}] 记录退出原因 [${type}]: ${text}`);
+}
+
+function getExitReason(username) {
+  return exitReasons[username] || null;
+}
 
 const INTERNAL_NODE_SECRET = process.env.INTERNAL_NODE_SECRET || '';
 if (!INTERNAL_NODE_SECRET) {
@@ -12,9 +88,10 @@ if (!INTERNAL_NODE_SECRET) {
   console.log('🔒 内部通信安全鉴权已启用 (INTERNAL_NODE_SECRET 已生效)');
 }
 
-const SERVER_HOST = 'bgjq.simpfun.cn';
-const SERVER_PORT = 25565;
-const SERVER_VERSION = '1.21.4';
+// 目标游戏服务器（可通过 .env 覆盖，便于换服或本地测试）
+const SERVER_HOST = process.env.MC_HOST || 'bgjq.simpfun.cn';
+const SERVER_PORT = parseInt(process.env.MC_PORT) || 25565;
+const SERVER_VERSION = process.env.MC_VERSION || '1.21.4';
 
 const bots = {}; // username -> bot instance
 let titleSelectedIndex = 0;
@@ -55,6 +132,36 @@ function startBot(username) {
     version: SERVER_VERSION
   });
   bots[username] = bot;
+
+  // ── 退出原因记录（挂在 startBot 里，任何通道连接都能生效）──
+  // _exitRecorded 保证原因只记录一次，且优先保留更具体的原因：
+  //   kicked（被服务器踢，含抢占登录）> error（连接错误）> end（socketClosed）
+  bot._exitRecorded = false;
+
+  bot.on('kicked', (reason, loggedIn) => {
+    const text = flattenChat(reason);
+    recordExitReason(username, text, 'kicked');
+    bot._exitRecorded = true;
+    // 抢占登录的典型提示，单独标注便于识别
+    if (/another location|already logged|重复登录|已在其他地方/i.test(text)) {
+      console.warn(`[${username}] ⚠️ 疑似被其他位置的同账号登录顶下线`);
+    }
+  });
+
+  bot.on('error', (err) => {
+    if (!bot._exitRecorded) {
+      recordExitReason(username, (err && err.message) || '未知连接错误', 'error');
+      bot._exitRecorded = true;
+    }
+  });
+
+  bot.on('end', (reason) => {
+    if (!bot._exitRecorded) {
+      // 说明没收到 kicked/error，reason 通常就是无意义的 socketClosed
+      recordExitReason(username, reason || 'socketClosed', 'end');
+      bot._exitRecorded = true;
+    }
+  });
 
   // Listen for /server command responses to determine current server
   bot._currentServer = null;
@@ -119,6 +226,9 @@ function sendMapIfNotMain(username, b64, width, sendFn) {
 function stopBot(username) {
   const bot = bots[username];
   if (!bot) return;
+  // 主动下线：直接写明原因，避免被 end 的 socketClosed 覆盖
+  recordExitReason(username, '用户主动下线', 'stopped');
+  bot._exitRecorded = true;
   try { bot.quit(); } catch (e) { /* ignore */ }
   delete bots[username];
   console.log(`Bot stopped: ${username}`);
@@ -304,11 +414,16 @@ try {
         const username = msg.username;
         if (!username) { ws.send(JSON.stringify({ code: 400, message: 'username required' })); return; }
         const bot = bots[username];
-        if (!bot) {
-          ws.send(JSON.stringify({ code: 200, online: false }));
-        } else {
-          ws.send(JSON.stringify({ code: 200, online: true }));
-        }
+        const exit = getExitReason(username);
+        const resp = {
+          code: 200,
+          online: !!bot,
+          // 上次退出原因（供后台落库与前端展示）
+          last_exit_reason: exit ? exit.reason : '',
+          last_exit_type: exit ? exit.type : '',
+          last_exit_time: exit ? exit.time : ''
+        };
+        ws.send(JSON.stringify(resp));
       });
     }
 
