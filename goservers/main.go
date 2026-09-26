@@ -116,7 +116,18 @@ func loadEnv(path string) map[string]string {
 		}
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) == 2 {
-			env[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			env[key] = val
+
+			// 同时导出到进程环境变量。
+			// wsclient.go 等处的 os.Getenv() 依赖它；早期实现只把 .env 解析进
+			// map 而没有导出，导致 JS_NODE_URL / INTERNAL_NODE_SECRET 永远取不到值，
+			// 跨机连接始终退回默认地址且不带鉴权密钥。
+			// 已存在的真实环境变量优先，便于容器/K8s 覆盖 .env。
+			if os.Getenv(key) == "" {
+				os.Setenv(key, val)
+			}
 		}
 	}
 	return env
@@ -375,7 +386,7 @@ func main() {
 			log.Printf("[AUTO-RESTORE] sending restore command to %d bot(s)", len(names))
 			for _, name := range names {
 				targetURL := getJSNodeURL("/ws/api/sendinfo")
-				sc, _, serr := (&websocket.Dialer{}).Dial(targetURL, nil)
+				sc, _, serr := jsDialer.Dial(targetURL, nil)
 				if serr != nil {
 					continue
 				}
@@ -1547,7 +1558,7 @@ func main() {
 
 		// Send via sendinfo WS (目标为内地 JS 节点，自动附带内部鉴权 secret)
 		targetURL := getJSNodeURL("/ws/api/sendinfo")
-		wsConn, _, err := (&websocket.Dialer{}).Dial(targetURL, nil)
+		wsConn, _, err := jsDialer.Dial(targetURL, nil)
 		if err != nil {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "bad gateway!!!机器人服务异常，请联系管理员!"})
 			return
@@ -1819,7 +1830,7 @@ func main() {
 									time.Sleep(10 * time.Second)
 									// Try to restart: connect to JS startbot WS (内地节点 + 内部鉴权)
 									restartURL := getJSNodeURL("/ws/api/startbot")
-									rc, _, rerr := (&websocket.Dialer{}).Dial(restartURL, nil)
+									rc, _, rerr := jsDialer.Dial(restartURL, nil)
 									if rerr != nil {
 										log.Printf("[WS] auto-reconnect dial failed for %s: %v", name, rerr)
 										return
@@ -1933,7 +1944,7 @@ func main() {
 
 		// Connect to JS launcher and start the bot (内地节点 + 内部鉴权)
 		jsURL := getJSNodeURL("/ws/api/startbot")
-		jsConn, _, err := (&websocket.Dialer{}).Dial(jsURL, nil)
+		jsConn, _, err := jsDialer.Dial(jsURL, nil)
 		if err != nil {
 			conn.WriteJSON(map[string]interface{}{"code": 502, "message": "bad gateway!!!无法连接到机器人服务"})
 			return
