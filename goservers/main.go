@@ -52,6 +52,13 @@ var (
 	corsOriginList       []string
 )
 
+// upstreamHTTPClient 用于所有对外部服务的调用。
+//
+// 必须显式设置超时：默认的 http.Get / http.Post 没有任何超时，一旦上游不可达
+// （例如已下线的 simpass.simpfun.cn）就会一直挂起，最终被 Cloudflare 判为超时
+// 并返回不带 CORS 头的错误页，浏览器只能看到难以排查的 "Network Error"。
+var upstreamHTTPClient = &http.Client{Timeout: 15 * time.Second}
+
 type UserData struct {
 	JhtUID                       string `json:"jht_uid"`
 	AccessToken                  string `json:"accesstoken"`
@@ -175,7 +182,7 @@ func verifyCapToken(capTok string) (bool, error) {
 	}
 	capBody, _ := json.Marshal(payload)
 
-	resp, err := http.Post(verifyURL, "application/json", bytes.NewReader(capBody))
+	resp, err := upstreamHTTPClient.Post(verifyURL, "application/json", bytes.NewReader(capBody))
 	if err != nil {
 		return false, fmt.Errorf("siteverify request: %w", err)
 	}
@@ -443,7 +450,7 @@ func main() {
 		apiURL := fmt.Sprintf("%s/openapi/user_verify?accesstoken=%s&uid=%s&pass_code=%s",
 			fanverifyAPIBase, fanverifyAccessToken, uidStr, passCode)
 		
-		resp, err := http.Get(apiURL)
+		resp, err := upstreamHTTPClient.Get(apiURL)
 		if err != nil {
 			log.Printf("fanverify api error: %v", err)
 			w.Header().Set("Content-Type", "application/json")
@@ -588,52 +595,64 @@ func main() {
 				return
 			}
 
-			// Query simpass OTP status (only otp_id, NO uuid — uuid triggers generate)
-			otpQueryURL := simpassAPIBase + "/api/dev/otp?otp_id=" + sess.OtpID
-			log.Printf("[SESSION] poll token=%s... querying simpass: %s", sessionToken[:16], otpQueryURL)
-			otpResp, err := http.Get(otpQueryURL)
+			// 调用 FanVerify OTP 轮询接口 (旧版 simpass 接口已下线)
+			otpQueryURL := fmt.Sprintf("%s/openapi/seeotp?accesstoken=%s&otp=%s",
+				fanverifyAPIBase, url.QueryEscape(fanverifyAccessToken), url.QueryEscape(sess.OtpID))
+			log.Printf("[SESSION] poll token=%s... querying fanverify", sessionToken[:16])
+			otpResp, err := upstreamHTTPClient.Get(otpQueryURL)
 			if err != nil {
-				log.Printf("[SESSION] simpass otp query error: %v", err)
+				log.Printf("[SESSION] fanverify otp query error: %v", err)
 				json.NewEncoder(w).Encode(map[string]interface{}{"status": "wait"})
 				return
 			}
 			defer otpResp.Body.Close()
 			otpBody, _ := io.ReadAll(otpResp.Body)
-			log.Printf("[SESSION] simpass otp query raw response (http %d): %s", otpResp.StatusCode, string(otpBody))
 
 			var otpStatus struct {
-				Status   string `json:"status"`
-				UserID   int64  `json:"user_id"`
-				UserInfo *struct {
-					SimpassUID int64  `json:"simpass_uid"`
-					CreateTime string `json:"create_time"`
-					Level      int64  `json:"level"`
-					Risky      bool   `json:"risky"`
-				} `json:"user_info"`
+				Status string `json:"status"`
+				Error  string `json:"error"`
+				Data   []struct {
+					UID     int64  `json:"uid"`
+					RegTime string `json:"reg_time"`
+					Level   string `json:"level"`
+					Tag     string `json:"tag"`
+				} `json:"data"`
 			}
 			json.Unmarshal(otpBody, &otpStatus)
 
-			if otpStatus.Status == "verified" && otpStatus.UserInfo != nil {
-				log.Printf("[SESSION] poll token=%s... simpass VERIFIED! uid=%d", sessionToken[:16], otpStatus.UserID)
+			// 429 rate_limit: FanVerify 要求同一 OTP 至少间隔 5 秒才能再次查询，
+			// 属正常节流，按"等待中"处理即可，不应当作错误。
+			if otpResp.StatusCode == http.StatusTooManyRequests || otpStatus.Status == "rate_limit" {
+				json.NewEncoder(w).Encode(map[string]interface{}{"status": "wait"})
+				return
+			}
 
-				// Find or create user in DB
-				uidStr := strconv.FormatInt(otpStatus.UserInfo.SimpassUID, 10)
+			if otpStatus.Status == "ok" && len(otpStatus.Data) > 0 {
+				userInfo := otpStatus.Data[0]
+				log.Printf("[SESSION] poll token=%s... fanverify VERIFIED! uid=%d", sessionToken[:16], userInfo.UID)
+
+				levelInt, perr := strconv.ParseInt(userInfo.Level, 10, 64)
+				if perr != nil {
+					levelInt = 1
+				}
+				uidStr := strconv.FormatInt(userInfo.UID, 10)
+
 				u, _ := findUser(db, uidStr)
 				if u == nil {
 					u = &UserData{
 						JhtUID:                       uidStr,
 						LevelID:                      10001,
 						RemainingBotCreationQuantity: 1,
-						FanverifyUID:                 otpStatus.UserInfo.SimpassUID,
-						CreateTime:                   otpStatus.UserInfo.CreateTime,
-						Level:                        otpStatus.UserInfo.Level,
-						Tag:                          "verified",
+						FanverifyUID:                 userInfo.UID,
+						CreateTime:                   userInfo.RegTime,
+						Level:                        levelInt,
+						Tag:                          userInfo.Tag,
 					}
 				} else {
-					u.FanverifyUID = otpStatus.UserInfo.SimpassUID
-					u.CreateTime = otpStatus.UserInfo.CreateTime
-					u.Level = otpStatus.UserInfo.Level
-					u.Tag = "verified"
+					u.FanverifyUID = userInfo.UID
+					u.CreateTime = userInfo.RegTime
+					u.Level = levelInt
+					u.Tag = userInfo.Tag
 				}
 
 				// Issue JWT
@@ -641,9 +660,9 @@ func main() {
 				exp := now.Add(tokenValidity)
 				token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 					"jht_uid": u.JhtUID, "level": u.LevelID,
-					"fan_uid": otpStatus.UserInfo.SimpassUID,
-					"fan_lv":  otpStatus.UserInfo.Level,
-					"tag":     "verified",
+					"fan_uid": userInfo.UID,
+					"fan_lv":  levelInt,
+					"tag":     userInfo.Tag,
 					"exp":     exp.Unix(), "iat": now.Unix(),
 				})
 				tokStr, _ := token.SignedString(jwtSecret)
@@ -653,10 +672,10 @@ func main() {
 				// Cache in session for subsequent polls, then return
 				sess.Status = "ok"
 				sess.Token = tokStr
-				sess.FanverifyUID = otpStatus.UserInfo.SimpassUID
-				sess.CreateTime = otpStatus.UserInfo.CreateTime
-				sess.Level = otpStatus.UserInfo.Level
-				sess.Tag = "verified"
+				sess.FanverifyUID = userInfo.UID
+				sess.CreateTime = userInfo.RegTime
+				sess.Level = levelInt
+				sess.Tag = userInfo.Tag
 
 				json.NewEncoder(w).Encode(map[string]interface{}{
 					"status":       "ok",
@@ -666,7 +685,7 @@ func main() {
 				return
 			}
 
-			log.Printf("[SESSION] poll token=%s... simpass status=%s", sessionToken[:16], otpStatus.Status)
+			log.Printf("[SESSION] poll token=%s... fanverify status=%s", sessionToken[:16], otpStatus.Status)
 			json.NewEncoder(w).Encode(map[string]interface{}{"status": "wait"})
 			return
 		}
@@ -688,43 +707,67 @@ func main() {
 				return
 			}
 
-			// Call simpass /api/dev/otp to get OTP ID
-			otpURL := simpassAPIBase + "/api/dev/otp?uuid=" + devUUID
-			log.Printf("[OTP] requesting from simpass: %s", otpURL)
-			otpResp, err := http.Get(otpURL)
+			// 调用 FanVerify OTP 申请接口 (旧版 simpass 接口已下线)
+			otpURL := fmt.Sprintf("%s/openapi/otp?accesstoken=%s",
+				fanverifyAPIBase, url.QueryEscape(fanverifyAccessToken))
+			log.Printf("[OTP] requesting from fanverify: %s/openapi/otp", fanverifyAPIBase)
+			otpResp, err := upstreamHTTPClient.Get(otpURL)
 			if err != nil {
 				log.Printf("[OTP] http error: %v", err)
 				w.WriteHeader(http.StatusBadGateway)
-				json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "otp service unavailable"})
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "扫码凭据服务连接失败，请稍后重试"})
 				return
 			}
 			defer otpResp.Body.Close()
 			otpBody, _ := io.ReadAll(otpResp.Body)
-			log.Printf("[OTP] simpass raw response: %s", string(otpBody))
+			log.Printf("[OTP] fanverify raw response (http %d): %s", otpResp.StatusCode, string(otpBody))
+
 			var otpData struct {
-				OtpID     string `json:"otp_id"`
-				ExpiresIn int    `json:"expires_in"`
+				Success bool `json:"success"`
+				Error   string `json:"error"`
+				Data    struct {
+					Otp string `json:"otp"`
+				} `json:"data"`
 			}
-			if err := json.Unmarshal(otpBody, &otpData); err != nil || otpData.OtpID == "" {
+			if err := json.Unmarshal(otpBody, &otpData); err != nil {
 				log.Printf("[OTP] parse error: %v | body=%s", err, string(otpBody))
 				w.WriteHeader(http.StatusBadGateway)
-				json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "bad otp response"})
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "扫码凭据服务返回异常"})
 				return
 			}
-			log.Printf("[OTP] success: otp_id=%s expires_in=%d", otpData.OtpID, otpData.ExpiresIn)
+			if !otpData.Success || otpData.Data.Otp == "" {
+				reason := otpData.Error
+				if reason == "" {
+					reason = "未知错误"
+				}
+				log.Printf("[OTP] fanverify rejected: %s", reason)
+				w.WriteHeader(http.StatusBadGateway)
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "扫码登录暂不可用：" + reason})
+				return
+			}
+			otpValue := otpData.Data.Otp
+			log.Printf("[OTP] success: otp=%s", otpValue)
 
 			// Generate session token (128 hex chars = 64 bytes)
 			sessionToken := generateToken(64)
-			qrURL := simpassAPIBase + "/api/otp?otp_id=" + otpData.OtpID
 
-			expiresIn := otpData.ExpiresIn
-			if expiresIn <= 0 {
-				expiresIn = 120
+			// 二维码图片不直接把 FanVerify 的 genqrcode 地址交给前端：
+			// 该接口要求把 accesstoken 放在 URL 里，直接下发会把开发者密钥
+			// 暴露给每一个访问者。改为经本方 /api/otp/qrcode 代理转发。
+			proto := r.Header.Get("X-Forwarded-Proto")
+			if proto == "" {
+				if r.TLS != nil {
+					proto = "https"
+				} else {
+					proto = "http"
+				}
 			}
+			qrURL := fmt.Sprintf("%s://%s/api/otp/qrcode?session_token=%s", proto, r.Host, sessionToken)
+
 			otpSessions.Store(sessionToken, &otpSession{
-				OtpID:     otpData.OtpID,
+				OtpID:     otpValue,
 				Status:    "wait",
-				ExpiresAt: time.Now().Add(time.Duration(expiresIn) * time.Second),
+				ExpiresAt: time.Now().Add(120 * time.Second),
 			})
 
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -781,7 +824,7 @@ func main() {
 		apiURL := fmt.Sprintf("%s/openapi/user_verify?accesstoken=%s&uid=%s&pass_code=%s",
 			fanverifyAPIBase, fanverifyAccessToken, url.QueryEscape(req.UserID), url.QueryEscape(req.VerifyCode))
 
-		resp, err := http.Get(apiURL)
+		resp, err := upstreamHTTPClient.Get(apiURL)
 		if err != nil {
 			log.Printf("[AUTH] fanverify request error: %v", err)
 			w.WriteHeader(http.StatusBadGateway)
@@ -1461,6 +1504,60 @@ func main() {
 		var result map[string]interface{}
 		json.Unmarshal(resp, &result)
 		json.NewEncoder(w).Encode(result)
+	})
+
+	// --- GET /api/otp/qrcode : 扫码登录二维码代理 ---
+	//
+	// FanVerify 的 /openapi/genqrcode 要求把 accesstoken 放在 URL 查询参数里。
+	// 若把该地址直接下发给前端，等于把开发者密钥公开给所有访问者，
+	// 因此这里做一次服务端代理，密钥只保留在后端。
+	mux.HandleFunc("/api/otp/qrcode", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		sessionToken := r.URL.Query().Get("session_token")
+		if sessionToken == "" {
+			http.Error(w, "session_token required", http.StatusBadRequest)
+			return
+		}
+		val, ok := otpSessions.Load(sessionToken)
+		if !ok {
+			http.Error(w, "session expired", http.StatusNotFound)
+			return
+		}
+		sess := val.(*otpSession)
+		if time.Now().After(sess.ExpiresAt) {
+			otpSessions.Delete(sessionToken)
+			http.Error(w, "session expired", http.StatusNotFound)
+			return
+		}
+
+		qcURL := fmt.Sprintf("%s/openapi/genqrcode?accesstoken=%s&otp=%s",
+			fanverifyAPIBase, url.QueryEscape(fanverifyAccessToken), url.QueryEscape(sess.OtpID))
+		resp, err := upstreamHTTPClient.Get(qcURL)
+		if err != nil {
+			log.Printf("[QRCODE] upstream error: %v", err)
+			http.Error(w, "二维码服务不可用", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			log.Printf("[QRCODE] upstream http %d: %s", resp.StatusCode, string(body))
+			http.Error(w, "二维码生成失败", http.StatusBadGateway)
+			return
+		}
+
+		png, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if err != nil {
+			http.Error(w, "二维码读取失败", http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Write(png)
 	})
 
 	// --- GET /api/config : 前端配置 ---
