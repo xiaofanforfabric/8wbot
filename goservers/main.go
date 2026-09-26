@@ -1304,6 +1304,19 @@ func main() {
 			return
 		}
 
+		// 归属校验：只能验证属于自己的机器人
+		// 否则任何人都能启动/确认别人的机器人（配合 createbot 的重新认领
+		// 机制，还会出现「A 的验证努力帮 B 坐实归属」的劫持）
+		vbot, verr := findBotByUsername(globalDB, req.BotName)
+		if verr != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "message": "db error"})
+			return
+		}
+		if vbot == nil || vbot.Belong != jhtUID {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权验证"})
+			return
+		}
+
 		// Start bot via WS and monitor events
 		client := InitWSClient()
 		chat, uid, err := client.StartBotAndDetect(req.BotName, 120*time.Second)
@@ -1362,6 +1375,19 @@ func main() {
 			return
 		}
 
+		// 归属校验：只能确认属于自己的机器人
+		// 关键：验证可能持续 120 秒，期间机器人有可能被他人重新认领，
+		// 若不校验，A 提交验证码会把他人的机器人改成 confirmed
+		vbot, verr := findBotByUsername(globalDB, req.BotName)
+		if verr != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "message": "db error"})
+			return
+		}
+		if vbot == nil || vbot.Belong != jhtUID {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人已不属于你（可能已被其他用户重新认领），请回到列表重新确认归属"})
+			return
+		}
+
 		// Send code to bot via WS and monitor result
 		client := InitWSClient()
 		chat, err := client.SendCommandAndDetect(req.BotName, req.Code, 120*time.Second)
@@ -1381,7 +1407,25 @@ func main() {
 
 		// Success — "验证成功" found in chat
 		setBotDSL(globalDB, jhtUID, req.BotName, false)
-		updateBotStatus(globalDB, req.BotName, "confirmed")
+
+		// 带 belong 条件写入，并检查是否真的改中:
+		// 验证持续期间机器人可能已被他人重新认领，此时返回 0 行，
+		// 绝不能把归属已变更的机器人标成 confirmed
+		affected, uerr := updateBotStatus(globalDB, req.BotName, jhtUID, "confirmed")
+		if uerr != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "message": "验证通过但保存失败: " + uerr.Error()})
+			return
+		}
+		if affected == 0 {
+			log.Printf("[verify] %s 验证通过，但归属已变更，未标记 confirmed", req.BotName)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"code":    409,
+				"message": "游戏内验证已通过，但此机器人刚刚被其他用户重新认领，归属已变更。请回到列表确认当前归属后重新操作。",
+				"chat":    chat,
+			})
+			return
+		}
+
 		json.NewEncoder(w).Encode(map[string]interface{}{"code": "200", "message": "验证成功，机器人已确认归属", "chat": chat})
 
 		// Stop the bot after 5s (async)

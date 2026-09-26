@@ -79,10 +79,17 @@ func updateBotOwner(db *sql.DB, username string, newBelong string) error {
 	return err
 }
 
-// updateBotStatus changes a bot's status by username.
-func updateBotStatus(db *sql.DB, username string, status string) error {
-	_, err := db.Exec("UPDATE bots SET status = ? WHERE username = ?", status, username)
-	return err
+// updateBotStatus changes a bot's status, scoped to its owner.
+// 必须带上 belong 条件: 归属校验与写入之间存在竞态窗口，
+// 若在此期间机器人被他人重新认领，无条件更新会误改他人的机器人。
+// 返回受影响行数，调用方可用它判断是否真的改中（0 表示归属已变更）。
+func updateBotStatus(db *sql.DB, username string, belong string, status string) (int64, error) {
+	res, err := db.Exec("UPDATE bots SET status = ? WHERE username = ? AND belong = ?", status, username, belong)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // setBotAutoReconnect updates the auto_reconnect flag for a bot.
