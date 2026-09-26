@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>创建机器人 — 8WBot</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --bg-start: #f5f0ff; --bg-end: #e8e0f8;
+      --glass-bg: rgba(255,255,255,0.55); --glass-border: rgba(255,255,255,0.72);
+      --glass-shadow: 0 8px 32px rgba(140,120,200,0.12);
+      --text-primary: #2d2a3e; --text-secondary: #7a7590;
+      --accent: #7c6ae6; --radius: 20px;
+      --input-bg: rgba(255,255,255,0.50); --input-border: rgba(124,106,230,0.12);
+    }
+    html, body {
+      height: 100%;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: linear-gradient(150deg, var(--bg-start), var(--bg-end), #f0eaff, #faf5ff);
+      background-size: 400% 400%;
+      animation: bgShift 20s ease infinite;
+      color: var(--text-primary);
+      overflow: hidden;
+    }
+    @keyframes bgShift {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+    .bg-orbs { position: fixed; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; }
+    .bg-orbs span { position: absolute; border-radius: 50%; filter: blur(100px); opacity: 0.40; animation: orbFloat 20s ease-in-out infinite alternate; }
+    .bg-orbs .o1 { width: 480px; height: 480px; top: -12%; left: -10%; background: linear-gradient(135deg,#f9d8e0,#d4b8f0); }
+    .bg-orbs .o2 { width: 400px; height: 400px; bottom: -10%; right: -8%; background: linear-gradient(135deg,#c8e6f8,#e0c8f8); animation-delay: -7s; }
+    .bg-orbs .o3 { width: 300px; height: 300px; top: 50%; left: 60%; background: linear-gradient(135deg,#f0d8e8,#d8e8f8); animation-delay: -14s; opacity: 0.30; }
+    @keyframes orbFloat {
+      0% { transform: translate(0,0) scale(1); }
+      100% { transform: translate(50px,-30px) scale(1.10); }
+    }
+    .wrap { position: relative; z-index: 1; height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+    .card {
+      width: 100%; max-width: 420px; padding: 44px 32px 36px;
+      background: var(--glass-bg); backdrop-filter: blur(24px) saturate(1.6);
+      -webkit-backdrop-filter: blur(24px) saturate(1.6);
+      border: 1px solid var(--glass-border); border-radius: 24px;
+      box-shadow: var(--glass-shadow); text-align: center;
+    }
+    .card .logo { font-size: 1.5rem; font-weight: 700; margin-bottom: 4px;
+      background: linear-gradient(135deg,#4a3f7a,#7c6ae6,#e879b0); background-size: 200% 200%;
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+      animation: shimmerText 5s ease infinite; }
+    @keyframes shimmerText {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+    .card .sub { font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 28px; }
+    .form-group { text-align: left; margin-bottom: 20px; }
+    .form-group label { display: block; font-size: 0.82rem; font-weight: 500; color: var(--text-secondary); margin-bottom: 6px; }
+    .form-group input {
+      width: 100%; padding: 12px 16px; border-radius: 12px;
+      border: 1.5px solid var(--input-border); background: var(--input-bg);
+      font-size: 0.95rem; font-family: inherit; color: var(--text-primary);
+      outline: none; transition: all 0.25s ease;
+    }
+    .form-group input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(124,106,230,0.12); background: rgba(255,255,255,0.70); }
+    .form-group input::placeholder { color: #b0abc8; }
+    .msg-box { font-size: 0.85rem; padding: 10px 14px; border-radius: 12px; margin-bottom: 16px; }
+    .msg-box.info { background: rgba(124,106,230,0.08); color: var(--accent); border: 1px solid rgba(124,106,230,0.12); }
+    .msg-box.success { background: rgba(34,197,94,0.08); color: #16a34a; border: 1px solid rgba(34,197,94,0.15); }
+    .msg-box.error { background: rgba(239,68,68,0.08); color: #dc2626; border: 1px solid rgba(239,68,68,0.15); }
+    .msg-box.warn { background: rgba(234,179,8,0.08); color: #ca8a04; border: 1px solid rgba(234,179,8,0.15); }
+    .btn-submit {
+      width: 100%; padding: 14px; border-radius: 12px; border: none;
+      font-size: 0.95rem; font-weight: 600; font-family: inherit; cursor: pointer;
+      background: linear-gradient(135deg,#7c6ae6,#b080e0,#e879b0); background-size: 300% 300%;
+      color: #fff; transition: all 0.3s ease; animation: shimmerBtn 5s ease infinite;
+      opacity: 0.7; pointer-events: none;
+    }
+    .btn-submit.ready { opacity: 1; pointer-events: auto; }
+    .btn-submit:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(124,106,230,0.30); }
+    .btn-submit:disabled { opacity: 0.4; pointer-events: none; }
+    @keyframes shimmerBtn {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+    .back-link { display: inline-block; margin-top: 18px; font-size: 0.82rem; color: var(--text-secondary); text-decoration: none; }
+    .back-link:hover { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="bg-orbs"><span class="o1"></span><span class="o2"></span><span class="o3"></span></div>
+  <div id="app" class="wrap">
+    <div class="card">
+      <div class="logo">8WBot</div>
+      <div class="sub">创建你的第一个机器人</div>
+
+      <div v-if="msg.text" :class="['msg-box', msg.type]">{{ msg.text }}</div>
+
+      <div class="form-group">
+        <label for="bot_name">机器人用户名</label>
+        <input id="bot_name" v-model="botName" type="text" placeholder="输入游戏内使用的用户名" @input="msg.text=''">
+      </div>
+
+      <button class="btn-submit" :class="{ ready: botName && !loading }" :disabled="loading" @click="handleCreate">
+        {{ loading ? '创建中…' : '🤖 创建机器人' }}
+      </button>
+
+      <a href="/user.html" class="back-link">← 返回用户中心</a>
+    </div>
+  </div>
+
+  <script>
+    const { createApp, ref, reactive } = Vue;
+    createApp({
+      setup() {
+        const botName = ref('');
+        const loading = ref(false);
+        const msg = reactive({ text: '', type: '' });
+
+        function getCookie(name) {
+          const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+          return match ? decodeURIComponent(match[2]) : '';
+        }
+
+        async function handleCreate() {
+          if (!botName.value || loading.value) return;
+          loading.value = true;
+          msg.text = '';
+          const token = getCookie('8wbot_token') || localStorage.getItem('8wbot_token');
+          if (!token) {
+            msg.text = '未登录，请先登录'; msg.type = 'error';
+            loading.value = false;
+            return;
+          }
+          try {
+            const res = await fetch('/api/createbot', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ access_token: token, bot_name: botName.value })
+            });
+            const data = await res.json();
+            if (data.code === '200') {
+              msg.text = '✅ ' + (data.message || '创建成功');
+              msg.type = 'success';
+              setTimeout(() => { window.location.href = '/user.html'; }, 2000);
+            } else if (data.code === 409) {
+              msg.text = '⚠️ ' + (data.message || '用户名已被占用');
+              msg.type = 'warn';
+            } else {
+              msg.text = '❌ ' + (data.message || data.msg || '创建失败');
+              msg.type = 'error';
+            }
+          } catch (e) {
+            msg.text = '❌ 网络错误: ' + e.message;
+            msg.type = 'error';
+          } finally {
+            loading.value = false;
+          }
+        }
+
+        return { botName, loading, msg, handleCreate };
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>

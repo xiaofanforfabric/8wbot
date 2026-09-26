@@ -1,0 +1,167 @@
+/* =========================================================
+   8W 社区官方 NES 像素复古主题系统 (8W NES.css Style)
+========================================================= */
+
+@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Noto+Sans+SC:wght@400;700;900&family=JetBrains+Mono:wght@400;700&display=swap');
+@import 'nes.css/css/nes.min.css';
+
+:root {
+  /* 默认白昼模式 (8W 官网标准配色) */
+  --nes-bg: #f0f0f0;
+  --nes-bg-card: #ffffff;
+  --nes-header-bg: #209cee;
+  --nes-nav-bg: #212529;
+  
+  --nes-blue: #209cee;
+  --nes-red: #e76e55;
+  --nes-green: #92cc41;
+  --nes-yellow: #f7d51d;
+  --nes-dark: #212529;
+  --nes-white: #ffffff;
+  --nes-gray: #adafbc;
+  --nes-black: #000000;
+  
+  --nes-text: #212529;
+  --nes-text-muted: #555555;
+  
+  --font-pixel: 'Press Start 2P', 'Noto Sans SC', sans-serif;
+  --font-main: 'Noto Sans SC', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+
+/* 暗黑地下城像素模式 */
+html.dark-theme {
+  --nes-bg: #141619;
+  --nes-bg-card: #1f2328;
+  --nes-header-bg: #105b8e;
+  --nes-nav-bg: #0d1117;
+  
+  --nes-text: #f0f6fc;
+  --nes-text-muted: #8b949e;
+  --nes-white: #f0f6fc;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-main);
+  background-color: var(--nes-bg);
+  color: var(--nes-text);
+  min-height: 100vh;
+  line-height: 1.7;
+  image-rendering: pixelated;
+  -webkit-font-smoothing: antialiased;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* 页面通用居中容器 */
+.nes-main-container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 30px 20px 60px;
+}
+
+/* 8W 专属像素卡片增强 */
+.nes-custom-card {
+  background-color: var(--nes-bg-card);
+  border: 4px solid var(--nes-dark);
+  box-shadow: 6px 6px 0 var(--nes-dark);
+  padding: 24px;
+  margin-bottom: 24px;
+  position: relative;
+}
+
+.nes-custom-card.with-title {
+  margin-top: 20px;
+  padding-top: 28px;
+}
+
+.nes-custom-card.with-title .card-title {
+  position: absolute;
+  top: -18px;
+  left: 20px;
+  background-color: var(--nes-yellow);
+  border: 3px solid var(--nes-dark);
+  box-shadow: 3px 3px 0 var(--nes-dark);
+  padding: 2px 14px;
+  font-weight: 900;
+  font-size: 0.95rem;
+  color: var(--nes-dark);
+}
+
+/* 像素黄底大标 */
+.nes-section-banner {
+  background-color: var(--nes-yellow);
+  color: var(--nes-dark);
+  border: 4px solid var(--nes-dark);
+  box-shadow: 4px 4px 0 var(--nes-dark);
+  padding: 14px 20px;
+  text-align: center;
+  font-weight: 900;
+  font-size: 1.3rem;
+  margin-bottom: 28px;
+  letter-spacing: 1px;
+}
+
+/* 像素表单项 */
+.nes-field-wrap {
+  margin-bottom: 18px;
+}
+
+.nes-field-wrap label {
+  display: block;
+  font-weight: 700;
+  font-size: 0.9rem;
+  margin-bottom: 8px;
+}
+
+/* 像素提示框 */
+.nes-alert {
+  padding: 10px 16px;
+  border: 3px solid var(--nes-dark);
+  box-shadow: 3px 3px 0 var(--nes-dark);
+  font-size: 0.88rem;
+  font-weight: 700;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.nes-alert.error {
+  background-color: var(--nes-red);
+  color: #fff;
+}
+
+.nes-alert.success {
+  background-color: var(--nes-green);
+  color: #fff;
+}
+
+.nes-alert.info {
+  background-color: var(--nes-blue);
+  color: #fff;
+}
+
+/* 状态药丸 */
+.nes-tag-status {
+  padding: 2px 10px;
+  border: 2px solid var(--nes-dark);
+  box-shadow: 2px 2px 0 var(--nes-dark);
+  font-size: 0.78rem;
+  font-weight: 900;
+}
+
+.nes-tag-status.online {
+  background-color: var(--nes-green);
+  color: #fff;
+}
+
+.nes-tag-status.offline {
+  background-color: var(--nes-red);
+  color: #fff;
+}

@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>8WBot</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700;14..32,760&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="page-shell">
+    <nav class="top-nav">
+      <div class="nav-inner">
+        <a class="brand" href="/">
+          <span class="brand-mark">8W</span>
+          <span>8WBot</span>
+        </a>
+        <div class="nav-pills" aria-label="主导航">
+          <a class="active" href="/">首页</a>
+          <a href="/login.html">登录</a>
+          <a href="/user.html">用户中心</a>
+        </div>
+        <div class="nav-actions">
+          <a class="icon-btn" href="/login.html" title="进入控制台" aria-label="进入控制台">
+            <svg class="svg" viewBox="0 0 24 24"><path d="M5 12h14"></path><path d="m13 6 6 6-6 6"></path></svg>
+          </a>
+        </div>
+      </div>
+    </nav>
+
+    <main class="container">
+      <section class="hero">
+        <div class="hero-grid">
+          <div>
+            <span class="eyebrow">
+              <svg class="svg" viewBox="0 0 24 24"><path d="M12 3v18"></path><path d="M5 8h14"></path><path d="M7 16h10"></path></svg>
+              Minecraft 1.21.4 挂机管理面板
+            </span>
+            <h1>8WBot</h1>
+            <p>面向 8W 社区和邦国崛起服务器的机器人管理页面。你可以登录账号、创建机器人、完成归属验证，并在控制台里启动、停止、查看日志和发送聊天或命令。</p>
+            <div class="hero-actions">
+              <a class="btn primary" href="/login.html">
+                <svg class="svg" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path><path d="m10 17 5-5-5-5"></path><path d="M15 12H3"></path></svg>
+                登录控制台
+              </a>
+              <a class="btn" href="https://8w.bgjq.top/" target="_blank" rel="noopener">8W 社区网站</a>
+            </div>
+          </div>
+          <div class="panel panel-pad">
+            <div class="section-title">
+              <div>
+                <h2>当前功能</h2>
+                <p>这里列出的是前端和后端已经接入的功能，不包含夸大的自动化承诺。</p>
+              </div>
+            </div>
+            <div class="feature-grid">
+              <div class="feature">
+                <svg class="svg" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+                <h3>账号登录</h3>
+                <p>支持简欢通 UID 和动态验证码登录，也保留二维码登录入口。</p>
+              </div>
+              <div class="feature">
+                <svg class="svg" viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="12" rx="2"></rect><path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><path d="M8 13h.01"></path><path d="M16 13h.01"></path></svg>
+                <h3>机器人管理</h3>
+                <p>创建机器人、查看归属状态，并对未确认机器人发起验证流程。</p>
+              </div>
+              <div class="feature">
+                <svg class="svg" viewBox="0 0 24 24"><path d="M4 17 10 11 4 5"></path><path d="M12 19h8"></path></svg>
+                <h3>控制台</h3>
+                <p>连接指定机器人，查看实时日志，发送聊天内容或以斜杠开头的命令。</p>
+              </div>
+              <div class="feature">
+                <svg class="svg" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7"></path><path d="M21 3v6h-6"></path></svg>
+                <h3>基础开关</h3>
+                <p>控制台提供地图显示、自动重连、自动恢复相关开关，具体效果以后端和机器人服务为准。</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel panel-pad" style="margin-bottom:18px">
+        <div class="section-title">
+          <div>
+            <h2>使用前请留意</h2>
+            <p>控制台操作会直接发送到机器人服务。启动、停止和发送命令前，请确认当前选择的机器人名称正确。</p>
+          </div>
+        </div>
+        <div class="notice">
+          <svg class="svg" viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"></path><path d="M12 9v4"></path><path d="M12 17h.01"></path></svg>
+          <div><strong>防止误触</strong>机器人启动、停止和命令发送都需要你主动点击按钮。建议先在用户中心确认机器人状态，再进入控制台操作。</div>
+        </div>
+      </section>
+
+      <section class="panel panel-pad">
+        <div class="section-title">
+          <div>
+            <h2>社区链接</h2>
+            <p>这些入口来自原欢迎页，方便跳转到社区相关页面。</p>
+          </div>
+        </div>
+        <div class="hero-actions" style="margin-top:0">
+          <a class="btn" href="https://8w.bgjq.top/" target="_blank" rel="noopener">社区官网</a>
+          <a class="btn" href="https://8w.bgjq.top/parliament" target="_blank" rel="noopener">邦国议会</a>
+          <a class="btn" href="https://qm.qq.com/q/hELXutcWZy" target="_blank" rel="noopener">QQ 群</a>
+          <a class="btn" href="https://pd.qq.com/s/61ds8hzgr" target="_blank" rel="noopener">QQ 频道</a>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 - 8WBot</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://cap.fanverify.cn/ce31c7abec/widget.js" data-cap-auto-bind="false"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700;14..32,760&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="page-shell">
+  <nav class="top-nav">
+    <div class="nav-inner">
+      <a class="brand" href="/"><span class="brand-mark">8W</span><span>8WBot</span></a>
+      <div class="nav-pills"><a href="/">首页</a><a class="active" href="/login.html">登录</a><a href="/user.html">用户中心</a></div>
+    </div>
+  </nav>
+
+  <main class="container" id="app">
+    <section class="form-card panel">
+      <div class="section-title" style="display:block;text-align:center">
+        <h2>登录控制台</h2>
+        <p>使用 FanVerify UID 和动态验证码登录。完成真人验证后再提交。</p>
+      </div>
+
+      <div v-if="autoChecking" class="msg info">正在检查本地登录状态...</div>
+      <div v-if="msg.text" :class="['msg', msg.type]">{{ msg.text }}</div>
+
+      <div v-if="!autoChecking">
+        <div class="field">
+          <label for="uid">FanVerify UID</label>
+          <input id="uid" v-model.trim="user_id" type="text" inputmode="numeric" placeholder="输入你的用户 ID" @input="msg.text=''">
+        </div>
+        <div class="field">
+          <label for="code">动态验证码</label>
+          <input id="code" v-model.trim="verify_code" type="text" placeholder="输入动态验证码" @input="msg.text=''">
+        </div>
+        <div style="display:grid;place-items:center;min-height:64px;margin:14px 0 18px">
+          <div id="main-cap-container"></div>
+        </div>
+        <button class="btn primary" style="width:100%" :disabled="loading || !captchaToken || !user_id || !verify_code" @click="handleLogin">
+          <svg class="svg" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path><path d="m10 17 5-5-5-5"></path><path d="M15 12H3"></path></svg>
+          {{ loading ? '正在验证' : '登录' }}
+        </button>
+
+        <div class="notice" style="margin:18px 0">
+          <svg class="svg" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"></path></svg>
+          <div><strong>小心误触</strong>登录后可直接进入机器人管理和控制台，请确认账号无误后再操作。</div>
+        </div>
+
+        <button class="btn" style="width:100%" @click="openQRModal">扫码登录</button>
+        <div style="text-align:center;margin-top:16px"><a href="/" style="color:#64748b;text-decoration:none">返回首页</a></div>
+      </div>
+    </section>
+
+    <div v-if="qrModal.show" class="modal" @click.self="closeQRModal">
+      <div class="modal-card">
+        <div class="section-title" style="display:block">
+          <h2>扫码登录</h2>
+          <p>先完成真人验证，再打开扫码页面。这里不加载外部二维码图片。</p>
+        </div>
+        <div v-if="qrModal.step === 'captcha'" style="display:grid;place-items:center;min-height:76px">
+          <div id="qr-cap-container"></div>
+          <button v-if="qrModal.capManual" class="btn" style="margin-top:12px" @click="generateQR">继续生成扫码链接</button>
+        </div>
+        <div v-if="qrModal.step === 'qr'">
+          <a class="btn primary" style="width:100%;margin-bottom:12px" :href="qrModal.qrUrl" target="_blank" rel="noopener">打开扫码页面</a>
+          <div :class="['msg', qrModal.status === 'error' || qrModal.status === 'expired' ? 'error' : qrModal.status === 'success' ? 'success' : 'info']">
+            <template v-if="qrModal.status === 'waiting'">等待扫码确认，剩余 {{ qrModal.countdown }} 秒。</template>
+            <template v-else-if="qrModal.status === 'success'">登录成功，正在进入用户中心。</template>
+            <template v-else-if="qrModal.status === 'expired'">扫码链接已过期，请重新生成。</template>
+            <template v-else>{{ qrModal.errMsg }}</template>
+          </div>
+        </div>
+        <button class="btn" style="width:100%" @click="closeQRModal">关闭</button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+const { createApp, ref, reactive, onMounted, nextTick } = Vue;
+createApp({setup(){
+  const user_id=ref(''), verify_code=ref(''), captchaToken=ref(''), loading=ref(false), autoChecking=ref(false);
+  const msg=reactive({text:'',type:''});
+  const qrModal=reactive({show:false,step:'captcha',capToken:'',sessionToken:'',qrUrl:'',status:'',countdown:0,errMsg:'',capManual:false});
+  let qrPollTimer=null, qrCountdownTimer=null;
+  let mainCapSolver=null, qrCapSolver=null;
+
+  function okCode(v){return String(v)==='200' || Number(v)===200}
+  function setAuthCookie(token){const d=new Date();d.setTime(d.getTime()+7*24*60*60*1000);document.cookie='8wbot_token='+encodeURIComponent(token)+'; expires='+d.toUTCString()+'; path=/; SameSite=Lax'}
+  function getCookie(name){const m=document.cookie.match(new RegExp('(^| )'+name+'=([^;]+)'));return m?decodeURIComponent(m[2]):''}
+
+  onMounted(()=>{
+    // Check existing login
+    const token=getCookie('8wbot_token')||localStorage.getItem('8wbot_token');
+    if(token){
+      autoChecking.value=true;
+      fetch('/api/userdata',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({access_token:token})})
+        .then(r=>r.json())
+        .then(d=>{if(okCode(d.code)) location.href='/user.html'; else autoChecking.value=false})
+        .catch(()=>autoChecking.value=false)
+    }
+
+    // Initialize main Cap widget
+    if(window.CapSolver){
+      mainCapSolver = new window.CapSolver('main-cap-container', {
+        onSuccess: (token) => {
+          captchaToken.value = token;
+          console.log('Cap solved (main):', token.substring(0, 20) + '...');
+        },
+        onError: (error) => {
+          console.error('Cap error (main):', error);
+          msg.text = 'Cap验证失败: ' + error.message;
+          msg.type = 'error';
+        }
+      });
+    }
+  });
+
+  async function handleLogin(){
+    if(!user_id.value||!verify_code.value||!captchaToken.value)return;
+    loading.value=true;
+    msg.text='';
+    try{
+      const res=await fetch('/api/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({user_id:user_id.value,verify_code:verify_code.value,cap_token:captchaToken.value})});
+      const data=await res.json();
+      if(okCode(data.code)){
+        msg.text=data.msg||'登录成功';
+        msg.type='success';
+        localStorage.setItem('8wbot_token',data.accesstoken);
+        setAuthCookie(data.accesstoken);
+        setTimeout(()=>location.href='/user.html',700)
+      }else{
+        msg.text=data.msg||data.message||'验证失败';
+        msg.type='error';
+        captchaToken.value='';
+        // Reset Cap widget
+        if(mainCapSolver) mainCapSolver.reset();
+      }
+    }catch(e){
+      msg.text='网络错误: '+e.message;
+      msg.type='error'
+    }finally{
+      loading.value=false
+    }
+  }
+
+  function openQRModal(){
+    msg.text='';
+    Object.assign(qrModal,{show:true,step:'captcha',capToken:captchaToken.value||'',sessionToken:'',qrUrl:'',status:'',countdown:0,errMsg:'',capManual:false});
+    
+    nextTick(()=>{
+      // Initialize QR Cap widget
+      if(window.CapSolver && !qrCapSolver){
+        qrCapSolver = new window.CapSolver('qr-cap-container', {
+          onSuccess: (token) => {
+            qrModal.capToken = token;
+            console.log('Cap solved (QR):', token.substring(0, 20) + '...');
+            generateQR();
+          },
+          onError: (error) => {
+            console.error('Cap error (QR):', error);
+            qrModal.errMsg = 'Cap验证失败: ' + error.message;
+            qrModal.status = 'error';
+            qrModal.step = 'qr';
+          }
+        });
+      }
+
+      if(qrModal.capToken){
+        generateQR();
+        return;
+      }
+      
+      setTimeout(()=>{
+        if(qrModal.show&&!qrModal.capToken&&qrModal.step==='captcha')
+          qrModal.capManual=true
+      },6000);
+    });
+  }
+
+  async function generateQR(){
+    try{
+      const res=await fetch('/api/login?cap_token='+encodeURIComponent(qrModal.capToken||captchaToken.value));
+      const data=await res.json();
+      if(!data.qr_coder){
+        qrModal.errMsg=data.msg||'生成扫码链接失败';
+        qrModal.status='error';
+        qrModal.step='qr';
+        return
+      }
+      qrModal.sessionToken=data.session_token;
+      qrModal.qrUrl=data.qr_coder;
+      qrModal.step='qr';
+      qrModal.status='waiting';
+      qrModal.countdown=120;
+      clearInterval(qrCountdownTimer);
+      qrCountdownTimer=setInterval(()=>{
+        qrModal.countdown--;
+        if(qrModal.countdown<=0){
+          qrModal.status='expired';
+          stopQRPoll();
+          clearInterval(qrCountdownTimer)
+        }
+      },1000);
+      startQRPoll()
+    }catch(e){
+      qrModal.errMsg=e.message;
+      qrModal.status='error';
+      qrModal.step='qr'
+    }
+  }
+
+  function startQRPoll(){
+    stopQRPoll();
+    qrPollTimer=setInterval(async()=>{
+      if(qrModal.status!=='waiting')return;
+      try{
+        const r=await fetch('/api/login?session_token='+encodeURIComponent(qrModal.sessionToken));
+        const d=await r.json();
+        if(d.status==='ok'){
+          qrModal.status='success';
+          stopQRPoll();
+          clearInterval(qrCountdownTimer);
+          localStorage.setItem('8wbot_token',d.access_token);
+          setAuthCookie(d.access_token);
+          setTimeout(()=>location.href='/user.html',900)
+        }else if(d.status==='expired'){
+          qrModal.status='expired';
+          stopQRPoll()
+        }
+      }catch(e){}
+    },5000)
+  }
+
+  function stopQRPoll(){
+    if(qrPollTimer){
+      clearInterval(qrPollTimer);
+      qrPollTimer=null
+    }
+  }
+
+  function closeQRModal(){
+    qrModal.show=false;
+    stopQRPoll();
+    clearInterval(qrCountdownTimer);
+    if(qrCapSolver){
+      qrCapSolver.reset();
+      qrCapSolver=null;
+    }
+  }
+
+  return{user_id,verify_code,captchaToken,loading,msg,autoChecking,handleLogin,qrModal,openQRModal,closeQRModal,generateQR};
+}}).mount('#app');
+</script>
+</body>
+</html>

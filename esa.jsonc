@@ -1,0 +1,25 @@
+{
+  "$schema": "https://esa.xiaofanshu.com/schema.json",
+  "name": "8wbot-web",
+  "version": "1.0.0",
+  "description": "8WBot 前端 - Minecraft 机器人管理平台",
+  "build": {
+    "command": "cd bgjq-web && npm install && npm run build",
+    "output": "bgjq-web/dist"
+  },
+  "deploy": {
+    "assets": {
+      "directory": "bgjq-web/dist",
+      "index": "index.html"
+    }
+  },
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "/index.html"
+    }
+  ],
+  "env": {
+    "NODE_VERSION": "22"
+  }
+}

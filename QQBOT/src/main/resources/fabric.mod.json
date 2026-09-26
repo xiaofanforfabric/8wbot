@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "qqbot",
+  "version": "${version}",
+  "name": "QQBOT",
+  "description": "",
+  "authors": [],
+  "contact": {},
+  "license": "unlicense",
+  "icon": "assets/qqbot/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "fabric-datagen": [
+      "com.xiaofan.qqbot.client.QqbotDataGenerator"
+    ],
+    "client": [
+      "com.xiaofan.qqbot.client.QqbotClient"
+    ],
+    "main": [
+      "com.xiaofan.qqbot.Qqbot"
+    ]
+  },
+  "mixins": [
+    "qqbot.mixins.json",
+    {
+      "config": "qqbot.client.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "fabric-api": "*",
+    "minecraft": "${minecraft_version}"
+  }
+}
