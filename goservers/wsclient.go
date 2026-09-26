@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,28 @@ func (s *BotSession) Close() {
 
 var activeSessions sync.Map // botName -> *BotSession
 
+// getJSNodeURL 构建连接内地 E5 机器 JS 节点的完整 URL (自动附加鉴权 secret)
+func getJSNodeURL(apiPath string) string {
+	rawBase := os.Getenv("JS_NODE_URL")
+	if rawBase == "" {
+		rawBase = "ws://js.xiaofanai.uk:8889"
+	}
+	secret := os.Getenv("INTERNAL_NODE_SECRET")
+
+	u, err := url.Parse(rawBase)
+	if err != nil {
+		u = &url.URL{Scheme: "ws", Host: "js.xiaofanai.uk:8889"}
+	}
+	u.Path = apiPath
+
+	if secret != "" {
+		q := u.Query()
+		q.Set("secret", secret)
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
+}
+
 // InitWSClient is kept for backward compatibility.
 func InitWSClient() *WSClient {
 	return &WSClient{}
@@ -40,21 +63,10 @@ func InitWSClient() *WSClient {
 // WSClient placeholder for backward compatibility.
 type WSClient struct{}
 
-// wsPoller sets up ping/pong heartbeat on an outgoing WS connection to JS.
-// Starts a goroutine that sends pings periodically.
 func wsPoller(conn *websocket.Conn) func() {
-	const (
-		pongWait   = 60 * time.Second
-		pingPeriod = 30 * time.Second
-	)
-	conn.SetReadDeadline(time.Now().Add(pongWait))
-	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(pongWait))
-		return nil
-	})
 	stop := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(pingPeriod)
+		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
@@ -72,11 +84,10 @@ func wsPoller(conn *websocket.Conn) func() {
 }
 
 // StartBotAndDetect spawns a dedicated WS connection, starts a bot, monitors
-// events, and returns when we see "正在生成动态二维码，请稍候..." or timeout.
-// Returns the matched chat text and the bot's simpass UID (from chat or bot name).
+// events, and returns when we see "您绑定的简幻通UID是" or timeout.
 func (c *WSClient) StartBotAndDetect(username string, timeout time.Duration) (chat string, uid string, err error) {
-	u := url.URL{Scheme: "ws", Host: "127.0.0.1:8889", Path: "/ws/api/startbot"}
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	targetURL := getJSNodeURL("/ws/api/startbot")
+	conn, _, err := websocket.DefaultDialer.Dial(targetURL, nil)
 	if err != nil {
 		return "", "", fmt.Errorf("ws dial: %w", err)
 	}
@@ -151,10 +162,24 @@ func (c *WSClient) StartBotAndDetect(username string, timeout time.Duration) (ch
 	}
 }
 
+func extractSimpassUID(text string) string {
+	idx := strings.Index(text, "您绑定的简幻通UID是")
+	if idx == -1 {
+		return ""
+	}
+	sub := text[idx+len("您绑定的简幻通UID是"):]
+	sub = strings.TrimSpace(sub)
+	fields := strings.Fields(sub)
+	if len(fields) > 0 {
+		return fields[0]
+	}
+	return ""
+}
+
 // StopBot sends a stop command via WS to terminate a bot.
 func (c *WSClient) StopBot(username string) error {
-	u := url.URL{Scheme: "ws", Host: "127.0.0.1:8889", Path: "/ws/api/stopbot"}
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	targetURL := getJSNodeURL("/ws/api/stopbot")
+	conn, _, err := websocket.DefaultDialer.Dial(targetURL, nil)
 	if err != nil {
 		return fmt.Errorf("stopbot dial: %w", err)
 	}
@@ -188,8 +213,8 @@ func (c *WSClient) StopBot(username string) error {
 // GetBotStatus queries the JS launcher for bot online status.
 // Returns online bool.
 func (c *WSClient) GetBotStatus(username string) (online bool, err error) {
-	u := url.URL{Scheme: "ws", Host: "127.0.0.1:8889", Path: "/ws/api/botstatus"}
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	targetURL := getJSNodeURL("/ws/api/botstatus")
+	conn, _, err := websocket.DefaultDialer.Dial(targetURL, nil)
 	if err != nil {
 		return false, fmt.Errorf("botstatus dial: %w", err)
 	}
@@ -220,8 +245,8 @@ func (c *WSClient) GetBotStatus(username string) (online bool, err error) {
 // BotLogs connects to the botlogs WS and returns the connection for reading events.
 // Caller must close the connection.
 func (c *WSClient) BotLogs(username string) (*websocket.Conn, error) {
-	u := url.URL{Scheme: "ws", Host: "127.0.0.1:8889", Path: "/ws/api/botlogs"}
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	targetURL := getJSNodeURL("/ws/api/botlogs")
+	conn, _, err := websocket.DefaultDialer.Dial(targetURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("botlogs dial: %w", err)
 	}
@@ -277,8 +302,8 @@ func (c *WSClient) SendCommandAndDetect(botname string, chatText string, timeout
 	}()
 
 	// Send code via sendinfo
-	u := url.URL{Scheme: "ws", Host: "127.0.0.1:8889", Path: "/ws/api/sendinfo"}
-	sinfo, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	targetURL := getJSNodeURL("/ws/api/sendinfo")
+	sinfo, _, err := websocket.DefaultDialer.Dial(targetURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("sendinfo dial: %w", err)
 	}

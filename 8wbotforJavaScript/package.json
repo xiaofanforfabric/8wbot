@@ -11,8 +11,9 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "dotenv": "^18.0.4",
     "mineflayer": "^4.37.1",
+    "ssh2": "^1.11.0",
     "ws": "^8.13.0"
-    ,"ssh2": "^1.11.0"
   }
 }

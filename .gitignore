@@ -71,3 +71,12 @@ node_modules/
 ### 构建产物 ###
 *.exe
 goservers/goservers
+goservers/8wbot-server
+*.backup*
+**/*.backup*
+CAP_MIGRATION_COMPLETE.md
+CONFIG_TEMPLATE.md
+FANVERIFY_MIGRATION.md
+MIGRATION_STATUS.md
+VUE_MIGRATION_COMPLETE.md
+

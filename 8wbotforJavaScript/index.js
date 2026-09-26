@@ -1,6 +1,16 @@
+require('dotenv').config();
+
 // launcher.js — 启动器，通过 WS /ws/api/startbot 启动机器人并实时推送日志
 const mineflayer = require('mineflayer');
 const WebSocket = require('ws');
+const url = require('url');
+
+const INTERNAL_NODE_SECRET = process.env.INTERNAL_NODE_SECRET || '';
+if (!INTERNAL_NODE_SECRET) {
+  console.warn('⚠️ 警告: INTERNAL_NODE_SECRET 未配置，节点鉴权处于未保护状态！');
+} else {
+  console.log('🔒 内部通信安全鉴权已启用 (INTERNAL_NODE_SECRET 已生效)');
+}
 
 const SERVER_HOST = 'bgjq.simpfun.cn';
 const SERVER_PORT = 25565;
@@ -135,8 +145,23 @@ try {
   wss.on('connection', (ws, req) => {
     ws.isAlive = true;
     ws.on('pong', heartbeat);
-    const path = req.url || '/';
-    console.log('WS client connected:', path);
+
+    const parsedUrl = url.parse(req.url || '/', true);
+    const pathname = parsedUrl.pathname || '/';
+    const clientSecret = parsedUrl.query.secret || req.headers['x-internal-secret'] || '';
+
+    // ─── 安全鉴权检查 ───
+    if (INTERNAL_NODE_SECRET) {
+      if (!clientSecret || clientSecret !== INTERNAL_NODE_SECRET) {
+        console.warn(`⛔ [Auth] 拒绝未经授权的 WS 握手: ${pathname} 来自 ${req.socket.remoteAddress}`);
+        ws.send(JSON.stringify({ code: 401, message: 'Unauthorized: invalid or missing internal secret' }));
+        ws.close(4001, 'Unauthorized');
+        return;
+      }
+    }
+
+    console.log(`✅ [Auth] 节点握手鉴权通过: ${pathname} 来自 ${req.socket.remoteAddress}`);
+    const path = pathname;
 
     // ─── /ws/api/startbot ───
     if (path === '/ws/api/startbot') {

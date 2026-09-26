@@ -31,11 +31,26 @@ import (
 )
 
 const (
-	listenAddr     = ":8888"
-	dbFile         = "data.sqlite"
-	tokenValidity  = 7 * 24 * time.Hour
-	simpassAPIBase = "https://pass.simpfun.cn"
-	defaultDevUUID = "REDACTED_DEV_UUID"
+	defaultListenAddr    = ":8888"
+	dbFile               = "data.sqlite"
+	tokenValidity        = 7 * 24 * time.Hour
+	defaultFanverifyBase = "https://api.fanverify.cn"
+	simpassAPIBase       = "https://simpass.simpfun.cn"
+)
+
+var (
+	listenAddr           string
+	fanverifyAPIBase     string
+	fanverifyAccessToken string
+	defaultDevUUID       string
+	jwtSecret            []byte
+	devUUID              string
+	capSiteKey           string
+	capSecretKey         string
+	capServerURL         string
+	corsRawOrigins       string
+	corsAllowAll         bool
+	corsOriginList       []string
 )
 
 type UserData struct {
@@ -43,10 +58,10 @@ type UserData struct {
 	AccessToken                  string `json:"accesstoken"`
 	RemainingBotCreationQuantity int64  `json:"remaining_bot_creation_quantity"`
 	LevelID                      int64  `json:"level_id"`
-	SimpassUID                   int64  `json:"simpass_uid"`
+	FanverifyUID                 int64  `json:"fanverify_uid"`
 	CreateTime                   string `json:"create_time"`
 	Level                        int64  `json:"level"`
-	Risky                        bool   `json:"risky"`
+	Tag                          string `json:"tag"`
 	LastLoginTime                string `json:"last_login_time"`
 	Status                       string `json:"status"`      // "ok" or "ban"
 	StatusInfo                   string `json:"status_info"` // reason
@@ -82,22 +97,75 @@ func loadEnv(path string) map[string]string {
 	return env
 }
 
-var jwtSecret []byte
-var devUUID string
-var capSecret string
-var capAPIEndpoint string
-var capSiteverifyURL string
+// initCORS 解析 CORS_ALLOWED_ORIGINS 配置。
+// 支持三种写法（逗号分隔混用）：
+//   - "*"                    放行所有来源（默认；API 使用 Bearer Token 鉴权，不依赖跨域 Cookie）
+//   - "https://a.example.com" 精确匹配来源
+//   - "*.example.com"         匹配该域名及其所有子域（支持 ESA Pages 预览域名）
+func initCORS(raw string) {
+	corsRawOrigins = strings.TrimSpace(raw)
+	if corsRawOrigins == "" {
+		corsRawOrigins = "*"
+	}
+	corsAllowAll = false
+	corsOriginList = nil
+	for _, item := range strings.Split(corsRawOrigins, ",") {
+		v := strings.ToLower(strings.TrimSpace(item))
+		if v == "" {
+			continue
+		}
+		if v == "*" {
+			corsAllowAll = true
+			continue
+		}
+		corsOriginList = append(corsOriginList, v)
+	}
+}
+
+// corsOriginAllowed 判断请求来源是否被允许。
+func corsOriginAllowed(origin string) bool {
+	if origin == "" {
+		return false
+	}
+	if corsAllowAll {
+		return true
+	}
+	o := strings.ToLower(strings.TrimSpace(origin))
+	for _, allow := range corsOriginList {
+		if allow == o {
+			return true
+		}
+		// 通配子域：*.example.com 同时匹配 example.com 本身
+		if strings.HasPrefix(allow, "*.") {
+			suffix := allow[1:] // ".example.com"
+			if strings.HasSuffix(o, suffix) {
+				return true
+			}
+			// 形如 https://example.com 时，主机部分正好等于后缀去掉点
+			if strings.HasSuffix(o, suffix[1:]) {
+				host := o
+				if i := strings.Index(host, "://"); i >= 0 {
+					host = host[i+3:]
+				}
+				if host == suffix[1:] {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
 
 // OTP session store (in-memory)
 type otpSession struct {
-	OtpID      string    `json:"otp_id"`
-	Status     string    `json:"status"` // "wait" | "ok"
-	ExpiresAt  time.Time `json:"expires_at"`
-	SimpassUID int64     `json:"simpass_uid,omitempty"`
-	CreateTime string    `json:"create_time,omitempty"`
-	Level      int64     `json:"level,omitempty"`
-	Risky      bool      `json:"risky,omitempty"`
-	Token      string    `json:"token,omitempty"`
+	OtpID        string    `json:"otp_id"`
+	Status       string    `json:"status"` // "wait" | "ok"
+	ExpiresAt    time.Time `json:"expires_at"`
+	FanverifyUID int64     `json:"fanverify_uid,omitempty"`
+	CreateTime   string    `json:"create_time,omitempty"`
+	Level        int64     `json:"level,omitempty"`
+	Tag          string    `json:"tag,omitempty"`
+	Token        string    `json:"token,omitempty"`
 }
 
 var otpSessions sync.Map
@@ -123,30 +191,62 @@ func main() {
 
 	// Load .env
 	envVars := loadEnv(filepath.Join(baseDir, ".env"))
+
+	listenAddr = envVars["PORT"]
+	if listenAddr == "" {
+		listenAddr = defaultListenAddr
+	} else if !strings.HasPrefix(listenAddr, ":") {
+		listenAddr = ":" + listenAddr
+	}
+
+	fanverifyAPIBase = envVars["FANVERIFY_API_BASE"]
+	if fanverifyAPIBase == "" {
+		fanverifyAPIBase = defaultFanverifyBase
+	}
+
+	fanverifyAccessToken = envVars["FANVERIFY_ACCESS_TOKEN"]
+	if fanverifyAccessToken == "" {
+		fanverifyAccessToken = os.Getenv("FANVERIFY_ACCESS_TOKEN")
+	}
+	if fanverifyAccessToken == "" {
+		log.Fatalf("FATAL: FANVERIFY_ACCESS_TOKEN not set in .env or environment!")
+	}
+	log.Printf("FANVERIFY_ACCESS_TOKEN loaded successfully")
+
 	devUUID = envVars["DEV_UUID"]
 	if devUUID == "" {
-		devUUID = defaultDevUUID
-		log.Printf("using default dev UUID (set DEV_UUID in .env to override)")
+		devUUID = os.Getenv("DEV_UUID")
+	}
+	if devUUID == "" {
+		log.Printf("DEV_UUID not specified, skipping dev auth module")
 	} else {
-		log.Printf("dev UUID loaded from .env")
+		log.Printf("DEV_UUID loaded")
 	}
-	capSecret = envVars["CAP_SECRET"]
-	if capSecret == "" {
-		log.Fatalf("FATAL: CAP_SECRET not set in .env! cap.js verification will not work.")
+	capSiteKey = envVars["CAP_SITE_KEY"]
+	if capSiteKey == "" {
+		log.Fatalf("FATAL: CAP_SITE_KEY not set in .env! Cap widget will not work.")
 	}
-	log.Printf("CAP_SECRET loaded from .env")
+	log.Printf("CAP_SITE_KEY loaded from .env: %s", capSiteKey)
 
-	capAPIEndpoint = envVars["CAP_API_ENDPOINT"]
-	if capAPIEndpoint == "" {
-		log.Fatalf("FATAL: CAP_API_ENDPOINT not set in .env! cap.js widget will not work.")
+	capSecretKey = envVars["CAP_SECRET_KEY"]
+	if capSecretKey == "" {
+		log.Fatalf("FATAL: CAP_SECRET_KEY not set in .env! Cap verification will not work.")
 	}
-	log.Printf("CAP_API_ENDPOINT loaded from .env")
+	log.Printf("CAP_SECRET_KEY loaded from .env")
 
-	capSiteverifyURL = envVars["CAP_SITEVERIFY_URL"]
-	if capSiteverifyURL == "" {
-		log.Fatalf("FATAL: CAP_SITEVERIFY_URL not set in .env! cap.js verification will not work.")
+	capServerURL = envVars["CAP_SERVER_URL"]
+	if capServerURL == "" {
+		log.Fatalf("FATAL: CAP_SERVER_URL not set in .env! Cap server will not work.")
 	}
-	log.Printf("CAP_SITEVERIFY_URL loaded from .env")
+	log.Printf("CAP_SERVER_URL loaded from .env: %s", capServerURL)
+
+	initCORS(envVars["CORS_ALLOWED_ORIGINS"])
+	if corsAllowAll {
+		log.Printf("CORS: 放行所有来源 (CORS_ALLOWED_ORIGINS=%s)", corsRawOrigins)
+	} else {
+		log.Printf("CORS: 白名单 %v", corsOriginList)
+	}
+
 
 	// load or create jwt secret
 	secretPath := filepath.Join(baseDir, "jwt.secret")
@@ -198,8 +298,8 @@ func main() {
 			}
 			log.Printf("[AUTO-RESTORE] sending restore command to %d bot(s)", len(names))
 			for _, name := range names {
-				su := url.URL{Scheme: "ws", Host: "127.0.0.1:8889", Path: "/ws/api/sendinfo"}
-				sc, _, serr := (&websocket.Dialer{}).Dial(su.String(), nil)
+				targetURL := getJSNodeURL("/ws/api/sendinfo")
+				sc, _, serr := (&websocket.Dialer{}).Dial(targetURL, nil)
 				if serr != nil {
 					continue
 				}
@@ -220,6 +320,28 @@ func main() {
 
 	// --- Logging middleware ---
 	loggedMux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// --- CORS: 必须在业务处理前完成，且 OPTIONS 预检必须短路 ---
+		origin := r.Header.Get("Origin")
+		if corsOriginAllowed(origin) {
+			if corsAllowAll {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+			} else {
+				// 回显具体来源，兼容后续可能开启的凭证模式
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			}
+			w.Header().Add("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With, Accept, Origin")
+			w.Header().Set("Access-Control-Expose-Headers", "Content-Type, Content-Length")
+			w.Header().Set("Access-Control-Max-Age", "600")
+		}
+		if r.Method == http.MethodOptions {
+			// 预检请求直接返回，避免被各 handler 的 method 检查判成 405
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
 		// Read body for POST/PUT (limit to 4KB)
 		var bodyDump string
 		if r.Method == "POST" || r.Method == "PUT" {
@@ -241,7 +363,7 @@ func main() {
 			if len(disp) > 200 {
 				disp = disp[:200] + "..."
 			}
-			disp = strings.ReplaceAll(disp, capSecret, "***")
+			disp = strings.ReplaceAll(disp, capSecretKey, "***")
 			logLine += " | body=" + disp
 		}
 
@@ -252,7 +374,7 @@ func main() {
 		log.Println(logLine)
 	})
 
-	// --- POST /api/dev/auth : 简欢通动态验证码登录 ---
+	// --- POST /api/dev/auth : FanVerify 动态验证码登录 ---
 	mux.HandleFunc("/api/dev/auth", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -266,39 +388,23 @@ func main() {
 			return
 		}
 
-		userIDStr := r.FormValue("user_id")
-		verifyCode := r.FormValue("verify_code")
-		mcUsername := r.FormValue("mc_username")
-		mcUUID := r.FormValue("mc_uuid")
-		playerIP := r.FormValue("player_ip")
+		uidStr := r.FormValue("uid")         // FanVerify: uid (对应原 user_id)
+		passCode := r.FormValue("pass_code") // FanVerify: pass_code (对应原 verify_code)
 
-		if userIDStr == "" || verifyCode == "" {
+		if uidStr == "" || passCode == "" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "user_id and verify_code required"})
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "uid and pass_code required"})
 			return
 		}
 
-		// Build multipart request to simpass API
-		bodyBuf := &bytes.Buffer{}
-		writer := multipart.NewWriter(bodyBuf)
-		writer.WriteField("uuid", devUUID)
-		writer.WriteField("user_id", userIDStr)
-		writer.WriteField("verify_code", verifyCode)
-		if mcUsername != "" {
-			writer.WriteField("mc_username", mcUsername)
-		}
-		if mcUUID != "" {
-			writer.WriteField("mc_uuid", mcUUID)
-		}
-		if playerIP != "" {
-			writer.WriteField("player_ip", playerIP)
-		}
-		writer.Close()
-
-		resp, err := http.Post(simpassAPIBase+"/api/dev/auth", writer.FormDataContentType(), bodyBuf)
+		// Call FanVerify API (GET request with query params)
+		apiURL := fmt.Sprintf("%s/openapi/user_verify?accesstoken=%s&uid=%s&pass_code=%s",
+			fanverifyAPIBase, fanverifyAccessToken, uidStr, passCode)
+		
+		resp, err := http.Get(apiURL)
 		if err != nil {
-			log.Printf("simpass api error: %v", err)
+			log.Printf("fanverify api error: %v", err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "upstream request failed: " + err.Error()})
@@ -307,35 +413,45 @@ func main() {
 		defer resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
 
-		// Parse simpass response
-		var simpassResp struct {
-			Code     int    `json:"code"`
-			Msg      string `json:"msg"`
-			UserInfo *struct {
-				SimpassUID int64  `json:"simpass_uid"`
-				CreateTime string `json:"create_time"`
-				Level      int64  `json:"level"`
-				Risky      bool   `json:"risky"`
-			} `json:"user_info"`
+		// Parse FanVerify response
+		var fanverifyResp struct {
+			Status string `json:"status"`
+			Error  string `json:"error"` // 401 时返回
+			Data   []struct {
+				UID     int64  `json:"uid"`
+				RegTime string `json:"reg_time"`
+				Level   string `json:"level"` // FanVerify 返回 string
+				Tag     string `json:"tag"`
+			} `json:"data"`
 		}
-		if err := json.Unmarshal(respBody, &simpassResp); err != nil {
-			log.Printf("simpass response parse error: %v", err)
+		if err := json.Unmarshal(respBody, &fanverifyResp); err != nil {
+			log.Printf("fanverify response parse error: %v", err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "bad upstream response"})
 			return
 		}
 
-		if simpassResp.Code != 200 || simpassResp.UserInfo == nil {
-			// Forward the upstream error directly
+		// Check for auth failure
+		if resp.StatusCode == 401 || fanverifyResp.Status != "ok" || len(fanverifyResp.Data) == 0 {
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(respBody)
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"code": 401,
+				"msg":  "Authentication failed: " + fanverifyResp.Error,
+			})
 			return
 		}
 
+		userInfo := fanverifyResp.Data[0]
+
+		// Convert level from string to int64
+		levelInt, err := strconv.ParseInt(userInfo.Level, 10, 64)
+		if err != nil {
+			levelInt = 1 // fallback
+		}
+
 		// Auth success — find or create user in our DB
-		uidStr := strconv.FormatInt(simpassResp.UserInfo.SimpassUID, 10)
 		u, err := findUser(db, uidStr)
 		if err != nil {
 			http.Error(w, `{"code":500,"msg":"db error"}`, http.StatusInternalServerError)
@@ -346,16 +462,16 @@ func main() {
 				JhtUID:                       uidStr,
 				RemainingBotCreationQuantity: 1,
 				LevelID:                      10001,
-				SimpassUID:                   simpassResp.UserInfo.SimpassUID,
-				CreateTime:                   simpassResp.UserInfo.CreateTime,
-				Level:                        simpassResp.UserInfo.Level,
-				Risky:                        simpassResp.UserInfo.Risky,
+				FanverifyUID:                 userInfo.UID,
+				CreateTime:                   userInfo.RegTime,
+				Level:                        levelInt,
+				Tag:                          userInfo.Tag,
 			}
 		} else {
-			u.SimpassUID = simpassResp.UserInfo.SimpassUID
-			u.CreateTime = simpassResp.UserInfo.CreateTime
-			u.Level = simpassResp.UserInfo.Level
-			u.Risky = simpassResp.UserInfo.Risky
+			u.FanverifyUID = userInfo.UID
+			u.CreateTime = userInfo.RegTime
+			u.Level = levelInt
+			u.Tag = userInfo.Tag
 		}
 
 		// Issue JWT
@@ -365,9 +481,9 @@ func main() {
 			"jht_uid":        u.JhtUID,
 			"remaining_bots": u.RemainingBotCreationQuantity,
 			"level":          u.LevelID,
-			"sim_uid":        simpassResp.UserInfo.SimpassUID,
-			"sim_lv":         simpassResp.UserInfo.Level,
-			"risky":          simpassResp.UserInfo.Risky,
+			"fan_uid":        userInfo.UID,
+			"fan_lv":         levelInt,
+			"tag":            userInfo.Tag,
 			"exp":            exp.Unix(),
 			"iat":            now.Unix(),
 		})
@@ -388,10 +504,10 @@ func main() {
 			"code": 200,
 			"msg":  "Authentication successful",
 			"user_info": map[string]interface{}{
-				"simpass_uid": simpassResp.UserInfo.SimpassUID,
-				"create_time": simpassResp.UserInfo.CreateTime,
-				"level":       simpassResp.UserInfo.Level,
-				"risky":       simpassResp.UserInfo.Risky,
+				"fanverify_uid": userInfo.UID,
+				"create_time":   userInfo.RegTime,
+				"level":         levelInt,
+				"tag":           userInfo.Tag,
 			},
 			"accesstoken": tokStr,
 			"expires_at":  exp.Unix(),
@@ -467,16 +583,16 @@ func main() {
 						JhtUID:                       uidStr,
 						LevelID:                      10001,
 						RemainingBotCreationQuantity: 1,
-						SimpassUID:                   otpStatus.UserInfo.SimpassUID,
+						FanverifyUID:                 otpStatus.UserInfo.SimpassUID,
 						CreateTime:                   otpStatus.UserInfo.CreateTime,
 						Level:                        otpStatus.UserInfo.Level,
-						Risky:                        otpStatus.UserInfo.Risky,
+						Tag:                          "verified",
 					}
 				} else {
-					u.SimpassUID = otpStatus.UserInfo.SimpassUID
+					u.FanverifyUID = otpStatus.UserInfo.SimpassUID
 					u.CreateTime = otpStatus.UserInfo.CreateTime
 					u.Level = otpStatus.UserInfo.Level
-					u.Risky = otpStatus.UserInfo.Risky
+					u.Tag = "verified"
 				}
 
 				// Issue JWT
@@ -484,9 +600,9 @@ func main() {
 				exp := now.Add(tokenValidity)
 				token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 					"jht_uid": u.JhtUID, "level": u.LevelID,
-					"sim_uid": otpStatus.UserInfo.SimpassUID,
-					"sim_lv":  otpStatus.UserInfo.Level,
-					"risky":   otpStatus.UserInfo.Risky,
+					"fan_uid": otpStatus.UserInfo.SimpassUID,
+					"fan_lv":  otpStatus.UserInfo.Level,
+					"tag":     "verified",
 					"exp":     exp.Unix(), "iat": now.Unix(),
 				})
 				tokStr, _ := token.SignedString(jwtSecret)
@@ -496,10 +612,10 @@ func main() {
 				// Cache in session for subsequent polls, then return
 				sess.Status = "ok"
 				sess.Token = tokStr
-				sess.SimpassUID = otpStatus.UserInfo.SimpassUID
+				sess.FanverifyUID = otpStatus.UserInfo.SimpassUID
 				sess.CreateTime = otpStatus.UserInfo.CreateTime
 				sess.Level = otpStatus.UserInfo.Level
-				sess.Risky = otpStatus.UserInfo.Risky
+				sess.Tag = "verified"
 
 				json.NewEncoder(w).Encode(map[string]interface{}{
 					"status":       "ok",
@@ -518,9 +634,10 @@ func main() {
 		if r.Method == http.MethodGet && r.URL.Query().Get("cap_token") != "" {
 			capTok := r.URL.Query().Get("cap_token")
 
-			// verify cap
-			capBody, _ := json.Marshal(map[string]string{"secret": capSecret, "response": capTok})
-			capResp, err := http.Post(capSiteverifyURL, "application/json", bytes.NewReader(capBody))
+			// verify cap token using Cap siteverify API
+			verifyURL := capServerURL + "/siteverify"
+			capBody, _ := json.Marshal(map[string]string{"secret": capSecretKey, "token": capTok})
+			capResp, err := http.Post(verifyURL, "application/json", bytes.NewReader(capBody))
 			if err != nil {
 				w.WriteHeader(http.StatusBadGateway)
 				json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "verification service unavailable"})
@@ -607,14 +724,15 @@ func main() {
 			return
 		}
 
-		// cap.js human verification
+		// Cap human verification
 		if req.CapToken == "" {
 			w.WriteHeader(http.StatusForbidden)
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "msg": "human verification required"})
 			return
 		}
-		capBody, _ := json.Marshal(map[string]string{"secret": capSecret, "response": req.CapToken})
-		capResp, err := http.Post(capSiteverifyURL, "application/json", bytes.NewReader(capBody))
+		verifyURL := capServerURL + "/siteverify"
+		capBody, _ := json.Marshal(map[string]string{"secret": capSecretKey, "token": req.CapToken})
+		capResp, err := http.Post(verifyURL, "application/json", bytes.NewReader(capBody))
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "msg": "verification service unavailable"})
@@ -675,25 +793,25 @@ func main() {
 				JhtUID:                       uidStr,
 				LevelID:                      10001,
 				RemainingBotCreationQuantity: 1,
-				SimpassUID:                   simpassResp.UserInfo.SimpassUID,
+				FanverifyUID:                 simpassResp.UserInfo.SimpassUID,
 				CreateTime:                   simpassResp.UserInfo.CreateTime,
 				Level:                        simpassResp.UserInfo.Level,
-				Risky:                        simpassResp.UserInfo.Risky,
+				Tag:                          "verified",
 			}
 		} else {
-			u.SimpassUID = simpassResp.UserInfo.SimpassUID
+			u.FanverifyUID = simpassResp.UserInfo.SimpassUID
 			u.CreateTime = simpassResp.UserInfo.CreateTime
 			u.Level = simpassResp.UserInfo.Level
-			u.Risky = simpassResp.UserInfo.Risky
+			u.Tag = "verified"
 		}
 
 		now := time.Now()
 		exp := now.Add(tokenValidity)
 		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 			"jht_uid": u.JhtUID, "level": u.LevelID,
-			"sim_uid": simpassResp.UserInfo.SimpassUID,
-			"sim_lv":  simpassResp.UserInfo.Level,
-			"risky":   simpassResp.UserInfo.Risky,
+			"fan_uid": simpassResp.UserInfo.SimpassUID,
+			"fan_lv":  simpassResp.UserInfo.Level,
+			"tag":     "verified",
 			"exp":     exp.Unix(), "iat": now.Unix(),
 		})
 		tokStr, _ := token.SignedString(jwtSecret)
@@ -1309,7 +1427,8 @@ func main() {
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"cap_api_endpoint": capAPIEndpoint,
+			"cap_site_key": capSiteKey,
+			"cap_server":   capServerURL,
 		})
 	})
 
@@ -1728,7 +1847,7 @@ func main() {
 		if r.URL.Path == "/login.html" || r.URL.Path == "/login" {
 			loginPath := filepath.Join(staticDir, "login.html")
 			if data, err := os.ReadFile(loginPath); err == nil {
-				content := strings.ReplaceAll(string(data), "{{CAP_API_ENDPOINT}}", capAPIEndpoint)
+				content := strings.ReplaceAll(string(data), "{{CAP_SITE_KEY}}", capSiteKey)
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.Write([]byte(content))
 				return
@@ -1770,10 +1889,10 @@ func migrate(db *sql.DB) error {
 		bot_name TEXT,
 		remaining_bot_creation_quantity INTEGER DEFAULT 1,
 		level_id INTEGER,
-		simpass_uid INTEGER,
+		fanverify_uid INTEGER,
 		create_time TEXT,
 		sim_level INTEGER,
-		risky INTEGER,
+		tag TEXT DEFAULT '',
 		last_login_time TEXT,
 		status TEXT DEFAULT 'ok',
 		status_info TEXT DEFAULT ''
@@ -1786,6 +1905,7 @@ func migrate(db *sql.DB) error {
 	db.Exec("ALTER TABLE userdata ADD COLUMN status TEXT DEFAULT 'ok'")
 	db.Exec("ALTER TABLE userdata ADD COLUMN status_info TEXT DEFAULT ''")
 	db.Exec("ALTER TABLE userdata ADD COLUMN remaining_bot_creation_quantity INTEGER DEFAULT 1")
+	db.Exec("ALTER TABLE userdata ADD COLUMN tag TEXT DEFAULT ''")  // Add tag column for existing tables
 
 	// Bots table
 	botsStmt := `CREATE TABLE IF NOT EXISTS bots (
@@ -1808,39 +1928,33 @@ func migrate(db *sql.DB) error {
 }
 
 func findUser(db *sql.DB, uid string) (*UserData, error) {
-	row := db.QueryRow("SELECT jht_uid, accesstoken, COALESCE(remaining_bot_creation_quantity,1), level_id, simpass_uid, create_time, sim_level, risky, COALESCE(last_login_time,''), COALESCE(status,'ok'), COALESCE(status_info,'') FROM userdata WHERE jht_uid = ?", uid)
+	row := db.QueryRow("SELECT jht_uid, accesstoken, COALESCE(remaining_bot_creation_quantity,1), level_id, fanverify_uid, create_time, sim_level, COALESCE(tag,''), COALESCE(last_login_time,''), COALESCE(status,'ok'), COALESCE(status_info,'') FROM userdata WHERE jht_uid = ?", uid)
 	var u UserData
-	var riskyInt int64
-	err := row.Scan(&u.JhtUID, &u.AccessToken, &u.RemainingBotCreationQuantity, &u.LevelID, &u.SimpassUID, &u.CreateTime, &u.Level, &riskyInt, &u.LastLoginTime, &u.Status, &u.StatusInfo)
+	err := row.Scan(&u.JhtUID, &u.AccessToken, &u.RemainingBotCreationQuantity, &u.LevelID, &u.FanverifyUID, &u.CreateTime, &u.Level, &u.Tag, &u.LastLoginTime, &u.Status, &u.StatusInfo)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	u.Risky = riskyInt != 0
 	return &u, nil
 }
 
 func upsertUser(db *sql.DB, u *UserData) error {
-	riskyInt := int64(0)
-	if u.Risky {
-		riskyInt = 1
-	}
-	_, err := db.Exec(`INSERT INTO userdata(jht_uid, accesstoken, remaining_bot_creation_quantity, level_id, simpass_uid, create_time, sim_level, risky, last_login_time, status, status_info)
+	_, err := db.Exec(`INSERT INTO userdata(jht_uid, accesstoken, remaining_bot_creation_quantity, level_id, fanverify_uid, create_time, sim_level, tag, last_login_time, status, status_info)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(jht_uid) DO UPDATE SET
 			accesstoken=excluded.accesstoken,
 			remaining_bot_creation_quantity=excluded.remaining_bot_creation_quantity,
 			level_id=excluded.level_id,
-			simpass_uid=excluded.simpass_uid,
+			fanverify_uid=excluded.fanverify_uid,
 			create_time=excluded.create_time,
 			sim_level=excluded.sim_level,
-			risky=excluded.risky,
+			tag=excluded.tag,
 			last_login_time=excluded.last_login_time,
 			status=excluded.status,
 			status_info=excluded.status_info;`,
-		u.JhtUID, u.AccessToken, u.RemainingBotCreationQuantity, u.LevelID, u.SimpassUID, u.CreateTime, u.Level, riskyInt, u.LastLoginTime, u.Status, u.StatusInfo)
+		u.JhtUID, u.AccessToken, u.RemainingBotCreationQuantity, u.LevelID, u.FanverifyUID, u.CreateTime, u.Level, u.Tag, u.LastLoginTime, u.Status, u.StatusInfo)
 	return err
 }
 
@@ -1857,7 +1971,7 @@ func containsStr(s, sub string) bool {
 	return false
 }
 
-func extractSimpassUID(chat string) string {
+func extractFanverifyUID(chat string) string {
 	// Try to extract UID from patterns like "UID：XXXXXX", "UID: XXXXXX" or "UID是：XXXXXX"
 	for _, prefix := range []string{"UID是：", "UID是:", "UID：", "UID:", "uid是：", "uid是:", "uid：", "uid:"} {
 		idx := strings.Index(chat, prefix)
