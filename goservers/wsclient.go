@@ -222,13 +222,28 @@ func (c *WSClient) StopBot(username string) error {
 	return nil
 }
 
+// BotStatusInfo 是 JS 节点 /ws/api/botstatus 返回的状态信息
+type BotStatusInfo struct {
+	Online        bool
+	LastExitReason string
+	LastExitType   string
+	LastExitTime   string
+}
+
 // GetBotStatus queries the JS launcher for bot online status.
 // Returns online bool.
 func (c *WSClient) GetBotStatus(username string) (online bool, err error) {
+	info, err := c.GetBotStatusInfo(username)
+	return info.Online, err
+}
+
+// GetBotStatusInfo 查询节点状态，含上次退出原因（供前端展示与落库）
+func (c *WSClient) GetBotStatusInfo(username string) (BotStatusInfo, error) {
+	var info BotStatusInfo
 	targetURL := getJSNodeURL("/ws/api/botstatus")
 	conn, _, err := jsDialer.Dial(targetURL, nil)
 	if err != nil {
-		return false, fmt.Errorf("botstatus dial: %w", err)
+		return info, fmt.Errorf("botstatus dial: %w", err)
 	}
 	defer conn.Close()
 
@@ -238,20 +253,27 @@ func (c *WSClient) GetBotStatus(username string) (online bool, err error) {
 
 	req, _ := json.Marshal(map[string]string{"username": username})
 	if err := conn.WriteMessage(websocket.TextMessage, req); err != nil {
-		return false, fmt.Errorf("botstatus write: %w", err)
+		return info, fmt.Errorf("botstatus write: %w", err)
 	}
 
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	_, resp, err := conn.ReadMessage()
 	if err != nil {
-		return false, fmt.Errorf("botstatus read resp: %w", err)
+		return info, fmt.Errorf("botstatus read resp: %w", err)
 	}
 	var result struct {
-		Code   float64 `json:"code"`
-		Online bool    `json:"online"`
+		Code           float64 `json:"code"`
+		Online         bool    `json:"online"`
+		LastExitReason string  `json:"last_exit_reason"`
+		LastExitType   string  `json:"last_exit_type"`
+		LastExitTime   string  `json:"last_exit_time"`
 	}
 	json.Unmarshal(resp, &result)
-	return result.Online, nil
+	info.Online = result.Online
+	info.LastExitReason = result.LastExitReason
+	info.LastExitType = result.LastExitType
+	info.LastExitTime = result.LastExitTime
+	return info, nil
 }
 
 // BotLogs connects to the botlogs WS and returns the connection for reading events.

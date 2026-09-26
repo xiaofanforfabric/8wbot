@@ -112,6 +112,19 @@ type BotData struct {
 	Status        string `json:"status"`         // no / confirmed
 	AutoRestore   bool   `json:"auto_restore"`   // 是否自动恢复连接
 	AutoReconnect bool   `json:"auto_reconnect"` // 是否自动重连
+
+	// 上次退出原因（由 JS 节点上报后落库）
+	LastExitReason string `json:"last_exit_reason"`
+	LastExitType   string `json:"last_exit_type"`
+	LastExitTime   string `json:"last_exit_time"`
+}
+
+// saveBotExitReason 把上次退出原因写回 bots 表
+func saveBotExitReason(db *sql.DB, username, reason, exitType, exitTime string) error {
+	_, err := db.Exec(
+		"UPDATE bots SET last_exit_reason = ?, last_exit_type = ?, last_exit_time = ? WHERE username = ?",
+		reason, exitType, exitTime, username)
+	return err
 }
 
 func loadEnv(path string) map[string]string {
@@ -1215,20 +1228,26 @@ func main() {
 		}
 
 		type botItem struct {
-			BotName     string `json:"bot_name"`
-			CreateTime  string `json:"create_time"`
-			DSL         bool   `json:"DSL"`
-			Status      string `json:"status"`
-			AutoRestore bool   `json:"auto_restore"`
+			BotName        string `json:"bot_name"`
+			CreateTime     string `json:"create_time"`
+			DSL            bool   `json:"DSL"`
+			Status         string `json:"status"`
+			AutoRestore    bool   `json:"auto_restore"`
+			LastExitReason string `json:"last_exit_reason"`
+			LastExitType   string `json:"last_exit_type"`
+			LastExitTime   string `json:"last_exit_time"`
 		}
 		var items []botItem
 		for _, b := range bots {
 			items = append(items, botItem{
-				BotName:     b.Username,
-				CreateTime:  b.CreationTime,
-				DSL:         b.DSL,
-				Status:      b.Status,
-				AutoRestore: b.AutoRestore,
+				BotName:        b.Username,
+				CreateTime:     b.CreationTime,
+				DSL:            b.DSL,
+				Status:         b.Status,
+				AutoRestore:    b.AutoRestore,
+				LastExitReason: b.LastExitReason,
+				LastExitType:   b.LastExitType,
+				LastExitTime:   b.LastExitTime,
 			})
 		}
 
@@ -1432,25 +1451,53 @@ func main() {
 
 		// Query online status from JS launcher
 		client := InitWSClient()
-		online, err := client.GetBotStatus(req.BotName)
+		info, err := client.GetBotStatusInfo(req.BotName)
 		if err != nil {
-			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "bad gateway!!!机器人服务异常，请联系管理员!"})
+			// 节点不可达时不再直接报错，退回数据库缓存的上次退出原因，
+			// 至少让前端能显示机器人为什么不在线
+			log.Printf("[status] botstatus 查询失败 %s: %v", req.BotName, err)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"code":             "200",
+				"online":           false,
+				"DSL":              bot.DSL,
+				"auto_restore":     bot.AutoRestore,
+				"auto_reconnect":   bot.AutoReconnect,
+				"server":           "",
+				"last_exit_reason": bot.LastExitReason,
+				"last_exit_type":   bot.LastExitType,
+				"last_exit_time":   bot.LastExitTime,
+				"node_reachable":   false,
+			})
 			return
+		}
+
+		// 从节点拿到了退出原因就落库，保证节点重启/记录丢失后仍可追溯
+		if info.LastExitReason != "" && info.LastExitReason != bot.LastExitReason {
+			if err := saveBotExitReason(db, req.BotName, info.LastExitReason, info.LastExitType, info.LastExitTime); err != nil {
+				log.Printf("[status] 保存退出原因失败 %s: %v", req.BotName, err)
+			}
+			bot.LastExitReason = info.LastExitReason
+			bot.LastExitType = info.LastExitType
+			bot.LastExitTime = info.LastExitTime
 		}
 
 		server := "main"
 		// If online, we could determine server from context; default to "main"
-		if !online {
+		if !info.Online {
 			server = ""
 		}
 
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"code":           "200",
-			"online":         online,
-			"DSL":            bot.DSL,
-			"auto_restore":   bot.AutoRestore,
-			"auto_reconnect": bot.AutoReconnect,
-			"server":         server,
+			"code":             "200",
+			"online":           info.Online,
+			"DSL":              bot.DSL,
+			"auto_restore":     bot.AutoRestore,
+			"auto_reconnect":   bot.AutoReconnect,
+			"server":           server,
+			"last_exit_reason": info.LastExitReason,
+			"last_exit_type":   info.LastExitType,
+			"last_exit_time":   info.LastExitTime,
+			"node_reachable":   true,
 		})
 	})
 
@@ -2181,7 +2228,10 @@ func migrate(db *sql.DB) error {
 		dsl INTEGER DEFAULT 0,
 		status TEXT DEFAULT 'no',
 		auto_restore INTEGER DEFAULT 1,
-		auto_reconnect INTEGER DEFAULT 1
+		auto_reconnect INTEGER DEFAULT 1,
+		last_exit_reason TEXT DEFAULT '',
+		last_exit_type TEXT DEFAULT '',
+		last_exit_time TEXT DEFAULT ''
 	);`
 	if _, err := db.Exec(botsStmt); err != nil {
 		return err
@@ -2189,6 +2239,10 @@ func migrate(db *sql.DB) error {
 	db.Exec("ALTER TABLE bots ADD COLUMN status TEXT DEFAULT 'no'")
 	db.Exec("ALTER TABLE bots ADD COLUMN auto_restore INTEGER DEFAULT 1")
 	db.Exec("ALTER TABLE bots ADD COLUMN auto_reconnect INTEGER DEFAULT 1")
+	// 上次退出原因（老库升级用，列已存在时 ALTER 会报错，忽略即可）
+	db.Exec("ALTER TABLE bots ADD COLUMN last_exit_reason TEXT DEFAULT ''")
+	db.Exec("ALTER TABLE bots ADD COLUMN last_exit_type TEXT DEFAULT ''")
+	db.Exec("ALTER TABLE bots ADD COLUMN last_exit_time TEXT DEFAULT ''")
 	return nil
 }
 

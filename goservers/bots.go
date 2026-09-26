@@ -11,7 +11,7 @@ func createBot(db *sql.DB, b *BotData) error {
 }
 
 func getBotsByUser(db *sql.DB, belong string) ([]BotData, error) {
-	rows, err := db.Query("SELECT belong, creation_time, username, dsl, COALESCE(status,'no'), COALESCE(auto_restore,1), COALESCE(auto_reconnect,1) FROM bots WHERE belong = ? ORDER BY id", belong)
+	rows, err := db.Query("SELECT belong, creation_time, username, dsl, COALESCE(status,'no'), COALESCE(auto_restore,1), COALESCE(auto_reconnect,1), COALESCE(last_exit_reason,''), COALESCE(last_exit_type,''), COALESCE(last_exit_time,'') FROM bots WHERE belong = ? ORDER BY id", belong)
 	if err != nil {
 		return nil, err
 	}
@@ -24,7 +24,8 @@ func getBotsByUser(db *sql.DB, belong string) ([]BotData, error) {
 		var statusStr string
 		var autoRestoreInt int64
 		var autoReconnectInt int64
-		if err := rows.Scan(&b.Belong, &b.CreationTime, &b.Username, &dslInt, &statusStr, &autoRestoreInt, &autoReconnectInt); err != nil {
+		if err := rows.Scan(&b.Belong, &b.CreationTime, &b.Username, &dslInt, &statusStr, &autoRestoreInt, &autoReconnectInt,
+			&b.LastExitReason, &b.LastExitType, &b.LastExitTime); err != nil {
 			return nil, err
 		}
 		b.DSL = dslInt != 0
