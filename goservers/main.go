@@ -1725,9 +1725,23 @@ func main() {
 		}
 		var auth struct {
 			AccessToken string `json:"accesstoken"`
-			BotName     string `json:"botname"`
+			// 别名：其它接口统一用 access_token，这里一并兼容避免踩坑
+			AccessTokenAlt string `json:"access_token"`
+			BotName        string `json:"botname"`
+			BotNameAlt     string `json:"bot_name"`
 		}
-		if err := json.Unmarshal(authMsg, &auth); err != nil || auth.AccessToken == "" || auth.BotName == "" {
+		if err := json.Unmarshal(authMsg, &auth); err != nil {
+			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "invalid json"})
+			return
+		}
+		if auth.AccessToken == "" {
+			auth.AccessToken = auth.AccessTokenAlt
+		}
+		if auth.BotName == "" {
+			auth.BotName = auth.BotNameAlt
+		}
+		auth.AccessToken = extractAccessToken(r, auth.AccessToken)
+		if auth.AccessToken == "" || auth.BotName == "" {
 			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "accesstoken and botname required"})
 			return
 		}
