@@ -2027,6 +2027,15 @@ func main() {
 			return
 		}
 
+		// 归属验证闸门：未完成验证的机器人不允许上线
+		if bot.Status != "confirmed" {
+			conn.WriteJSON(map[string]interface{}{
+				"code":    403,
+				"message": "此机器人尚未完成归属验证，请先在机器人列表中点击「验证」完成归属确认",
+			})
+			return
+		}
+
 		// Connect to JS launcher and start the bot (内地节点 + 内部鉴权)
 		jsURL := getJSNodeURL("/ws/api/startbot")
 		jsConn, _, err := jsDialer.Dial(jsURL, nil)
