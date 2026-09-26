@@ -393,7 +393,9 @@ func main() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
-			rows, err := db.Query("SELECT username FROM bots WHERE auto_restore = 1")
+			// 只对已完成归属验证的机器人做自动恢复，
+			// 避免未验证机器人被此任务牵扯（防御性过滤，正常也到不了运行态）
+			rows, err := db.Query("SELECT username FROM bots WHERE auto_restore = 1 AND status = 'confirmed'")
 			if err != nil {
 				continue
 			}
@@ -1906,6 +1908,13 @@ func main() {
 								log.Printf("[WS] bot %s offline (reason: %s), auto-reconnect in 10s", ev.BotName, d.Reason)
 								go func(name string) {
 									time.Sleep(10 * time.Second)
+									// 自动重连是一处绕过 HTTP 闸门的直达路径
+									// （直接拨 JS 节点），这里重新确认归属状态，
+									// 保证未验证的机器人不会被自动拉起
+									if fb, ferr := findBotByUsername(globalDB, name); ferr != nil || fb == nil || fb.Status != "confirmed" {
+										log.Printf("[WS] auto-reconnect skipped for %s: 归属状态未确认", name)
+										return
+									}
 									// Try to restart: connect to JS startbot WS (内地节点 + 内部鉴权)
 									restartURL := getJSNodeURL("/ws/api/startbot")
 									rc, _, rerr := jsDialer.Dial(restartURL, nil)
