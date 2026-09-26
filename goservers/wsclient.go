@@ -47,13 +47,15 @@ var jsDialer = &websocket.Dialer{
 func getJSNodeURL(apiPath string) string {
 	rawBase := os.Getenv("JS_NODE_URL")
 	if rawBase == "" {
-		rawBase = "ws://js.xiaofanai.uk:8889"
+		// 默认走 443 的 wss：JS 节点位于 Cloudflare 代理之后，
+		// Cloudflare 不代理 8889 端口，只有 443 才可达。
+		rawBase = "wss://js.xiaofanai.uk"
 	}
 	secret := os.Getenv("INTERNAL_NODE_SECRET")
 
 	u, err := url.Parse(rawBase)
 	if err != nil {
-		u = &url.URL{Scheme: "ws", Host: "js.xiaofanai.uk:8889"}
+		u = &url.URL{Scheme: "wss", Host: "js.xiaofanai.uk"}
 	}
 	u.Path = apiPath
 

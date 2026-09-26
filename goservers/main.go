@@ -62,13 +62,24 @@ func extractAccessToken(r *http.Request, bodyToken string) string {
 		return bodyToken
 	}
 	h := strings.TrimSpace(r.Header.Get("Authorization"))
-	if h == "" {
-		return ""
+	if h != "" {
+		if len(h) > 7 && strings.EqualFold(h[:7], "Bearer ") {
+			return strings.TrimSpace(h[7:])
+		}
+		return h
 	}
-	if len(h) > 7 && strings.EqualFold(h[:7], "Bearer ") {
-		return strings.TrimSpace(h[7:])
+	// 浏览器 WebSocket 无法自定义请求头，允许用查询参数传递令牌
+	if r != nil {
+		if q := r.URL.Query(); q != nil {
+			if t := q.Get("token"); t != "" {
+				return t
+			}
+			if t := q.Get("access_token"); t != "" {
+				return t
+			}
+		}
 	}
-	return h
+	return ""
 }
 
 // upstreamHTTPClient 用于所有对外部服务的调用。
@@ -1374,7 +1385,13 @@ func main() {
 			AccessToken string `json:"access_token"`
 			BotName     string `json:"botname"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccessToken == "" || req.BotName == "" {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "invalid json"})
+			return
+		}
+		req.AccessToken = extractAccessToken(r, req.AccessToken)
+		if req.AccessToken == "" || req.BotName == "" {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token and botname required"})
 			return
@@ -1912,7 +1929,14 @@ func main() {
 			AccessToken string `json:"access_token"`
 			BotName     string `json:"botname"`
 		}
-		if err := json.Unmarshal(authMsg, &req); err != nil || req.AccessToken == "" || req.BotName == "" {
+		if err := json.Unmarshal(authMsg, &req); err != nil {
+			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "invalid json"})
+			return
+		}
+		// 浏览器 WebSocket 无法自定义请求头，令牌通常由前端放在首包里；
+		// 同时兼容 Authorization 头与 ?token= 查询参数，方便脚本/调试调用。
+		req.AccessToken = extractAccessToken(r, req.AccessToken)
+		if req.AccessToken == "" || req.BotName == "" {
 			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "access_token and botname required"})
 			return
 		}
@@ -2018,7 +2042,14 @@ func main() {
 			AccessToken string `json:"access_token"`
 			BotName     string `json:"botname"`
 		}
-		if err := json.Unmarshal(authMsg, &req); err != nil || req.AccessToken == "" || req.BotName == "" {
+		if err := json.Unmarshal(authMsg, &req); err != nil {
+			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "invalid json"})
+			return
+		}
+		// 浏览器 WebSocket 无法自定义请求头，令牌通常由前端放在首包里；
+		// 同时兼容 Authorization 头与 ?token= 查询参数，方便脚本/调试调用。
+		req.AccessToken = extractAccessToken(r, req.AccessToken)
+		if req.AccessToken == "" || req.BotName == "" {
 			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "access_token and botname required"})
 			return
 		}
