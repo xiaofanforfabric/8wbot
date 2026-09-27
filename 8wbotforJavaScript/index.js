@@ -57,6 +57,29 @@ function stripMinecraftColors(text) {
 }
 
 /**
+ * 发送前净化聊天/命令文本。
+ *
+ * 原版 SharedConstants.isAllowedChatCharacter 只接受
+ *   c !== '\u00a7' && c >= ' ' && c !== '\u007f'
+ * 也就是说 § 分节符、所有控制字符、DEL 都是非法字符。服务器一旦收到就会
+ * 直接踢人（multiplayer.disconnect.illegal_characters），表现为
+ * 「在控制台发一条消息，机器人立刻掉线」。
+ *
+ * 这里在写给服务器之前剔除非法字符，避免整只机器人被踢下线。
+ * 换行符保留：mineflayer 会按 '\n' 拆成多条消息发送，不会进到包体里。
+ *
+ * @param {*} text 原始文本
+ * @returns {{text: string, removed: number}} 净化后文本 + 被剔除的字符数
+ */
+function sanitizeOutgoingChat(text) {
+  const raw = String(text == null ? '' : text).replace(/\r\n?/g, '\n');
+  const cleaned = raw
+    .replace(/\u00a7[0-9a-fk-orx]/gi, '')                        // 颜色/格式代码整体去掉（§c -> 空）
+    .replace(/[\u0000-\u0009\u000b-\u001f\u007f\u00a7]/g, '');   // 再清掉残留的非法字符
+  return { text: cleaned, removed: raw.length - cleaned.length };
+}
+
+/**
  * 记录某个机器人的退出原因
  * @param {string} username
  * @param {string} reason  原始原因文本
@@ -371,14 +394,41 @@ try {
         }
 
         try {
+          let removedTotal = 0;
+          let sent = 0;
           for (const item of dataArr) {
+            let payload = '';
             if (item.chat) {
-              bot.chat(item.chat);
+              const r = sanitizeOutgoingChat(item.chat);
+              removedTotal += r.removed;
+              payload = r.text;
             } else if (item.command) {
-              bot.chat('/' + item.command);
+              const r = sanitizeOutgoingChat(item.command);
+              removedTotal += r.removed;
+              payload = r.text ? '/' + r.text : '';
             }
+            if (!payload) continue;   // 净化后为空则不发，避免发出空包
+            bot.chat(payload);
+            sent++;
           }
-          ws.send(JSON.stringify({ code: 200, message: '成功执行' }));
+
+          if (sent === 0) {
+            ws.send(JSON.stringify({
+              code: 400,
+              message: removedTotal > 0
+                ? '消息只包含服务器禁止的字符（§ 等），已拦截未发送'
+                : '消息为空，未发送',
+            }));
+            return;
+          }
+
+          ws.send(JSON.stringify({
+            code: 200,
+            message: removedTotal > 0
+              ? `成功执行（已自动过滤 ${removedTotal} 个服务器禁止字符，如 § ，否则机器人会被踢下线）`
+              : '成功执行',
+            filtered: removedTotal,
+          }));
         } catch (e) {
           ws.send(JSON.stringify({ code: 401, message: `执行命令发生错误：${e && e.message || '未知错误'}` }));
         }
