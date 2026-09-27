@@ -32,6 +32,25 @@ func (s *BotSession) Close() {
 	}
 }
 
+// Replace 用新的 startbot 连接替换会话里的旧连接。
+// 重新拉起掉线的机器人后使用：后续要从新连接读取验证结果。
+func (s *BotSession) Replace(conn *websocket.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn != nil && s.conn != conn {
+		s.conn.Close()
+	}
+	s.conn = conn
+	s.closed = false
+}
+
+// Conn 返回当前会话使用的连接。
+func (s *BotSession) Conn() *websocket.Conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn
+}
+
 var activeSessions sync.Map // botName -> *BotSession
 
 // jsDialer 用于连接内地 JS 节点。
@@ -97,14 +116,15 @@ func wsPoller(conn *websocket.Conn) func() {
 
 // StartBotAndDetect spawns a dedicated WS connection, starts a bot, monitors
 // events, and returns when we see "您绑定的简幻通UID是" or timeout.
-func (c *WSClient) StartBotAndDetect(username string, timeout time.Duration) (chat string, uid string, err error) {
+// startBotDial 拨通 JS 节点的 /ws/api/startbot 并下发启动指令，
+// 返回仍然打开的连接与启动响应（code=200 表示已受理）。
+// 失败时由本函数负责关闭连接；成功时由调用方负责。
+func startBotDial(username string) (*websocket.Conn, map[string]interface{}, error) {
 	targetURL := getJSNodeURL("/ws/api/startbot")
 	conn, _, err := jsDialer.Dial(targetURL, nil)
 	if err != nil {
-		return "", "", fmt.Errorf("ws dial: %w", err)
+		return nil, nil, fmt.Errorf("ws dial: %w", err)
 	}
-	stopPoller := wsPoller(conn)
-	defer stopPoller()
 
 	// Consume welcome message
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -115,22 +135,63 @@ func (c *WSClient) StartBotAndDetect(username string, timeout time.Duration) (ch
 	req, _ := json.Marshal(map[string]string{"username": username})
 	if err := conn.WriteMessage(websocket.TextMessage, req); err != nil {
 		conn.Close()
-		return "", "", fmt.Errorf("write start: %w", err)
+		return nil, nil, fmt.Errorf("write start: %w", err)
 	}
 
 	// Read start response
 	_, resp, err := conn.ReadMessage()
 	if err != nil {
 		conn.Close()
-		return "", "", fmt.Errorf("read start resp: %w", err)
+		return nil, nil, fmt.Errorf("read start resp: %w", err)
 	}
 	var startResp map[string]interface{}
 	json.Unmarshal(resp, &startResp)
-	if code, _ := startResp["code"].(float64); code != 200 {
+	return conn, startResp, nil
+}
+
+// startBotReplacingStale 启动机器人；若 JS 节点回报 409（已有同名实例在运行），
+// 先把它停掉再重新启动一次。
+//
+// 为什么必须这样处理：未完成归属验证的机器人在界面上「上线/下线」按钮是禁用的
+// （UserPage 的 :disabled 里带了 status !== 'confirmed'），用户没有任何办法自己
+// 清理上一次验证遗留下来的实例。如果这里直接以 409 失败，用户就会陷入
+// 「验证不了 → 上不了线 → 也停不掉 → 永远验证不了」的死锁。
+func (c *WSClient) startBotReplacingStale(username string) (*websocket.Conn, error) {
+	conn, startResp, err := startBotDial(username)
+	if err != nil {
+		return nil, err
+	}
+	code, _ := startResp["code"].(float64)
+	if code == 409 {
+		msg, _ := startResp["message"].(string)
+		log.Printf("[WS] %s 已有实例在运行（%s），先停止再重新启动", username, msg)
+		conn.Close()
+		if serr := c.StopBot(username); serr != nil {
+			log.Printf("[WS] 清理残留实例失败 %s: %v", username, serr)
+		}
+		// 给 JS 节点一点时间真正断开连接，否则紧接着的启动可能仍被判重复
+		time.Sleep(2 * time.Second)
+		conn, startResp, err = startBotDial(username)
+		if err != nil {
+			return nil, err
+		}
+		code, _ = startResp["code"].(float64)
+	}
+	if code != 200 {
 		msg, _ := startResp["message"].(string)
 		conn.Close()
-		return "", "", fmt.Errorf("start failed: %s", msg)
+		return nil, fmt.Errorf("start failed: %s", msg)
 	}
+	return conn, nil
+}
+
+func (c *WSClient) StartBotAndDetect(username string, timeout time.Duration) (chat string, uid string, err error) {
+	conn, err := c.startBotReplacingStale(username)
+	if err != nil {
+		return "", "", err
+	}
+	stopPoller := wsPoller(conn)
+	defer stopPoller()
 
 	// Monitor events
 	deadline := time.Now().Add(timeout)
@@ -321,25 +382,12 @@ func (c *WSClient) BotLogs(username string) (*websocket.Conn, error) {
 	return conn, nil
 }
 
-// SendCommandAndDetect sends a chat command via sendinfo WS, then reads events
-// from the stored BotSession (startbot WS) to detect verification result.
-func (c *WSClient) SendCommandAndDetect(botname string, chatText string, timeout time.Duration) (string, error) {
-	// Look up the active session
-	raw, ok := activeSessions.Load(botname)
-	if !ok {
-		return "", fmt.Errorf("no active verify session for %s, start verify first", botname)
-	}
-	session := raw.(*BotSession)
-	defer func() {
-		session.Close()
-		activeSessions.Delete(botname)
-	}()
-
-	// Send code via sendinfo
+// sendInfoOnce 通过 sendinfo 通道给指定机器人投递一条聊天，只负责投递与应答。
+func (c *WSClient) sendInfoOnce(botname string, chatText string) error {
 	targetURL := getJSNodeURL("/ws/api/sendinfo")
 	sinfo, _, err := jsDialer.Dial(targetURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("sendinfo dial: %w", err)
+		return fmt.Errorf("sendinfo dial: %w", err)
 	}
 	defer sinfo.Close()
 
@@ -354,27 +402,116 @@ func (c *WSClient) SendCommandAndDetect(botname string, chatText string, timeout
 		"data":    []map[string]string{{"chat": chatText}},
 	})
 	if err := sinfo.WriteMessage(websocket.TextMessage, req); err != nil {
-		return "", fmt.Errorf("write cmd: %w", err)
+		return fmt.Errorf("write cmd: %w", err)
 	}
 
 	// Read command response
 	_, cmdResp, err := sinfo.ReadMessage()
 	if err != nil {
-		return "", fmt.Errorf("read cmd resp: %w", err)
+		return fmt.Errorf("read cmd resp: %w", err)
 	}
 	var cmdResult map[string]interface{}
 	json.Unmarshal(cmdResp, &cmdResult)
 	if code, _ := cmdResult["code"].(float64); code != 200 {
 		msg, _ := cmdResult["message"].(string)
-		return "", fmt.Errorf("cmd failed: %s", msg)
+		return fmt.Errorf("cmd failed: %s", msg)
+	}
+	return nil
+}
+
+// isBotNotRunningErr 判断错误是否为「机器人当前不在运行」。
+// JS 节点在 sendinfo 里查不到 bots[botname] 时回 code=404，消息为
+// 「机器人没有运行，请先启动」/「机器人没有运行」。
+func isBotNotRunningErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "机器人没有运行")
+}
+
+// restartBotForVerify 重新拉起一个已经掉线的机器人，等它真正进入游戏后
+// 返回新的 startbot 连接（后续从这个连接读验证结果）。
+func (c *WSClient) restartBotForVerify(username string) (*websocket.Conn, error) {
+	conn, err := c.startBotReplacingStale(username)
+	if err != nil {
+		return nil, err
+	}
+
+	// JS 节点在 spawn 时会推 [系统] <name> 已进入游戏
+	conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("等待机器人进入游戏失败: %w", err)
+		}
+		var events []struct {
+			BotName string `json:"botname"`
+			Data    []struct {
+				Chat string `json:"chat"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(msg, &events) != nil {
+			continue
+		}
+		ready := false
+		for _, ev := range events {
+			for _, d := range ev.Data {
+				if strings.Contains(d.Chat, "已进入游戏") {
+					ready = true
+				}
+			}
+		}
+		if ready {
+			conn.SetReadDeadline(time.Time{})
+			// 刚进游戏时服务器还没把验证提示发下来，稍等一下再发验证码，
+			// 否则验证码可能早于提示到达而被服务器忽略
+			time.Sleep(5 * time.Second)
+			return conn, nil
+		}
+	}
+}
+
+// SendCommandAndDetect sends a chat command via sendinfo WS, then reads events
+// from the stored BotSession (startbot WS) to detect verification result.
+func (c *WSClient) SendCommandAndDetect(botname string, chatText string, timeout time.Duration) (string, error) {
+	// Look up the active session
+	raw, ok := activeSessions.Load(botname)
+	if !ok {
+		return "", fmt.Errorf("no active verify session for %s, start verify first", botname)
+	}
+	session := raw.(*BotSession)
+	defer func() {
+		session.Close()
+		activeSessions.Delete(botname)
+	}()
+
+	// 投递验证码。若机器人此时已经掉线，就地重新拉起再发一次。
+	//
+	// 典型掉线原因：SimpPass 要求 120 秒内完成验证，超时会把机器人踢出
+	// （服务端日志: 验证超时！您需要在 120 秒内完成身份验证。）；或资源包
+	// 卡在 configuration 阶段导致断线。若不这样兜底，用户只会看到
+	// 「机器人没有运行，请先启动」—— 而未验证机器人的「上线」按钮是禁用的，
+	// 等于彻底卡死，没有任何自救途径。
+	if err := c.sendInfoOnce(botname, chatText); err != nil {
+		if !isBotNotRunningErr(err) {
+			return "", err
+		}
+		log.Printf("[WS] %s 已掉线，重新启动后再发送验证码（原错误: %v）", botname, err)
+		newConn, rerr := c.restartBotForVerify(botname)
+		if rerr != nil {
+			return "", fmt.Errorf("机器人已掉线，重新启动也失败（可能是服务器验证超时把它踢了，请重新点「验证」再试）: %w", rerr)
+		}
+		session.Replace(newConn)
+		if err2 := c.sendInfoOnce(botname, chatText); err2 != nil {
+			return "", err2
+		}
+		log.Printf("[WS] %s 已重新启动，验证码重新投递成功", botname)
 	}
 
 	// Now read events from the stored startbot connection for verification result
 	deadline := time.Now().Add(timeout)
-	session.conn.SetReadDeadline(deadline)
+	session.Conn().SetReadDeadline(deadline)
 
 	for {
-		_, msg, err := session.conn.ReadMessage()
+		_, msg, err := session.Conn().ReadMessage()
 		if err != nil {
 			return "", fmt.Errorf("verify event read: %w", err)
 		}
