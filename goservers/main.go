@@ -393,9 +393,9 @@ func main() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
-			// 只对已完成归属验证的机器人做自动恢复，
-			// 避免未验证机器人被此任务牵扯（防御性过滤，正常也到不了运行态）
-			rows, err := db.Query("SELECT username FROM bots WHERE auto_restore = 1 AND status = 'confirmed'")
+			// 只对已完成归属验证、且不是用户主动下线的机器人做自动恢复，
+			// 避免未验证机器人被此任务牵扯，也避免对已经关掉的机器人白发指令
+			rows, err := db.Query("SELECT username FROM bots WHERE auto_restore = 1 AND status = 'confirmed' AND COALESCE(manual_stop,0) = 0")
 			if err != nil {
 				continue
 			}
@@ -428,6 +428,14 @@ func main() {
 			}
 		}
 	}()
+
+	// Global auto-reconnect: 常驻巡护，把意外掉线的机器人重新拉起来。
+	//
+	// 原先 auto_reconnect 的实现寄生在 /ws/api/connectbot 处理器里，靠读取
+	// 浏览器那条 JS 连接上的 bot_offline 事件触发。后果是这个功能只在
+	// 「有人开着控制台页面」时才有效：控制台一关，连接断开、协程退出，
+	// 机器人掉线后再也没有人管它 —— 而「自动重连」本来应该是常驻能力。
+	go autoReconnectLoop(db, envVars["AUTO_RECONNECT_INTERVAL"])
 
 	mux := http.NewServeMux()
 
@@ -1235,6 +1243,7 @@ func main() {
 			DSL            bool   `json:"DSL"`
 			Status         string `json:"status"`
 			AutoRestore    bool   `json:"auto_restore"`
+			AutoReconnect  bool   `json:"auto_reconnect"`
 			LastExitReason string `json:"last_exit_reason"`
 			LastExitType   string `json:"last_exit_type"`
 			LastExitTime   string `json:"last_exit_time"`
@@ -1247,6 +1256,7 @@ func main() {
 				DSL:            b.DSL,
 				Status:         b.Status,
 				AutoRestore:    b.AutoRestore,
+				AutoReconnect:  b.AutoReconnect,
 				LastExitReason: b.LastExitReason,
 				LastExitType:   b.LastExitType,
 				LastExitTime:   b.LastExitTime,
@@ -1433,6 +1443,14 @@ func main() {
 			time.Sleep(5 * time.Second)
 			if stopErr := client.StopBot(req.BotName); stopErr != nil {
 				log.Printf("[WS] stopbot after verify success: %v", stopErr)
+				return
+			}
+			// 验证通过后按设计要把机器人停掉，等用户自己去点「上线」。
+			// 这里必须一并打上主动停止标记，否则全局自动重连巡护会发现
+			// 「confirmed + 离线 + 未标记」并立刻把它重新拉起来，
+			// 机器人会在验证刚通过时自己上线，与设计意图相反。
+			if merr := setBotManualStop(globalDB, req.BotName, true); merr != nil {
+				log.Printf("[verify] 记录验证后停止标记失败 %s: %v", req.BotName, merr)
 			}
 		}()
 	})
@@ -2123,6 +2141,14 @@ func main() {
 		// Forward JS response to browser
 		conn.WriteJSON(jsResult)
 
+		// 用户主动上线：清掉「主动下线」标记，让自动重连巡护重新接管这个机器人。
+		// 409 也一并清除 —— 那表示机器人本来就在跑，同样不该被巡护当成下线处理。
+		if code, _ := jsResult["code"].(float64); code == 200 || code == 409 {
+			if err := setBotManualStop(globalDB, req.BotName, false); err != nil {
+				log.Printf("[WS] 清除主动下线标记失败 %s: %v", req.BotName, err)
+			}
+		}
+
 		// If bot started successfully, forward events to browser in real-time
 		if code, _ := jsResult["code"].(float64); code == 200 {
 			done := make(chan struct{})
@@ -2210,6 +2236,12 @@ func main() {
 			return
 		}
 
+		// 记下「这是用户主动下线」。全局自动重连巡护会跳过带此标记的机器人，
+		// 否则用户刚点完下线就会被巡护立刻拉回来，下线按钮形同虚设。
+		if err := setBotManualStop(globalDB, req.BotName, true); err != nil {
+			log.Printf("[WS] 记录主动下线标记失败 %s: %v", req.BotName, err)
+		}
+
 		conn.WriteJSON(map[string]interface{}{"code": 200, "message": "机器人已断开"})
 	})
 
@@ -2291,6 +2323,7 @@ func migrate(db *sql.DB) error {
 		status TEXT DEFAULT 'no',
 		auto_restore INTEGER DEFAULT 1,
 		auto_reconnect INTEGER DEFAULT 1,
+		manual_stop INTEGER DEFAULT 0,
 		last_exit_reason TEXT DEFAULT '',
 		last_exit_type TEXT DEFAULT '',
 		last_exit_time TEXT DEFAULT ''
@@ -2301,11 +2334,89 @@ func migrate(db *sql.DB) error {
 	db.Exec("ALTER TABLE bots ADD COLUMN status TEXT DEFAULT 'no'")
 	db.Exec("ALTER TABLE bots ADD COLUMN auto_restore INTEGER DEFAULT 1")
 	db.Exec("ALTER TABLE bots ADD COLUMN auto_reconnect INTEGER DEFAULT 1")
+	// manual_stop: 1 表示用户主动下线过，自动重连巡护要放过它
+	db.Exec("ALTER TABLE bots ADD COLUMN manual_stop INTEGER DEFAULT 0")
 	// 上次退出原因（老库升级用，列已存在时 ALTER 会报错，忽略即可）
 	db.Exec("ALTER TABLE bots ADD COLUMN last_exit_reason TEXT DEFAULT ''")
 	db.Exec("ALTER TABLE bots ADD COLUMN last_exit_type TEXT DEFAULT ''")
 	db.Exec("ALTER TABLE bots ADD COLUMN last_exit_time TEXT DEFAULT ''")
 	return nil
+}
+
+// autoReconnectLoop 常驻巡护：周期性检查哪些机器人掉线了，把该拉起来的拉起来。
+//
+// 设计取舍：
+//   - 用轮询 /ws/api/botstatus 而不是给每个机器人挂一条常驻 WS，避免机器
+//     人数量增长时堆积 N 条长连接和 N 个协程。
+//   - 只处理 auto_reconnect=1、status='confirmed'、manual_stop=0 的机器人。
+//     manual_stop 是关键：用户主动点「下线」的机器人必须保持关闭，否则巡护
+//     会立刻把它拉回来，下线按钮等于失效。
+//   - 连续失败时指数退避（30s→60s→120s→240s），避免对一个坏账号无限猛敲；
+//     节点不可达不计入失败次数，那是节点的问题不是机器人的问题。
+func autoReconnectLoop(db *sql.DB, intervalEnv string) {
+	interval := 30 * time.Second
+	if v := strings.TrimSpace(intervalEnv); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 5*time.Second {
+			interval = d
+		}
+	}
+
+	type botState struct {
+		lastAttempt time.Time
+		fails       int
+	}
+	states := make(map[string]*botState)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	log.Printf("[AUTO-RECONNECT] 巡护已启动，检查间隔 %s", interval)
+
+	for range ticker.C {
+		names, err := autoReconnectCandidates(db)
+		if err != nil {
+			log.Printf("[AUTO-RECONNECT] 查询待巡护机器人失败: %v", err)
+			continue
+		}
+		if len(names) == 0 {
+			continue
+		}
+		client := InitWSClient()
+		for _, name := range names {
+			st := states[name]
+			if st == nil {
+				st = &botState{}
+				states[name] = st
+			}
+			// 退避：失败次数越多，重试间隔越长（最多 8 倍）
+			backoff := interval
+			for i := 0; i < st.fails && i < 3; i++ {
+				backoff *= 2
+			}
+			if !st.lastAttempt.IsZero() && time.Since(st.lastAttempt) < backoff {
+				continue
+			}
+
+			online, err := client.GetBotStatus(name)
+			if err != nil {
+				// 节点不可达：跳过，不计失败
+				continue
+			}
+			if online {
+				st.fails = 0
+				continue
+			}
+
+			st.lastAttempt = time.Now()
+			log.Printf("[AUTO-RECONNECT] %s 已掉线，尝试重新拉起", name)
+			if err := client.StartBotSimple(name); err != nil {
+				st.fails++
+				log.Printf("[AUTO-RECONNECT] %s 拉起失败（连续第 %d 次）: %v", name, st.fails, err)
+				continue
+			}
+			st.fails = 0
+			log.Printf("[AUTO-RECONNECT] %s 已重新拉起", name)
+		}
+	}
 }
 
 func findUser(db *sql.DB, uid string) (*UserData, error) {

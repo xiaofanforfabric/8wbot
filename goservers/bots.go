@@ -104,6 +104,36 @@ func setBotAutoRestore(db *sql.DB, username string, enabled bool) error {
 	return err
 }
 
+// setBotManualStop 标记「这个机器人是用户主动下线的」。
+//
+// 全局自动重连巡护必须靠它区分两种离线状态，否则会出事：
+//   manual_stop = 0 —— 意外掉线（被服务器踢、网络抖动），应该自动拉起来
+//   manual_stop = 1 —— 用户自己点了「下线」，必须保持关闭
+//
+// 少了这个标记，巡护会在用户下线后立刻把机器人重新拉起来，下线按钮等于失效。
+func setBotManualStop(db *sql.DB, username string, stopped bool) error {
+	_, err := db.Exec("UPDATE bots SET manual_stop = ? WHERE username = ?", boolToInt(stopped), username)
+	return err
+}
+
+// autoReconnectCandidates 返回需要自动重连巡护的机器人名单：
+// 开了自动重连、已完成归属验证、并且不是用户主动下线的。
+func autoReconnectCandidates(db *sql.DB) ([]string, error) {
+	rows, err := db.Query("SELECT username FROM bots WHERE auto_reconnect = 1 AND status = 'confirmed' AND COALESCE(manual_stop,0) = 0")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err == nil {
+			names = append(names, name)
+		}
+	}
+	return names, nil
+}
+
 func boolToInt(b bool) int64 {
 	if b {
 		return 1

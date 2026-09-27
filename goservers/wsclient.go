@@ -185,6 +185,20 @@ func (c *WSClient) startBotReplacingStale(username string) (*websocket.Conn, err
 	return conn, nil
 }
 
+// StartBotSimple 只负责把机器人拉起来，不等任何聊天内容。
+//
+// 供全局自动重连巡护使用。拉起后立即关闭这条 WS：JS 节点的 startbot 分支
+// 只在 bot 事件里往 ws 写数据，并没有注册 close 回调，所以连接关闭不会
+// 影响已经跑起来的机器人本体。
+func (c *WSClient) StartBotSimple(username string) error {
+	conn, err := c.startBotReplacingStale(username)
+	if err != nil {
+		return err
+	}
+	conn.Close()
+	return nil
+}
+
 func (c *WSClient) StartBotAndDetect(username string, timeout time.Duration) (chat string, uid string, err error) {
 	conn, err := c.startBotReplacingStale(username)
 	if err != nil {
