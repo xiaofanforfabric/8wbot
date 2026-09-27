@@ -156,6 +156,29 @@ function startBot(username) {
   });
   bots[username] = bot;
 
+  // ── 资源包应答（必须处理，否则机器人根本进不了游戏）──
+  // MC 1.20.3 起服务器会在 configuration 阶段推送资源包，并且「一直吊着该阶段
+  // 直到客户端给出应答」。mineflayer 只抛出 resourcePack 事件、不会自动应答，
+  // 所以不处理就永远卡在配置阶段：spawn 不触发、进不了游戏，此时发消息必然
+  // 触发服务器异常（有时报成 An internal error occurred in your connection.）。
+  // Velocity 每次切换服务器都会重新进入 configuration 阶段，本服务器正是
+  // Velocity + SimpPass 多后端结构，因此影响被放大。
+  bot.on('resourcePack', (url, hash) => {
+    const action = (process.env.RESOURCE_PACK_ACTION || 'accept').toLowerCase();
+    try {
+      if (action === 'deny') {
+        bot.denyResourcePack();
+        console.log(`[${username}] 已拒绝资源包（RESOURCE_PACK_ACTION=deny）: ${url}`);
+      } else {
+        // 只回复应答包，不会真的下载资源包，无额外流量开销
+        bot.acceptResourcePack();
+        console.log(`[${username}] 已应答资源包: ${url}`);
+      }
+    } catch (e) {
+      console.warn(`[${username}] 资源包应答失败: ${e.message}`);
+    }
+  });
+
   // ── 退出原因记录（挂在 startBot 里，任何通道连接都能生效）──
   // _exitRecorded 保证原因只记录一次，且优先保留更具体的原因：
   //   kicked（被服务器踢，含抢占登录）> error（连接错误）> end（socketClosed）

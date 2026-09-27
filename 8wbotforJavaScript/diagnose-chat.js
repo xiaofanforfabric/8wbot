@@ -101,7 +101,9 @@ const state = {
   cmdReplies: [],
   kickReason: null,
   sentChat: false,
-  sentCmd: false
+  sentCmd: false,
+  resourcePack: null,
+  packAnswered: false
 }
 
 const bot = mineflayer.createBot({
@@ -116,6 +118,21 @@ const bot = mineflayer.createBot({
 bot._client.on('login', (packet) => {
   if (packet && packet.enforcesSecureChat !== undefined) {
     state.secureChat = packet.enforcesSecureChat
+  }
+})
+
+// ② 资源包：服务器会吊着 configuration 阶段直到客户端应答。
+//    mineflayer 只抛事件、不会自动应答，不处理就会永远卡在配置阶段进不了游戏。
+bot.on('resourcePack', (url, hash) => {
+  state.resourcePack = String(url || '')
+  console.log('  📦 收到资源包（阶段:', bot._client.state + '）:', state.resourcePack)
+  const action = (process.env.RESOURCE_PACK_ACTION || 'accept').toLowerCase()
+  try {
+    if (action === 'deny') { bot.denyResourcePack() } else { bot.acceptResourcePack() }
+    state.packAnswered = true
+    console.log('  📦 已应答资源包（', action, '）')
+  } catch (e) {
+    console.log('  📦 应答失败:', e.message)
   }
 })
 
@@ -189,6 +206,11 @@ function finish () {
   console.log('  2. enforcesSecureChat:', state.secureChat === null
     ? '（服务端未提供该字段）'
     : (state.secureChat ? '⚠️ true —— 服务端强制要求正版聊天签名' : '✅ false'))
+  if (state.resourcePack) {
+    console.log('  2b. 资源包           :', state.packAnswered
+      ? `✅ 已应答（${state.resourcePack.slice(0, 60)}）`
+      : `⚠️ 收到但未应答（${state.resourcePack.slice(0, 60)}）`)
+  }
   console.log('  3. 普通聊天是否送达  :', chatOk
     ? `✅ 是（服务器广播了 ${JSON.stringify(state.chatEcho)}）`
     : (state.kickReason && state.kickReason !== 'socketClosed'
@@ -207,7 +229,14 @@ function finish () {
   line()
 
   if (!state.spawned) {
-    console.log('  ⚠️ 根本没进服 —— 先确认地址/端口/版本，或账号是否已被别处占用。')
+    if (state.resourcePack && !state.packAnswered) {
+      console.log('  ⚠️ 收到了资源包但没有应答，机器人卡在 configuration 阶段！')
+      console.log('     → 服务器会一直吊着该阶段直到客户端应答资源包。')
+      console.log('     → 这正是「机器人进不去游戏 / 一发消息就异常」的典型原因。')
+      console.log('     → 修复：在 resourcePack 事件里调用 bot.acceptResourcePack()。')
+    } else {
+      console.log('  ⚠️ 根本没进服 —— 先确认地址/端口/版本，或账号是否已被别处占用。')
+    }
   } else if (state.secureChat === true) {
     console.log('  ⚠️ 服务端 enforcesSecureChat=true，聊天被拒但命令正常：')
     console.log('     → 离线（非正版）账号没有 Mojang 签名密钥，无法在这种服务器上聊天。')
