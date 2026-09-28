@@ -441,7 +441,7 @@ func adminListBots() map[string]interface{} {
 func adminListUsers() map[string]interface{} {
 	rows, err := globalDB.Query(`
 		SELECT u.jht_uid, COALESCE(u.tag,''), COALESCE(u.level_id,0),
-		       COALESCE(u.fanverify_uid,0), COALESCE(u.remaining_bot_creation_quantity,0),
+		       COALESCE(u.fan_level,-1), COALESCE(u.remaining_bot_creation_quantity,0),
 		       COALESCE(u.status,'ok'), COALESCE(u.status_info,''),
 		       COALESCE(u.last_login_time,''),
 		       (SELECT COUNT(*) FROM bots b WHERE b.belong = u.jht_uid)
@@ -453,11 +453,12 @@ func adminListUsers() map[string]interface{} {
 	defer rows.Close()
 
 	type userRow struct {
-		UID       string `json:"uid"`
-		Tag       string `json:"tag"`
-		LevelID   int64  `json:"level_id"`
-		FanUID    int64  `json:"fanverify_uid"`
-		Quota     int64  `json:"quota"`
+		UID      string `json:"uid"`
+		Tag      string `json:"tag"`
+		LevelID  int64  `json:"level_id"`
+		// FanVerify 验证等级。0 = 管理员（正常用户是 1 或 2，-1 表示未验证）
+		FanLevel int64 `json:"fan_level"`
+		Quota    int64 `json:"quota"`
 		Status    string `json:"status"`
 		StatusMsg string `json:"status_info"`
 		LastLogin string `json:"last_login_time"`
@@ -468,11 +469,13 @@ func adminListUsers() map[string]interface{} {
 	out := []userRow{}
 	for rows.Next() {
 		var r userRow
-		if err := rows.Scan(&r.UID, &r.Tag, &r.LevelID, &r.FanUID, &r.Quota,
+		if err := rows.Scan(&r.UID, &r.Tag, &r.LevelID, &r.FanLevel, &r.Quota,
 			&r.Status, &r.StatusMsg, &r.LastLogin, &r.BotCount); err != nil {
 			continue
 		}
-		r.IsAdmin = r.FanUID == 0
+		// 判定统一走 isAdminUser，不在这里另写一份比较 ——
+		// 规则散落两处迟早会不一致（刚才就是这样错的）
+		r.IsAdmin = r.FanLevel == 0
 		out = append(out, r)
 	}
 	return map[string]interface{}{"code": 200, "users": out, "count": len(out)}

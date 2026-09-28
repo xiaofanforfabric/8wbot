@@ -96,6 +96,11 @@ type UserData struct {
 	LevelID                      int64  `json:"level_id"`
 	FanverifyUID                 int64  `json:"fanverify_uid"`
 	CreateTime                   string `json:"create_time"`
+	// FanLevel —— FanVerify 返回的验证等级，登录时落库。
+	// 本站的 ADMIN 判定就看它：0 = 管理员。
+	// 正常用户在 FanVerify 那边是 1 或 2，0 只会由人工改库产生。
+	FanLevel int64 `json:"fan_level"`
+	// Level 给前端展示用，取自同一份数据，不单独落库
 	Level                        int64  `json:"level"`
 	Tag                          string `json:"tag"`
 	LastLoginTime                string `json:"last_login_time"`
@@ -592,6 +597,7 @@ func main() {
 				LevelID:                      10001,
 				FanverifyUID:                 userInfo.UID,
 				CreateTime:                   userInfo.RegTime,
+				FanLevel:                     levelInt,
 				Level:                        levelInt,
 				Tag:                          userInfo.Tag,
 			}
@@ -599,6 +605,7 @@ func main() {
 			u.FanverifyUID = userInfo.UID
 			u.CreateTime = userInfo.RegTime
 			u.Level = levelInt
+			u.FanLevel = levelInt
 			u.Tag = userInfo.Tag
 		}
 
@@ -736,6 +743,7 @@ func main() {
 						RemainingBotCreationQuantity: 1,
 						FanverifyUID:                 userInfo.UID,
 						CreateTime:                   userInfo.RegTime,
+						FanLevel:                     levelInt,
 						Level:                        levelInt,
 						Tag:                          userInfo.Tag,
 					}
@@ -743,6 +751,7 @@ func main() {
 					u.FanverifyUID = userInfo.UID
 					u.CreateTime = userInfo.RegTime
 					u.Level = levelInt
+					u.FanLevel = levelInt
 					u.Tag = userInfo.Tag
 				}
 
@@ -969,6 +978,7 @@ func main() {
 				RemainingBotCreationQuantity: 1,
 				FanverifyUID:                 userInfo.UID,
 				CreateTime:                   userInfo.RegTime,
+				FanLevel:                     levelInt,
 				Level:                        levelInt,
 				Tag:                          userInfo.Tag,
 			}
@@ -976,6 +986,7 @@ func main() {
 			u.FanverifyUID = userInfo.UID
 			u.CreateTime = userInfo.RegTime
 			u.Level = levelInt
+			u.FanLevel = levelInt
 			u.Tag = userInfo.Tag
 		}
 
@@ -2652,6 +2663,7 @@ func migrate(db *sql.DB) error {
 		fanverify_uid INTEGER,
 		create_time TEXT,
 		sim_level INTEGER,
+		fan_level INTEGER DEFAULT -1,
 		tag TEXT DEFAULT '',
 		last_login_time TEXT,
 		status TEXT DEFAULT 'ok',
@@ -2665,7 +2677,10 @@ func migrate(db *sql.DB) error {
 	db.Exec("ALTER TABLE userdata ADD COLUMN status TEXT DEFAULT 'ok'")
 	db.Exec("ALTER TABLE userdata ADD COLUMN status_info TEXT DEFAULT ''")
 	db.Exec("ALTER TABLE userdata ADD COLUMN remaining_bot_creation_quantity INTEGER DEFAULT 1")
-	db.Exec("ALTER TABLE userdata ADD COLUMN tag TEXT DEFAULT ''")  // Add tag column for existing tables
+	db.Exec("ALTER TABLE userdata ADD COLUMN tag TEXT DEFAULT ''") // Add tag column for existing tables
+	// fan_level 存 FanVerify 验证等级。默认 -1 而不是 0：
+	// 0 在本项目里意味着「管理员」，没登录过的用户绝不能误判成管理员。
+	db.Exec("ALTER TABLE userdata ADD COLUMN fan_level INTEGER DEFAULT -1")
 
 	// Bots table
 	botsStmt := `CREATE TABLE IF NOT EXISTS bots (
@@ -2788,16 +2803,26 @@ func autoReconnectLoop(db *sql.DB, intervalEnv string) {
 // 不存在「等级 >= N 就是管理员」这类规则：LevelID 是本站的展示性等级，
 // 不参与任何鉴权判断。真正的闸门只有这一个函数。
 func isAdminUser(u *UserData) bool {
-	return u != nil && u.FanverifyUID == 0
+	// 规则：FanVerify 验证等级为 0 即管理员。
+	// 正常用户在 FanVerify 那边是 1 或 2，0 是人工改库才会出现的值。
+	//
+	// FanLevel 默认 -1 而不是 0 —— 没登录过、或 FanVerify 没返回等级的用户，
+	// 不能因此被误判成管理员。
+	return u != nil && u.FanLevel == 0
 }
 
 func findUser(db *sql.DB, uid string) (*UserData, error) {
-	// accesstoken / level_id / fanverify_uid / create_time / sim_level 都可能为 NULL ——
-	// 比如 SSH 的 webuser 只更新一部分列时。不套 COALESCE 的话 Scan 会直接报
+	// 这些列都可能为 NULL —— 比如 SSH 的 webuser 只更新一部分列时。
+	// 不套 COALESCE 的话 Scan 会直接报
 	//「converting NULL to string is unsupported」，整条 webuser 命令就废了。
-	row := db.QueryRow("SELECT jht_uid, COALESCE(accesstoken,''), COALESCE(remaining_bot_creation_quantity,1), COALESCE(level_id,0), COALESCE(fanverify_uid,0), COALESCE(create_time,''), COALESCE(sim_level,0), COALESCE(tag,''), COALESCE(last_login_time,''), COALESCE(status,'ok'), COALESCE(status_info,'') FROM userdata WHERE jht_uid = ?", uid)
+	//
+	// 第 7 个字段读的是 fan_level（FanVerify 验证等级），不再是 sim_level。
+	// 原先这里读 sim_level、upsertUser 又把 u.Level 写进 sim_level，
+	// 列名与语义对不上，ADMIN 判定根本找不到可信的字段。
+	row := db.QueryRow("SELECT jht_uid, COALESCE(accesstoken,''), COALESCE(remaining_bot_creation_quantity,1), COALESCE(level_id,0), COALESCE(fanverify_uid,-1), COALESCE(create_time,''), COALESCE(fan_level,-1), COALESCE(tag,''), COALESCE(last_login_time,''), COALESCE(status,'ok'), COALESCE(status_info,'') FROM userdata WHERE jht_uid = ?", uid)
 	var u UserData
-	err := row.Scan(&u.JhtUID, &u.AccessToken, &u.RemainingBotCreationQuantity, &u.LevelID, &u.FanverifyUID, &u.CreateTime, &u.Level, &u.Tag, &u.LastLoginTime, &u.Status, &u.StatusInfo)
+	err := row.Scan(&u.JhtUID, &u.AccessToken, &u.RemainingBotCreationQuantity, &u.LevelID, &u.FanverifyUID, &u.CreateTime, &u.FanLevel, &u.Tag, &u.LastLoginTime, &u.Status, &u.StatusInfo)
+	u.Level = u.FanLevel // 前端展示与判定用的是同一份值
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -2808,7 +2833,14 @@ func findUser(db *sql.DB, uid string) (*UserData, error) {
 }
 
 func upsertUser(db *sql.DB, u *UserData) error {
-	_, err := db.Exec(`INSERT INTO userdata(jht_uid, accesstoken, remaining_bot_creation_quantity, level_id, fanverify_uid, create_time, sim_level, tag, last_login_time, status, status_info)
+	// 写的是 fan_level，不是 sim_level。
+	//
+	// 原先这里把 u.Level 写进 sim_level 列，findUser 又从 sim_level 读回 u.Level，
+	// 列名与语义完全对不上。现在 FanVerify 等级有自己明确的列。
+	//
+	// sim_level 不在写入列表里：它的来源不明（疑似简幻通旧数据），
+	// 不该被登录流程覆盖掉。
+	_, err := db.Exec(`INSERT INTO userdata(jht_uid, accesstoken, remaining_bot_creation_quantity, level_id, fanverify_uid, create_time, fan_level, tag, last_login_time, status, status_info)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(jht_uid) DO UPDATE SET
 			accesstoken=excluded.accesstoken,
@@ -2816,12 +2848,12 @@ func upsertUser(db *sql.DB, u *UserData) error {
 			level_id=excluded.level_id,
 			fanverify_uid=excluded.fanverify_uid,
 			create_time=excluded.create_time,
-			sim_level=excluded.sim_level,
+			fan_level=excluded.fan_level,
 			tag=excluded.tag,
 			last_login_time=excluded.last_login_time,
 			status=excluded.status,
 			status_info=excluded.status_info;`,
-		u.JhtUID, u.AccessToken, u.RemainingBotCreationQuantity, u.LevelID, u.FanverifyUID, u.CreateTime, u.Level, u.Tag, u.LastLoginTime, u.Status, u.StatusInfo)
+		u.JhtUID, u.AccessToken, u.RemainingBotCreationQuantity, u.LevelID, u.FanverifyUID, u.CreateTime, u.FanLevel, u.Tag, u.LastLoginTime, u.Status, u.StatusInfo)
 	return err
 }
 
