@@ -447,6 +447,70 @@ function showTitleScreen() {
   }
 }
 
+// ── 掐掉原版 physics 插件的发包循环，但保留 bot.physics 对象 ──
+//
+// 背景：mineflayer 的 physics 插件和 @miner-org/mineflayer-physics-reworked
+// 各起一个 setInterval(doPhysics, 50)，两个循环都在发移动包，实测合计
+// 40 次/秒。服务器 tick 只有 20/秒，超出的部分 GrimAC 判 flying 并踢人。
+//
+// 为什么不用 plugins:{physics:false} 一禁了之：那样 bot.physics 会变成
+// undefined，而 baritone 的 executor.js:74 要读 bot.physics.gravity、
+// utils.js:129 要调 bot.physics.simulatePlayer，机器人一 spawn 就崩：
+//   TypeError: Cannot read properties of undefined (reading 'gravity')
+//
+// 为什么要钩 setInterval：physics 插件里那个定时器是闭包私有变量
+// （let doPhysicsTimer），外部拿不到引用。唯一能碰到它的时机就是它
+// 自己被创建的那一刻。而它是在 "login" 事件里创建的，所以这里挂一个
+// 一次性钩子，等到 login 再执行，用完立刻还原，不影响其他代码。
+//
+// 为什么 physicsEnabled=false 不够：原版的 tickPhysics 长这样，
+//   if (bot.physicsEnabled && shouldUsePhysics) { physics.simulatePlayer(...) }
+//   if (shouldUsePhysics) { updatePosition(now) }   ← 在 if 外面
+// reworked 把 physicsEnabled 设成 false 只挡住了模拟，发包照旧。
+function installPhysicsTimerTrap(bot) {
+  const onLogin = () => {
+    bot.removeListener('login', onLogin);
+
+    const realSetInterval = global.setInterval;
+    const trapped = [];
+
+    global.setInterval = function (fn, ms, ...rest) {
+      const id = realSetInterval(fn, ms, ...rest);
+      // 只杀原版 physics 的循环，绝不能连 physics-reworked 的一起杀。
+      //
+      // 两个循环的定时器长得一模一样（都是 50ms），但函数体不同：
+      //
+      //   原版 doPhysics:     有 timeAccumulator / catchupTicks 的补帧 while
+      //   reworked doPhysics: 只有一句 tickPhysics(now)，没有补帧
+      //
+      // 实测验证过：按 50ms 一刀切会把两个全杀掉，结果一个定时器都不剩、
+      // 物理彻底停摆，机器人直接飘。所以必须按函数体认人。
+      if (ms === 50 && /timeAccumulator/.test(String(fn))) {
+        trapped.push(id);
+      }
+      return id;
+    };
+
+    // physics 插件也是在 "login" 时起定时器，它的监听器注册得比我们早，
+    // 所以本轮同步执行完就能抓到。用 setImmediate 保证不早于它。
+    setImmediate(() => {
+      global.setInterval = realSetInterval;
+      for (const id of trapped) clearInterval(id);
+      if (trapped.length) {
+        console.log(
+          `[${bot.username}] 已停掉原版 physics 发包循环（${trapped.length} 个），` +
+          `保留 physics-reworked`
+        );
+      } else {
+        console.warn(`[${bot.username}] ⚠️ 没抓到原版 physics 定时器，发包可能仍是双份`);
+      }
+    });
+  };
+
+  bot.on('login', onLogin);
+}
+
+
 // Start a single bot and return it
 function startBot(username) {
   if (bots[username]) return null; // already exists
@@ -458,49 +522,21 @@ function startBot(username) {
     version: SERVER_VERSION,
     // ── 限制原版 physics 的补帧上限 ──
     //
-    // 说明：下面 plugins:{physics:false} 之后原版 physics 根本不会加载，
-    // 所以这一项在当前配置下是空转。保留它是因为一旦哪天回退到不带
-    // useCustomPhysics 的模式，它立刻就有用 —— 那种模式下原版 physics
-    // 会用 while 循环把欠下的 tick 一次性补上（默认上限 4），
+    // 说明：上面的 installPhysicsTimerTrap 会在 login 时把原版 physics 的
+    // 发包循环整个停掉，所以这一项实际也是空转。留着是因为一旦哪天
+    // 回退到不带 useCustomPhysics 的模式，它立刻有用 —— 那种模式下
+    // 原版 physics 会用 while 循环把欠下的 tick 一次性补上（默认上限 4），
     // 每补一 tick 多发一个移动包。
     //
-    // 注意别把它当成这次的修复：实测加了这个参数之后发包率照旧
-    // （29 秒 1423 个包 ≈ 49 包/秒）。真正的病因是双循环，不是补帧。
+    // 别把它当这次的修复：实测加了这个参数之后发包率照旧
+    //（29 秒 1423 个包 ≈ 49 包/秒）。病因是双循环发包，不是补帧。
     maxCatchupTicks: 1,
-      // ── 关键：禁掉原版 physics 插件，让 reworked 独占发包权 ──
-      //
-      // 这是「双循环发包」的根治。证据链：
-      //
-      //   mineflayer/lib/plugins/physics.js:
-      //     let doPhysicsTimer = null           ← 闭包私有变量
-      //     setInterval(doPhysics, 50)          ← 一直在跑
-      //
-      //       if (bot.physicsEnabled && shouldUsePhysics) {
-      //         physics.simulatePlayer(...)       ← reworked 把它关了
-      //         bot.emit("physicsTick")
-      //       }
-      //       if (shouldUsePhysics) {
-      //         updatePosition(now)               ← ★ 在 if 外面！照发不误
-      //       }
-      //
-      //   @miner-org/mineflayer-physics-reworked:
-      //     bot.physicsEnabled = false          ← 以为这样就能让原版闭嘴
-      //     setInterval(doPhysics, 50)          ← 它也起了一个
-      //     clearInterval(自己的 doPhysicsTimer) ← 只能清自己的
-      //
-      // 原版那个定时器是闭包私有的，外部代码根本拿不到引用，
-      // 所以 reworked 永远停不掉它。结果是两个循环各发一份移动包，
-      // 发包率翻倍 —— 这正是日志里 41-64 包/秒的来源
-      //（服务器 tick 只有 20/秒，超出的部分 GrimAC 判 flying）。
-      //
-      // 改成不加载原版 physics：
-      //   - 只有 reworked 发 position 包，回到 20/秒
-      //   - physicsTick 事件由 reworked 自己 emit，自产自销
-      //   - 全库只有 creative.js 依赖 bot.physics，生存模式用不到
-    plugins: { physics: false },
     });
   bots[username] = bot;
   notifyBotStarted(username);
+
+  // 先掐掉原版 physics 的发包循环（bot.physics 对象保留，baritone 要用）
+  installPhysicsTimerTrap(bot);
 
   // ── 扩地：加载寻路插件并建立队列 ──
   // baritone 不能用 bot.loadPlugin —— 那样拿不到重写物理。
