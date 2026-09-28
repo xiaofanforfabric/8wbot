@@ -381,6 +381,10 @@ func main() {
 		log.Fatalf("migrate: %v", err)
 	}
 
+	// 把库里的封禁名单读回内存。必须放在 migrate 之后、任何鉴权路径之前 ——
+	// bannedUsers 是内存 map，不加载的话 ban 只活到下次重启。
+	loadBannedUsers(db)
+
 	// Start SSH server (non-blocking)
 	StartSSHServer(baseDir)
 
@@ -2730,7 +2734,10 @@ func autoReconnectLoop(db *sql.DB, intervalEnv string) {
 }
 
 func findUser(db *sql.DB, uid string) (*UserData, error) {
-	row := db.QueryRow("SELECT jht_uid, accesstoken, COALESCE(remaining_bot_creation_quantity,1), level_id, fanverify_uid, create_time, sim_level, COALESCE(tag,''), COALESCE(last_login_time,''), COALESCE(status,'ok'), COALESCE(status_info,'') FROM userdata WHERE jht_uid = ?", uid)
+	// accesstoken / level_id / fanverify_uid / create_time / sim_level 都可能为 NULL ——
+	// 比如 SSH 的 webuser 只更新一部分列时。不套 COALESCE 的话 Scan 会直接报
+	//「converting NULL to string is unsupported」，整条 webuser 命令就废了。
+	row := db.QueryRow("SELECT jht_uid, COALESCE(accesstoken,''), COALESCE(remaining_bot_creation_quantity,1), COALESCE(level_id,0), COALESCE(fanverify_uid,0), COALESCE(create_time,''), COALESCE(sim_level,0), COALESCE(tag,''), COALESCE(last_login_time,''), COALESCE(status,'ok'), COALESCE(status_info,'') FROM userdata WHERE jht_uid = ?", uid)
 	var u UserData
 	err := row.Scan(&u.JhtUID, &u.AccessToken, &u.RemainingBotCreationQuantity, &u.LevelID, &u.FanverifyUID, &u.CreateTime, &u.Level, &u.Tag, &u.LastLoginTime, &u.Status, &u.StatusInfo)
 	if err == sql.ErrNoRows {

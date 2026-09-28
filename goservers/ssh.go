@@ -214,7 +214,9 @@ func execCmd(ch ssh.Channel, cmd string) {
 	case cmd == "version" || cmd == "bot -v":
 		fmt.Fprintf(ch, "v0.0.1\r\n")
 	case cmd == "status":
-		resp, err := http.Get("http://127.0.0.1:8888/api/config")
+		// 端口不能写死：listenAddr 由 .env 的 PORT 决定，改了端口这里必须跟着变。
+		// 原先硬编码 8888，一旦把服务挪到别的端口，status 就永远报 api unreachable。
+		resp, err := http.Get("http://127.0.0.1" + listenAddr + "/api/config")
 		if err != nil {
 			fmt.Fprintf(ch, "server: api unreachable (%v)\r\n", err)
 			return
