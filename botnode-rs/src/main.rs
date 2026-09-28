@@ -31,13 +31,12 @@ use tracing_subscriber::EnvFilter;
 fn main() {
     // 先读配置再初始化日志 —— 顺序不能反。
     //
-    // `.env` 里可能有 `RUST_LOG`，而 `EnvFilter::try_from_default_env()`
-    // 读的是进程环境变量。如果先初始化日志，那份 `.env` 里的日志级别就
-    // 永远不生效，表现为「我明明设了 debug 却什么都看不到」。
+    // `.env` 里的 `RUST_LOG` 由 `Config::load` 写回进程环境，而
+    // `EnvFilter::try_from_default_env()` 要在那之后才读得到它。顺序反过来
+    // 就是「我明明设了 debug 却什么都看不到」。
     //
     // 代价是配置载入那几条日志（「已载入 .env」）看不到 —— 可以接受，
-    // 因为它们在排查配置问题时才有用，而那时可以把 RUST_LOG 直接给到环境
-    // 变量里。
+    // 它们在排查配置问题时才有用，而那时改的是别的东西。
     let cfg = Config::load();
 
     tracing_subscriber::fmt()

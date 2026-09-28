@@ -77,6 +77,24 @@ impl Config {
 
         let secret = get("INTERNAL_NODE_SECRET");
 
+        // 把 `.env` 里的 RUST_LOG 写回进程环境，否则它不生效。
+        //
+        // `tracing_subscriber::EnvFilter::try_from_default_env()` 读的是
+        // 进程环境变量，不是我们的 `Config`。光把值读进来而不写回去，会
+        // 表现为「我在 .env 里明明设了 debug，却什么都看不到」—— 一个很
+        // 容易归因到「日志坏了」的坑。
+        //
+        // 只写这一个变量：别的配置都从 `Config` 走，不需要污染进程环境。
+        // 而且 `RUST_LOG` 本来就是日志系统自己按约定读的名字。
+        if std::env::var_os("RUST_LOG").is_none() {
+            if let Some(level) = file_vars.get("RUST_LOG") {
+                // SAFETY: 这是在 `main` 的最开头、任何线程创建之前调用的，
+                // 不存在与其它线程的 `getenv` 竞态。Rust 2024 起
+                // `set_var` 被标为 unsafe 正是因为这个前提。
+                unsafe { std::env::set_var("RUST_LOG", level) };
+            }
+        }
+
         Self {
             mc_address,
             control_addr,
