@@ -771,7 +771,7 @@ mod tests {
         // 前端按 `[{botname, data:[...]}]` 解析：这里检查 data 是数组而
         // 不是对象 —— 后者会让前端的 `for (const item of msg.data)` 抛错。
         assert!(v["data"].is_array());
-        assert_eq!(v["data"][0]["text"], "hi");
+        assert_eq!(v["data"][0]["chat"], "[消息] hi");
         assert_eq!(v["botname"], "xiaofanbot");
     }
 

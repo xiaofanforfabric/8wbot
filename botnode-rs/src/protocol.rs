@@ -153,10 +153,31 @@ pub type EventData = serde_json::Map<String, serde_json::Value>;
 /// 构造一条日志事件。
 pub fn log_event(level: &str, text: &str) -> EventData {
     let mut m = EventData::new();
-    m.insert("level".into(), level.into());
-    m.insert("text".into(), text.into());
-    m.insert("time".into(), crate::status::now_rfc3339().into());
+    m.insert("chat".into(), format!("{}{}", prefix_for(level), text).into());
     m
+}
+
+/// 日志级别到聊天前缀。
+///
+/// **这个前缀不是装饰，是契约的一部分。** 前端只认 `data[].chat` 这一个
+/// 字段（见 `ConsolePage.vue` 的 `if (d.chat) appendLog(d.chat)`），前缀
+/// 由节点加好。我一开始发的是 `{level, text, time}` 三个字段，前端一个都
+/// 不认 —— 于是每一帧都落到最后的兜底分支
+/// `appendLog(JSON.stringify(data))`，把整坨 JSON 打进控制台。用户看到的
+/// 就是满屏 `{"botname":"xiaofanbot","data":[{"level":"info",...}]}`。
+///
+/// 前缀取值与原 JS 版一致（`index.js` 里那几处 broadcast）：
+/// `[消息]` `[聊天]` `[系统]`。
+fn prefix_for(level: &str) -> &'static str {
+    match level {
+        // 聊天：机器人自己说的、以及别人说的话。
+        "chat" => "[聊天] ",
+        // 出站指令（我们发给服务器的）。原来用 "info" 表示，但那样它和
+        // 系统消息混在一起，看不出这是「我发出去的」。
+        "info" => "[消息] ",
+        // 其余（warn/error/debug）都是节点自己的状态通报。
+        _ => "[系统] ",
+    }
 }
 
 /// 构造一条状态事件。
@@ -225,6 +246,39 @@ mod tests {
         // 外层是对象，data 是数组 —— 前端按这个形状取。
         assert_eq!(json["botname"], "xiaofanbot");
         assert!(json["data"].is_array());
-        assert_eq!(json["data"][0]["text"], "hello");
+        assert_eq!(json["data"][0]["chat"], "[消息] hello");
+    }
+
+    /// 日志必须发 `chat` 字段，不能发 `{level, text, time}`。
+    ///
+    /// 这是我犯过的一个错误：发成 `{level, text}` 之后，前端一个字段都不
+    /// 认（它只读 `d.chat`），每一帧都落到兜底分支
+    /// `appendLog(JSON.stringify(data))` —— 用户看到的控制台里是满屏的
+    /// `{"botname":"xiaofanbot","data":[{"level":"info",...}]}`。
+    ///
+    /// 所以这条测试锁死字段名和前缀，避免再退回去。
+    #[test]
+    fn 日志只发_chat_字段且带前缀() {
+        for (level, want_prefix) in
+            [("chat", "[聊天] "), ("info", "[消息] "), ("warn", "[系统] "), ("error", "[系统] ")]
+        {
+            let ev = log_event(level, "内容");
+            assert!(
+                ev.contains_key("chat"),
+                "级别 {level} 应当发 chat 字段，实际: {ev:?}"
+            );
+            // 不能有前端不认的字段 —— 多发的字段不会报错，只会静默失效，
+            // 而「静默失效」正是这个 bug 最难查的地方。
+            for bad in ["level", "text", "time"] {
+                assert!(
+                    !ev.contains_key(bad),
+                    "不该再发 {bad} 字段（前端不认），级别 {level}"
+                );
+            }
+            assert_eq!(
+                ev["chat"], format!("{want_prefix}内容"),
+                "级别 {level} 的前缀不对"
+            );
+        }
     }
 }
