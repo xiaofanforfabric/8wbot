@@ -196,7 +196,24 @@ impl Bot {
     }
 
     fn push_status(&self) {
-        let snapshot = self.status();
+        // 取整放在这里，而不是放在某个调用方里。
+        //
+        // 原来只有 `maybe_push_position` 取整，但 `push_status` 还有四个
+        // 调用点（进世界、收到 /server 回复、开拓成功…），它们推的是
+        // status 里的原始浮点 —— 实测前端收到的就是 -7104.699999988079。
+        // 让每个调用方各自记得取整是不可靠的，放在唯一的出口上才不会有
+        // 漏网的路径。
+        let snapshot = {
+            let mut st = self.status.write();
+            if let Some(p) = st.pos.as_mut() {
+                // `-0.0.floor()` 仍是 -0.0，序列化成 -0.0 同样难看，所以
+                // y 轴额外加 0.0 归一。只影响显示，不影响任何计算。
+                p.x = p.x.floor();
+                p.y = p.y.floor() + 0.0;
+                p.z = p.z.floor();
+            }
+            st.clone()
+        };
         self.emit(status_event(&snapshot));
     }
 
