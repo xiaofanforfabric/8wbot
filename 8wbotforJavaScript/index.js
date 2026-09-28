@@ -468,34 +468,37 @@ function showTitleScreen() {
 //   if (shouldUsePhysics) { updatePosition(now) }   ← 在 if 外面
 // reworked 把 physicsEnabled 设成 false 只挡住了模拟，发包照旧。
 function installPhysicsTimerTrap(bot) {
-  console.log(`[${bot.username}] 物理发包陷阱已装载，等待 login`);
+  // 钩子必须【立刻】装上，不能等到 login 事件里再装。
+  //
+  // 两个模块都是在 login 事件的同步执行期间调 setInterval 的：
+  //   mineflayer/lib/plugins/physics.js:483   bot.on('login', ... setInterval ...)
+  //   physics-reworked/index.js:493           bot.on("login", ... setInterval ...)
+  //
+  // 而我的 login 监听器注册得比 physics 插件【早】（我在 createBot 之后
+  // 立刻注册，physics 插件要等 inject_allowed 那个 setTimeout(0) 才注入），
+  // 所以事件触发时我先执行 —— 如果这时才装钩子，两个定时器都已经建好了，
+  // 一个都抓不到。实测复现过：login 同步执行完时已有 2 个定时器。
+  //
+  // 正确做法是从现在起一直挂着，等到 login 执行完再摘。
+  const realSetInterval = global.setInterval;
+  const trapped = [];
+
+  global.setInterval = function (fn, ms, ...rest) {
+    const id = realSetInterval(fn, ms, ...rest);
+    // 只认原版 physics 的循环，绝不能连 physics-reworked 的一起杀。
+    // 两个定时器都是 50ms，区别在函数体：
+    //   原版 doPhysics:     含 timeAccumulator 补帧 while
+    //   reworked doPhysics: 只有一句 tickPhysics(now)
+    // 实测按 50ms 一刀切会把两个全杀掉，物理彻底停摆、机器人直接飘。
+    if (ms === 50 && /timeAccumulator/.test(String(fn))) {
+      trapped.push(id);
+    }
+    return id;
+  };
 
   const onLogin = () => {
     bot.removeListener('login', onLogin);
-    console.log(`[${bot.username}] login 到达，开始接管 setInterval`);
-
-    const realSetInterval = global.setInterval;
-    const trapped = [];
-
-    global.setInterval = function (fn, ms, ...rest) {
-      const id = realSetInterval(fn, ms, ...rest);
-      // 只杀原版 physics 的循环，绝不能连 physics-reworked 的一起杀。
-      //
-      // 两个循环的定时器长得一模一样（都是 50ms），但函数体不同：
-      //
-      //   原版 doPhysics:     有 timeAccumulator / catchupTicks 的补帧 while
-      //   reworked doPhysics: 只有一句 tickPhysics(now)，没有补帧
-      //
-      // 实测验证过：按 50ms 一刀切会把两个全杀掉，结果一个定时器都不剩、
-      // 物理彻底停摆，机器人直接飘。所以必须按函数体认人。
-      if (ms === 50 && /timeAccumulator/.test(String(fn))) {
-        trapped.push(id);
-      }
-      return id;
-    };
-
-    // physics 插件也是在 "login" 时起定时器，它的监听器注册得比我们早，
-    // 所以本轮同步执行完就能抓到。用 setImmediate 保证不早于它。
+    // login 的所有监听器都跑完了，两个 setInterval 都已发生，可以摘钩子了
     setImmediate(() => {
       global.setInterval = realSetInterval;
       for (const id of trapped) clearInterval(id);
@@ -506,8 +509,7 @@ function installPhysicsTimerTrap(bot) {
         );
       } else {
         console.warn(
-          `[${bot.username}] ⚠️ 没抓到原版 physics 定时器，发包可能仍是双份。` +
-          `（若确认代码是 beb574c 之后的版本，请把这段日志发出来）`
+          `[${bot.username}] ⚠️ 没抓到原版 physics 定时器，发包可能仍是双份`
         );
       }
     });
