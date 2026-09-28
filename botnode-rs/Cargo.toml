@@ -1,0 +1,47 @@
+[package]
+name = "bgjq-bot"
+version = "0.1.0"
+edition = "2024"
+description = "8W 邦国崛起机器人节点（Rust / Azalea）"
+
+[dependencies]
+# 关掉 `packet-event`：它把【每一个】收到的包都变成一个 `Event::Packet`，
+# 而本用途只需要聊天、tick、连接状态这几类。开着它的后果实测过 —— 事件通道
+# 涨到 1000+ 条、`GameTick` 落后 10 tick 以上、控制面的 `botstatus` 请求
+# 卡住不返。关掉之后事件量回到正常水平。
+#
+# `online-mode` 也关掉：这个节点用的是离线账号（`Account::offline`），
+# 真正的鉴权由服务端的 SimpPass 做。
+azalea = { version = "0.16", default-features = false, features = ["log", "serde"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+regex = "1"
+once_cell = "1"
+parking_lot = "0.12"
+axum = { version = "0.8", features = ["ws"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
+# 发布构建的取舍，都是为「一台 4G 机器跑 20 个机器人」服务的：
+#
+# - opt-level = 3：Azalea 每 tick 都跑物理和寻路，优化值得。
+# - lto + codegen-units = 1：跨 crate 内联，二进制更小、跑得更快。编译慢
+#   一倍多，但这是一次性的。
+# - panic = "abort"：不需要栈展开，二进制小一截。代价是单个机器人 panic
+#   会带掉整个节点 —— 可以接受，因为节点由 systemd 拉起，重启很快；而且
+#   一个 panic 的机器人本来也不该继续跑。
+# - strip：去掉符号，二进制从几十 MB 降到几 MB。
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
