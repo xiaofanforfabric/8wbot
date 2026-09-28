@@ -2,15 +2,27 @@ require('dotenv').config();
 
 // launcher.js — 启动器，通过 WS /ws/api/startbot 启动机器人并实时推送日志
 const mineflayer = require('mineflayer');
-// 扩地寻路。这里用 mineflayer-pathfinder：Node 侧没有真 Baritone，
-// 而网页操控扩地是「逐块走近距离」，这个插件够用。
-const { pathfinder, goals } = require('mineflayer-pathfinder');
+// 扩地寻路。这里用 @miner-org/mineflayer-baritone。
+//
+// 为什么不用 mineflayer-pathfinder：它每 tick 都往服务器发 flying 包，
+// 而服务器装了 GrimAC 反作弊，会把移动判定成 type=flying 并拉回原位
+// （实测 wans7891 有 22% 的移动包被判失败，根本走不动）。
+//
+// baritone 的两个关键差异：
+//   1. useCustomPhysics —— 挂载重写的物理引擎。它只在 onGround 状态
+//      【变化】时才发 flying 包，而不是每 tick 都发，直接减少被 GrimAC
+//      抓到的机会。
+//   2. gotoSmart —— 超过阈值自动拆成 waypoint 分段寻路，长距离不再
+//      一条 A* 走到底。地越扩越大，这个必须有。
+const baritone = require('@miner-org/mineflayer-baritone');
+const { goals } = baritone;
+const { Vec3 } = require('vec3');
 const WebSocket = require('ws');
 const url = require('url');
 const fs = require('fs');
 const path = require('path');
 const ST = require('./status');
-const { ClaimQueue, orderSquare, parseClaimNotify, CHUNK_TIMEOUT_SEC, REPATH_AFTER_SEC } =
+const { ClaimQueue, orderSquare, parseClaimNotify, CHUNK_TIMEOUT_SEC } =
   require('./claimqueue');
 
 // ════════════════════════════════════════════════════════════════
@@ -151,48 +163,79 @@ async function walkToChunk(bot, username, cx, cz) {
   const bz = cz * 16 + 8;
   const q = claimQueues.get(username);
 
-  if (!bot.pathfinder) {
-    console.error(`[${username}] pathfinder 未加载，无法前往 (${cx},${cz})`);
+  if (!bot.ashfinder) {
+    console.error(`[${username}] ashfinder 未加载，无法前往 (${cx},${cz})`);
     return false;
   }
 
+  // GoalXZ 要的是 Vec3（不是 pathfinder 那样的两个数字）。
+  // Y 给当前高度即可 —— GoalXZ 只看 XZ，不看 Y。
+  const y = bot.entity ? Math.floor(bot.entity.position.y) : 64;
+  let goal;
   try {
-    bot.pathfinder.setGoal(new goals.GoalXZ(bx, bz));
+    goal = new goals.GoalXZ(new Vec3(bx, y, bz));
   } catch (e) {
-    console.error(`[${username}] setGoal 失败: ${e.message}`);
+    console.error(`[${username}] 构造目标失败: ${e.message}`);
     return false;
   }
 
   const deadline = Date.now() + CHUNK_TIMEOUT_SEC * 1000;
-  let waited = 0;
 
-  while (Date.now() < deadline) {
-    await sleep(1000);
-    waited++;
-    if (!bot.entity) return false;
-    if (q && !q.running) return false; // 被中断
+  // gotoSmart 是异步的，它自己会一直走到目标或失败，不需要我们轮询重设目标。
+  // 之前用 pathfinder 时那个「每秒检查 isMoving、不动就 setGoal」的循环
+  // 本身就是问题的一部分 —— 反复重设计划会让移动包节奏剧烈抖动，
+  // 在反作弊眼里比正常走路可疑得多。
+  const walk = bot.ashfinder
+    .gotoSmart(goal, { waypointThreshold: 75 })
+    .then(() => true)
+    .catch((e) => {
+      console.warn(`[${username}] 前往 (${cx},${cz}) 寻路失败: ${e.message}`);
+      return false;
+    });
 
-    const pc = playerChunkOf(bot);
-    if (pc && pc[0] === cx && pc[1] === cz) {
-      try { bot.pathfinder.setGoal(null); } catch (_) {}
-      return true;
-    }
+  // 超时保护：gotoSmart 可能长时间不返回（卡在某个地形里），到点主动停，
+  // 别把整条队列拖死。
+  let timer = null;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      try { bot.ashfinder.stop(); } catch (_) {}
+      console.warn(`[${username}] 前往 (${cx},${cz}) 超时（${CHUNK_TIMEOUT_SEC}s）`);
+      resolve(false);
+    }, CHUNK_TIMEOUT_SEC * 1000);
+  });
 
-    // 寻路中断（卡住/被取消）就重设目标。刚起步的前几秒不重设，
-    // 否则 setGoal 还没生效就被误判为中断。
-    if (waited > REPATH_AFTER_SEC) {
-      let moving = false;
-      try { moving = bot.pathfinder.isMoving(); } catch (_) {}
-      if (!moving) {
-        console.log(`[${username}] 前往 (${cx},${cz}) 寻路中断，重设目标`);
-        try { bot.pathfinder.setGoal(new goals.GoalXZ(bx, bz)); } catch (_) {}
+  // 每 5 秒看一眼：到了没有、用户有没有中途停掉
+  const watcher = (async () => {
+    while (Date.now() < deadline) {
+      await sleep(5000);
+      if (!bot.entity) return false;
+      if (q && !q.running) {
+        try { bot.ashfinder.stop(); } catch (_) {}
+        return false;
+      }
+      const pc = playerChunkOf(bot);
+      if (pc && pc[0] === cx && pc[1] === cz) {
+        try { bot.ashfinder.stop(); } catch (_) {}
+        return true;
       }
     }
+    return false;
+  })();
+
+  let reached = false;
+  try {
+    reached = await Promise.race([walk, timeout, watcher]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    try { bot.ashfinder.stop(); } catch (_) {}
   }
 
-  try { bot.pathfinder.setGoal(null); } catch (_) {}
-  console.warn(`[${username}] 前往 (${cx},${cz}) 超时（${CHUNK_TIMEOUT_SEC}s）`);
-  return false;
+  if (!reached) return false;
+
+  // 到点了再确认一次：gotoSmart 返回成功不等于真的进了目标区块
+  await sleep(500);
+  const pc = playerChunkOf(bot);
+  return !!(pc && pc[0] === cx && pc[1] === cz);
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -418,10 +461,18 @@ function startBot(username) {
   notifyBotStarted(username);
 
   // ── 扩地：加载寻路插件并建立队列 ──
+  // baritone 不能用 bot.loadPlugin —— 那样拿不到重写物理。
+  // 必须直接调 loader(bot, {useCustomPhysics:true})。
   try {
-    bot.loadPlugin(pathfinder);
+    baritone.loader(bot, { useCustomPhysics: true });
+    if (bot.ashfinder && bot.ashfinder.config) {
+      bot.ashfinder.config.parkour = true;      // 跑酷先开着，看反作弊反应
+      bot.ashfinder.config.breakBlocks = true;  // 卡住时允许挖开
+      bot.ashfinder.config.placeBlocks = true;  // 允许垫方块
+      bot.ashfinder.config.swimming = true;
+    }
   } catch (e) {
-    console.warn(`[${username}] 寻路插件加载失败，扩地将不可用: ${e.message}`);
+    console.warn(`[${username}] baritone 加载失败，扩地将不可用: ${e.message}`);
   }
   claimQueues.set(
     username,

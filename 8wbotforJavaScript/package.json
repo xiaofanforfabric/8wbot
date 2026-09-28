@@ -11,6 +11,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@miner-org/mineflayer-baritone": "^4.6.2",
     "dotenv": "^18.0.4",
     "mineflayer": "^4.37.1",
     "mineflayer-pathfinder": "^2.4.5",
