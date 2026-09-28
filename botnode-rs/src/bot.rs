@@ -240,11 +240,22 @@ impl Bot {
         }
         *self.last_pos_push.lock() = now;
 
+        // 取整【并写回】。只拿取整后的值去比较、却推原始浮点是不行的 ——
+        // 实测推出去的是 -7104.699999988079 这种数字：地图上显示它没有
+        // 意义，而且和「比较用整数」的限频逻辑自相矛盾（比较认为没变，
+        // 推出去的却一直在变）。
+        //
+        // `-0.0.floor()` 是 -0.0，序列化成 -0.0 同样难看，所以 y 轴额外
+        // 归一成 0.0 —— 只影响显示，不影响任何计算。
         let (pos, dim) = {
-            let st = self.status.read();
+            let mut st = self.status.write();
+            if let Some(p) = st.pos.as_mut() {
+                p.x = p.x.floor();
+                p.y = p.y.floor() + 0.0; // +0.0 把 -0.0 归一成 0.0
+                p.z = p.z.floor();
+            }
             (
-                st.pos
-                    .map(|p| (p.x.floor() as i64, p.y.floor() as i64, p.z.floor() as i64)),
+                st.pos.map(|p| (p.x as i64, p.y as i64, p.z as i64)),
                 st.dimension.clone(),
             )
         };
