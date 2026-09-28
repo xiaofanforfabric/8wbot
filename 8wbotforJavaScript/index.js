@@ -468,8 +468,11 @@ function showTitleScreen() {
 //   if (shouldUsePhysics) { updatePosition(now) }   ← 在 if 外面
 // reworked 把 physicsEnabled 设成 false 只挡住了模拟，发包照旧。
 function installPhysicsTimerTrap(bot) {
+  console.log(`[${bot.username}] 物理发包陷阱已装载，等待 login`);
+
   const onLogin = () => {
     bot.removeListener('login', onLogin);
+    console.log(`[${bot.username}] login 到达，开始接管 setInterval`);
 
     const realSetInterval = global.setInterval;
     const trapped = [];
@@ -502,7 +505,10 @@ function installPhysicsTimerTrap(bot) {
           `保留 physics-reworked`
         );
       } else {
-        console.warn(`[${bot.username}] ⚠️ 没抓到原版 physics 定时器，发包可能仍是双份`);
+        console.warn(
+          `[${bot.username}] ⚠️ 没抓到原版 physics 定时器，发包可能仍是双份。` +
+          `（若确认代码是 beb574c 之后的版本，请把这段日志发出来）`
+        );
       }
     });
   };
