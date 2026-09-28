@@ -1,6 +1,15 @@
 package main
 
-import "database/sql"
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
 
 // Bot CRUD functions
 
@@ -139,4 +148,203 @@ func boolToInt(b bool) int64 {
 		return 1
 	}
 	return 0
+}
+
+// ════════════════════════════════════════════════════════════════
+// 浏览器实时状态流
+//
+// 前端只开一条 /ws/api/stream 订阅自己名下所有机器人，切页面也不断开。
+// 数据来自 Go 到 JS 节点的一条常驻订阅（/ws/api/events），而不是让每个
+// 浏览器各自去连 JS 节点 —— 后者会让连接数随「用户数 × 机器人数」爆炸，
+// 而且浏览器并不知道内部密钥。
+// ════════════════════════════════════════════════════════════════
+
+type botStreamSub struct {
+	conn *websocket.Conn
+	bots map[string]bool // 该用户名下的机器人，作为转发白名单
+	send chan []byte
+	once sync.Once
+	done chan struct{}
+}
+
+// writeLoop 是这条连接唯一的写入者。
+//
+// gorilla/websocket 不允许多个 goroutine 并发写同一条连接，而心跳 ping 和
+// 业务推送天然来自两个 goroutine，直接写会触发 concurrent write 崩溃。
+// 把写操作全部收敛到这个循环里就根除了这个隐患。
+func (s *botStreamSub) writeLoop() {
+	const pingPeriod = 30 * time.Second
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case msg := <-s.send:
+			s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := s.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				return
+			}
+		case <-ticker.C:
+			if err := s.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+				return
+			}
+		case <-s.done:
+			return
+		}
+	}
+}
+
+func (s *botStreamSub) close() {
+	s.once.Do(func() { close(s.done) })
+}
+
+// push 非阻塞投递。客户端太慢时丢帧，而不是拖住整个事件循环。
+func (s *botStreamSub) push(msg []byte) {
+	select {
+	case s.send <- msg:
+	case <-s.done:
+	default:
+	}
+}
+
+var (
+	botStreamMu   sync.RWMutex
+	botStreamSubs = map[*botStreamSub]bool{}
+)
+
+func addBotStreamSub(s *botStreamSub) {
+	botStreamMu.Lock()
+	botStreamSubs[s] = true
+	botStreamMu.Unlock()
+}
+
+func removeBotStreamSub(s *botStreamSub) {
+	botStreamMu.Lock()
+	delete(botStreamSubs, s)
+	botStreamMu.Unlock()
+	s.close()
+}
+
+// pushToBrowsers 把某个机器人的事件推给所有有权看它的浏览器连接
+func pushToBrowsers(botname string, payload []byte) {
+	botStreamMu.RLock()
+	var targets []*botStreamSub
+	for s := range botStreamSubs {
+		if s.bots[botname] {
+			targets = append(targets, s)
+		}
+	}
+	botStreamMu.RUnlock()
+	for _, s := range targets {
+		s.push(payload)
+	}
+}
+
+// saveBotStatus 把 JS 节点上报的实时状态落库。
+// 落库的意义：用户切页面、关掉控制台、或者后端重启之后，卡片上仍然能显示
+// 最近一次已知的位置与邦国信息，而不是一片空白。
+func saveBotStatus(db *sql.DB, botname string, status json.RawMessage) error {
+	_, err := db.Exec("UPDATE bots SET status_json = ?, status_time = ? WHERE username = ?",
+		string(status), time.Now().Format(time.RFC3339), botname)
+	return err
+}
+
+// botStatusRow 供 /api/getmybotslist 与 /ws/api/stream 读取缓存状态
+func botStatusRow(db *sql.DB, botname string) (string, string) {
+	var js, ts string
+	row := db.QueryRow("SELECT COALESCE(status_json,''), COALESCE(status_time,'') FROM bots WHERE username = ?", botname)
+	if err := row.Scan(&js, &ts); err != nil {
+		return "", ""
+	}
+	return js, ts
+}
+
+// jsEventsLoop 常驻订阅 JS 节点的全局事件流并扇出给浏览器。
+// 这条链路断了等于所有实时状态都停摆，所以断线要无限重连。
+func jsEventsLoop(db *sql.DB) {
+	for {
+		if err := jsEventsOnce(db); err != nil {
+			log.Printf("[EVENTS] 事件订阅中断，5 秒后重连: %v", err)
+		}
+		time.Sleep(5 * time.Second)
+	}
+}
+
+func jsEventsOnce(db *sql.DB) error {
+	conn, _, err := jsDialer.Dial(getJSNodeURL("/ws/api/events"), nil)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"all":true}`)); err != nil {
+		return fmt.Errorf("subscribe: %w", err)
+	}
+	log.Printf("[EVENTS] 已订阅 JS 节点全局事件流")
+
+	stopPing := wsPoller(conn)
+	defer stopPing()
+
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("read: %w", err)
+		}
+		handleNodeEvent(db, msg)
+	}
+}
+
+// handleNodeEvent 处理 JS 节点推来的一帧事件。
+// 目前只关心 status（落库 + 推送）与 bot_offline（推送），
+// 聊天和地图仍然走 /ws/api/connectbot，避免重复占用带宽。
+func handleNodeEvent(db *sql.DB, raw []byte) {
+	var events []struct {
+		BotName string `json:"botname"`
+		Data    []struct {
+			Status     json.RawMessage `json:"status"`
+			BotOffline bool            `json:"bot_offline"`
+			Reason     string          `json:"reason"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &events); err != nil {
+		return
+	}
+	for _, ev := range events {
+		if ev.BotName == "" {
+			continue
+		}
+		for _, d := range ev.Data {
+			if len(d.Status) > 0 && string(d.Status) != "null" {
+				if err := saveBotStatus(db, ev.BotName, d.Status); err != nil {
+					log.Printf("[EVENTS] 状态落库失败 %s: %v", ev.BotName, err)
+				}
+				out, _ := json.Marshal([]map[string]interface{}{{
+					"botname": ev.BotName,
+					"data":    []map[string]interface{}{{"status": d.Status}},
+				}})
+				pushToBrowsers(ev.BotName, out)
+			}
+			if d.BotOffline {
+				out, _ := json.Marshal([]map[string]interface{}{{
+					"botname": ev.BotName,
+					"data":    []map[string]interface{}{{"bot_offline": true, "reason": d.Reason}},
+				}})
+				pushToBrowsers(ev.BotName, out)
+			}
+		}
+	}
+}
+
+// 给 /api/getmybotslist 用的小包装：取不到就返回空串，不让单个机器人
+// 的状态缺失影响整个列表接口。
+func mustBotStatusJSON(botname string) string {
+	js, _ := botStatusRow(globalDB, botname)
+	if js == "" || !json.Valid([]byte(js)) {
+		return ""
+	}
+	return js
+}
+
+func mustBotStatusTime(botname string) string {
+	_, ts := botStatusRow(globalDB, botname)
+	return ts
 }

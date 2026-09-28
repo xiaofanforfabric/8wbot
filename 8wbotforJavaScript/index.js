@@ -6,6 +6,7 @@ const WebSocket = require('ws');
 const url = require('url');
 const fs = require('fs');
 const path = require('path');
+const ST = require('./status');
 
 // ════════════════════════════════════════════════════════════════
 // 上次退出原因记录
@@ -117,6 +118,189 @@ const SERVER_PORT = parseInt(process.env.MC_PORT) || 25565;
 const SERVER_VERSION = process.env.MC_VERSION || '1.21.4';
 
 const bots = {}; // username -> bot instance
+
+// ════════════════════════════════════════════════════════════════
+// 事件总线
+//
+// 以前每个 /ws/api/botlogs 连接都会往 bot 上重新挂一遍 bot.on(...)，
+// 而且 close 时不摘除 —— 那段注释写着 "Remove listeners by re-assigning
+// noop"，下面其实是空的。后果：开 N 次控制台就挂 5N 个监听器，同一条
+// 聊天被转发 N 次，Node 还会报 MaxListenersExceededWarning，内存只涨不降。
+//
+// 现在改成：bot 的事件在 startBot 里只注册一次，统一投到总线，再由总线
+// 扇出给所有订阅者。顺带解决另一个问题 —— 原来事件只发给「启动它的那条
+// 连接」，所以自动重连巡护拉起的机器人不属于任何连接，谁也不知道它在干嘛。
+// ════════════════════════════════════════════════════════════════
+const subscribers = new Map(); // username -> Set<ws>
+// 订阅了 {all:true} 的全局连接，新机器人启动时需要主动纳入
+const eventWatchers = new Set();
+
+function subscribeBot(username, ws) {
+  let set = subscribers.get(username);
+  if (!set) { set = new Set(); subscribers.set(username, set); }
+  set.add(ws);
+}
+
+// 连接关闭时按连接整体摘除，避免残留
+function unsubscribeWs(ws) {
+  for (const [name, set] of subscribers) {
+    set.delete(ws);
+    if (set.size === 0) subscribers.delete(name);
+  }
+}
+
+function broadcast(username, payload) {
+  const set = subscribers.get(username);
+  if (!set || set.size === 0) return;
+  const msg = JSON.stringify(payload);
+  for (const ws of set) {
+    if (ws.readyState === 1) {
+      try { ws.send(msg); } catch (_) {}
+    }
+  }
+}
+
+// 通知订阅了 {all:true} 的全局连接「有新机器人起来了」。
+// 否则常驻订阅者只能看到它订阅那一刻已经存在的机器人。
+function notifyBotStarted(username) {
+  for (const ws of eventWatchers) {
+    if (ws.readyState === 1 && ws._watchAll && typeof ws._onBotStarted === 'function') {
+      try { ws._onBotStarted(username); } catch (_) {}
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+// 状态采集：位置 / 维度 / 所在服务器 / 邦国信息
+//
+// 位置和维度直接从 mineflayer 读，几乎零开销；
+// 所在服务器靠发 /server 问，输出是原版翻译消息 —— 机器人 locale 是
+// en_US（mineflayer 默认），所以收到的是英文 "You are currently
+// connected to main."，但中文客户端会看到中文，这里两种都匹配。
+// 邦国信息靠发 /u info，那 14 行是插件自己吐的中文原文，机器人收到的
+// 也是中文；为了不赌语言，解析按「键: 值」结构走，不硬编码字段名。
+// ════════════════════════════════════════════════════════════════
+const STATUS_POS_MS = parseInt(process.env.STATUS_POS_MS) || 5000;
+const STATUS_SERVER_MS = parseInt(process.env.STATUS_SERVER_MS) || 60000;
+const STATUS_KINGDOM_MS = parseInt(process.env.STATUS_KINGDOM_MS) || 600000;
+const KINGDOM_COLLECT_MS = 4000; // 发完 /u info 后收多少毫秒的回复
+
+const emptyStatus = ST.emptyStatus;
+
+function pushStatus(username, patch) {
+  const bot = bots[username];
+  if (!bot) return;
+  if (!bot._status) bot._status = emptyStatus();
+  Object.assign(bot._status, patch, { updatedAt: new Date().toISOString() });
+  broadcast(username, [{ botname: username, data: [{ status: bot._status }] }]);
+}
+
+// 处理一条进来的聊天消息，抽取状态信息。
+// 返回 true 表示这条消息属于邦国信息块。
+function handleStatusMessage(username, bot, text) {
+  if (!bot._status) bot._status = emptyStatus();
+
+  // ── /server 的回复 ──
+  const server = ST.parseServer(text);
+  if (server) {
+    bot._currentServer = server;
+    pushStatus(username, { server: server });
+    if (bot._serverCheckResolve) {
+      bot._serverCheckResolve(server);
+      bot._serverCheckResolve = null;
+    }
+  }
+
+  // ── /u info 的回复：累积整个块再解析 ──
+  const title = ST.parseKingdomHead(text);
+  if (title !== null) {
+    bot._kingdomBuf = { title: title, raw: [text] };
+    if (bot._kingdomTimer) clearTimeout(bot._kingdomTimer);
+    bot._kingdomTimer = setTimeout(() => finishKingdom(username), KINGDOM_COLLECT_MS);
+    return true;
+  }
+
+  if (bot._kingdomBuf) {
+    bot._kingdomBuf.raw.push(text);
+    if (ST.isKingdomEnd(text)) {
+      if (bot._kingdomTimer) clearTimeout(bot._kingdomTimer);
+      finishKingdom(username);
+    }
+    return true;
+  }
+
+  return false;
+}
+
+function finishKingdom(username) {
+  const bot = bots[username];
+  if (!bot || !bot._kingdomBuf) return;
+  const buf = bot._kingdomBuf;
+  bot._kingdomBuf = null;
+  if (bot._kingdomTimer) { clearTimeout(bot._kingdomTimer); bot._kingdomTimer = null; }
+
+  const parsed = ST.parseKingdomBlock(buf.title, buf.raw);
+  if (!parsed) return; // 残缺块，丢弃
+
+  parsed.updatedAt = new Date().toISOString();
+  pushStatus(username, { kingdom: parsed });
+  console.log(`[${username}] 邦国信息已更新: ${parsed.title}（${Object.keys(parsed.fields).length} 个字段）`);
+}
+
+// 为某个机器人启动周期性采集。重复调用是幂等的。
+function startStatusCollector(username) {
+  const bot = bots[username];
+  if (!bot || bot._statusTimer) return;
+  if (!bot._status) bot._status = emptyStatus();
+
+  const tick = () => {
+    const b = bots[username];
+    if (!b) return stopStatusCollector(username);
+    try {
+      const p = b.entity && b.entity.position;
+      const dim = (b.game && b.game.dimension) || null;
+      const pos = p ? { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) } : null;
+      const prev = b._status || {};
+      if (JSON.stringify(prev.pos) !== JSON.stringify(pos) || prev.dimension !== dim) {
+        pushStatus(username, { pos: pos, dimension: dim });
+      }
+    } catch (_) {}
+  };
+
+  const askServer = () => {
+    const b = bots[username];
+    if (!b) return;
+    try { b.chat('/server'); } catch (_) {}
+  };
+
+  const askKingdom = () => {
+    const b = bots[username];
+    if (!b) return;
+    try { b.chat('/u info'); } catch (_) {}
+  };
+
+  tick();
+  bot._statusTimer = {
+    pos: setInterval(tick, STATUS_POS_MS),
+    server: setInterval(askServer, STATUS_SERVER_MS),
+    kingdom: setInterval(askKingdom, STATUS_KINGDOM_MS),
+  };
+  // 进游戏后先各问一次，别让卡片空等一个周期
+  setTimeout(() => { askServer(); }, 3000);
+  setTimeout(() => { askKingdom(); }, 8000);
+}
+
+function stopStatusCollector(username) {
+  const bot = bots[username];
+  if (!bot || !bot._statusTimer) return;
+  const t = bot._statusTimer;
+  clearInterval(t.pos);
+  clearInterval(t.server);
+  clearInterval(t.kingdom);
+  bot._statusTimer = null;
+  if (bot._kingdomTimer) { clearTimeout(bot._kingdomTimer); bot._kingdomTimer = null; }
+}
+
 let titleSelectedIndex = 0;
 const titleControls = ['Start', 'Options', 'Quit'];
 
@@ -155,6 +339,7 @@ function startBot(username) {
     version: SERVER_VERSION
   });
   bots[username] = bot;
+  notifyBotStarted(username);
 
   // ── 资源包应答（必须处理，否则机器人根本进不了游戏）──
   // MC 1.20.3 起服务器会在 configuration 阶段推送资源包，并且「一直吊着该阶段
@@ -207,22 +392,57 @@ function startBot(username) {
       recordExitReason(username, reason || 'socketClosed', 'end');
       bot._exitRecorded = true;
     }
+    // 必须先清采集器（它要靠 bots[name] 找定时器），再摘掉实例。
+    // 这个 delete 不能省：少了它，机器人掉线后 startbot 会一直回 409
+    // 「已有实例在运行」，用户就再也拉不起来了。
+    stopStatusCollector(username);
+    delete bots[username];
+
+    const why = reason || '未知';
+    broadcast(username, [{ botname: username, data: [{ chat: `[系统] ${username} 已断开连接: ${why}` }] }]);
+    broadcast(username, [{ botname: username, data: [{ bot_offline: true, reason: why }] }]);
   });
 
-  // Listen for /server command responses to determine current server
+  // ── 单一 message 处理器：/server 检测 + 邦国信息累积 + 广播 ──
+  // 以前这里只做 /server 匹配，而聊天广播挂在各个连接分支里（每来一条
+  // 连接就挂一份，且从不摘除）。现在统一到这里，只挂一次。
   bot._currentServer = null;
   bot._serverCheckResolve = null;
+  bot._status = emptyStatus();
+
   bot.on('message', (jsonMsg) => {
     const text = jsonMsg.toString();
-    const m = text.match(/You are currently connected to (\w+)/);
-    if (m) {
-      bot._currentServer = m[1];
-      if (bot._serverCheckResolve) {
-        bot._serverCheckResolve(m[1]);
-        bot._serverCheckResolve = null;
-      }
+    try { handleStatusMessage(username, bot, text); } catch (e) {
+      console.warn(`[${username}] 状态解析异常: ${e.message}`);
+    }
+    broadcast(username, [{ botname: username, data: [{ chat: `[消息] ${text}` }] }]);
+  });
+
+  bot.on('chat', (who, message) => {
+    broadcast(username, [{ botname: username, data: [{ chat: `[聊天] ${who}: ${message}` }] }]);
+  });
+
+  // ── 地图数据（含二维码大图）──
+  // 同样从各连接分支收归到这里，避免重复注册
+  const emitMap = (b64, width) => {
+    sendMapIfNotMain(username, b64, width, (b, w2) => {
+      broadcast(username, [{ botname: username, data: [{ mapdata: b, width: w2 }] }]);
+    });
+  };
+  bot.on('map', (map) => {
+    if (map && map.data && map.data.length > 0) {
+      emitMap(map.data.toString('base64'), map.data.length > 20000 ? 256 : 128);
     }
   });
+  bot._client.on('map', (data) => {
+    if (data && data.data && data.columns > 0 && data.rows > 0) {
+      const buf = Buffer.isBuffer(data.data) ? data.data : Buffer.from(data.data);
+      if (buf.length > 0) emitMap(buf.toString('base64'), data.columns);
+    }
+  });
+
+  // ── 状态采集（位置/维度/服务器/邦国）──
+  startStatusCollector(username);
 
   return bot;
 }
@@ -275,6 +495,8 @@ function stopBot(username) {
   // 主动下线：直接写明原因，避免被 end 的 socketClosed 覆盖
   recordExitReason(username, '用户主动下线', 'stopped');
   bot._exitRecorded = true;
+  // 必须先于 delete bots[username] —— 采集器要靠 bots[name] 找到定时器
+  stopStatusCollector(username);
   try { bot.quit(); } catch (e) { /* ignore */ }
   delete bots[username];
   console.log(`Bot stopped: ${username}`);
@@ -340,9 +562,13 @@ try {
 
         ws.send(JSON.stringify({ code: 200, message: '机器人已成功启动并连接到服务器' }));
 
+        // 事件全部由 startBot 里的总线统一注册，这里只订阅，不再逐个 bot.on
+        subscribeBot(username, ws);
+        ws.on('close', () => unsubscribeWs(ws));
+
         bot.once('spawn', () => {
           console.log(`[${username}] spawned`);
-          ws.send(JSON.stringify([{ botname: username, data: [{ chat: `[系统] ${username} 已进入游戏` }] }]));
+          broadcast(username, [{ botname: username, data: [{ chat: `[系统] ${username} 已进入游戏` }] }]);
           // Select first hotbar slot (map is there)
           try {
             bot.setQuickBarSlot(0);
@@ -350,47 +576,6 @@ try {
           } catch (e) {
             console.log(`[${username}] setQuickBarSlot error:`, e.message);
           }
-        });
-        bot.on('chat', (who, message) => {
-          ws.send(JSON.stringify([{ botname: username, data: [{ chat: `[聊天] ${who}: ${message}` }] }]));
-        });
-        bot.on('message', (jsonMsg) => {
-          ws.send(JSON.stringify([{ botname: username, data: [{ chat: `[消息] ${jsonMsg.toString()}` }] }]));
-        });
-        bot.on('map', (map) => {
-          console.log(`[${username}] map event:`, map ? 'received' : 'null', map ? `data=${map.data ? map.data.length : 'no'}` : '');
-          if (map && map.data && map.data.length > 0) {
-            const b64 = map.data.toString('base64');
-            const w = map.data.length > 20000 ? 256 : 128;
-            sendMapIfNotMain(username, b64, w, (b, w2) => {
-              ws.send(JSON.stringify([{ botname: username, data: [{ mapdata: b, width: w2 }] }]));
-            });
-          }
-        });
-        // Listen for raw map data packet
-        bot._client.on('map', (data) => {
-          if (data && data.data && data.columns > 0 && data.rows > 0) {
-            const buf = Buffer.isBuffer(data.data) ? data.data : Buffer.from(data.data);
-            console.log(`[${username}] map data: ${buf.length} bytes, ${data.columns}x${data.rows}`);
-            if (buf.length > 0) {
-              const b64 = buf.toString('base64');
-              const w = data.columns;
-              // Check server before sending — only send if NOT on main
-              sendMapIfNotMain(username, b64, w, (b, w2) => {
-                ws.send(JSON.stringify([{ botname: username, data: [{ mapdata: b, width: w2 }] }]));
-              });
-            }
-          }
-        });
-        bot.on('error', (err) => {
-          console.error(`[${username}] error:`, err && err.message);
-          ws.send(JSON.stringify({ code: 401, message: `启动失败，连接已丢失：${err && err.message || '未知错误'}` }));
-        });
-        bot.on('end', (reason) => {
-          console.log(`[${username}] ended:`, reason);
-          delete bots[username];
-          ws.send(JSON.stringify([{ botname: username, data: [{ chat: `[系统] ${username} 已断开连接: ${reason || '未知'}` }] }]));
-          ws.send(JSON.stringify([{ botname: username, data: [{ bot_offline: true, reason: reason || '未知' }] }]));
         });
       });
     }
@@ -494,69 +679,69 @@ try {
           // 上次退出原因（供后台落库与前端展示）
           last_exit_reason: exit ? exit.reason : '',
           last_exit_type: exit ? exit.type : '',
-          last_exit_time: exit ? exit.time : ''
+          last_exit_time: exit ? exit.time : '',
+          // 实时状态缓存：位置/维度/所在服务器/邦国信息
+          status: bot && bot._status ? bot._status : null
         };
         ws.send(JSON.stringify(resp));
       });
     }
 
     // ─── /ws/api/botlogs ───
+    // 只做订阅。以前这里每来一条连接就 bot.on(...) 挂 5 个监听器且从不
+    // 摘除，开 N 次控制台就泄漏 5N 个。事件现在由 startBot 统一注册并投到
+    // 总线，这里订阅即可，连接关闭时按连接整体摘除。
     else if (path === '/ws/api/botlogs') {
       ws.send(JSON.stringify({ ok: true, msg: 'connected to botlogs API' }));
       ws.on('message', (data) => {
         let msg;
         try { msg = JSON.parse(data); } catch (_) { ws.send(JSON.stringify({ code: 400 })); return; }
-        const username = msg.username;
+        const username = msg.username || msg.botname;
         if (!username) { ws.send(JSON.stringify({ code: 400, message: 'username required' })); return; }
         const bot = bots[username];
         if (!bot) {
           ws.send(JSON.stringify({ code: 404, message: 'bot not running' }));
           return;
         }
+        subscribeBot(username, ws);
+        ws.on('close', () => unsubscribeWs(ws));
         ws.send(JSON.stringify({ code: 200, message: 'monitoring started' }));
-        // Forward all bot events to this WS connection
-        const fwd = (evt) => {
-          try { ws.send(JSON.stringify(evt)); } catch (_) {}
-        };
-        bot.on('chat', (who, message) => {
-          fwd([{ botname: username, data: [{ chat: `[聊天] ${who}: ${message}` }] }]);
-        });
-        bot.on('message', (jsonMsg) => {
-          fwd([{ botname: username, data: [{ chat: `[消息] ${jsonMsg.toString()}` }] }]);
-        });
-        bot.on('map', (map) => {
-          console.log(`[${username}] botlogs map event:`, map ? 'received' : 'null');
-          if (map && map.data && map.data.length > 0) {
-            const b64 = map.data.toString('base64');
-            const w = map.data.length > 20000 ? 256 : 128;
-            sendMapIfNotMain(username, b64, w, (b, w2) => {
-              fwd([{ botname: username, data: [{ mapdata: b, width: w2 }] }]);
-            });
-          }
-        });
-        // Listen for raw map data packet (works for Minecraft 1.21.4)
-        bot._client.on('map', (data) => {
-          if (data && data.data && data.columns > 0 && data.rows > 0) {
-            const buf = Buffer.isBuffer(data.data) ? data.data : Buffer.from(data.data);
-            console.log(`[${username}] botlogs map data: ${buf.length} bytes, ${data.columns}x${data.rows}`);
-            if (buf.length > 0) {
-              const b64 = buf.toString('base64');
-              const w = data.columns;
-              // Check server before sending — only send if NOT on main
-              sendMapIfNotMain(username, b64, w, (b, w2) => {
-                fwd([{ botname: username, data: [{ mapdata: b, width: w2 }] }]);
-              });
-            }
-          }
-        });
-        bot.on('end', (reason) => {
-          fwd([{ botname: username, data: [{ chat: `[系统] ${username} 已断开连接: ${reason || '未知'}` }] }]);
-          fwd([{ botname: username, data: [{ bot_offline: true, reason: reason || '未知' }] }]);
-        });
-        ws.on('close', () => {
-          // Remove listeners by re-assigning noop — bot stays running
-        });
+        // 立刻回一份当前状态，前端不用等下一个采集周期
+        if (bot._status) {
+          try { ws.send(JSON.stringify([{ botname: username, data: [{ status: bot._status }] }])); } catch (_) {}
+        }
       });
+    }
+
+    // ─── /ws/api/events ───
+    // 全局订阅：一条连接收所有机器人的事件（含 status）。
+    // Go 服务端用它维持一条常驻订阅，再按归属扇出给各浏览器，
+    // 这样「巡护拉起的机器人」和「没开控制台的用户」都能收到数据。
+    else if (path === '/ws/api/events') {
+      ws.send(JSON.stringify({ ok: true, msg: 'connected to events API' }));
+      const watch = [];
+      const attach = (username) => {
+        if (watch.includes(username)) return;
+        subscribeBot(username, ws);
+        watch.push(username);
+      };
+      ws.on('message', (data) => {
+        let msg;
+        try { msg = JSON.parse(data); } catch (_) { ws.send(JSON.stringify({ code: 400 })); return; }
+        // { usernames:[...] } 订阅指定机器人；{ all:true } 订阅当前所有 + 后续新增
+        if (Array.isArray(msg.usernames)) {
+          msg.usernames.forEach(attach);
+        }
+        if (msg.all) {
+          ws._watchAll = true;
+          Object.keys(bots).forEach(attach);
+        }
+        ws.send(JSON.stringify({ code: 200, message: 'subscribed', watching: watch.slice() }));
+      });
+      // 订阅全部时，新启动的机器人也要自动纳入
+      ws._onBotStarted = (username) => { if (ws._watchAll) attach(username); };
+      eventWatchers.add(ws);
+      ws.on('close', () => { unsubscribeWs(ws); eventWatchers.delete(ws); });
     }
 
     else {

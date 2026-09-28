@@ -437,6 +437,10 @@ func main() {
 	// 机器人掉线后再也没有人管它 —— 而「自动重连」本来应该是常驻能力。
 	go autoReconnectLoop(db, envVars["AUTO_RECONNECT_INTERVAL"])
 
+	// 常驻订阅 JS 节点的全局事件流，把位置/维度/服务器/邦国信息落库并
+	// 推给浏览器。前端只开一条 /ws/api/stream，切页面不断开。
+	go jsEventsLoop(db)
+
 	mux := http.NewServeMux()
 
 	// --- Logging middleware ---
@@ -1244,6 +1248,9 @@ func main() {
 			Status         string `json:"status"`
 			AutoRestore    bool   `json:"auto_restore"`
 			AutoReconnect  bool   `json:"auto_reconnect"`
+			// 实时状态缓存（位置/维度/所在服务器/邦国信息）
+			StatusJSON     string `json:"status_json"`
+			StatusTime     string `json:"status_time"`
 			LastExitReason string `json:"last_exit_reason"`
 			LastExitType   string `json:"last_exit_type"`
 			LastExitTime   string `json:"last_exit_time"`
@@ -1260,6 +1267,8 @@ func main() {
 				LastExitReason: b.LastExitReason,
 				LastExitType:   b.LastExitType,
 				LastExitTime:   b.LastExitTime,
+				StatusJSON:     mustBotStatusJSON(b.Username),
+				StatusTime:     mustBotStatusTime(b.Username),
 			})
 		}
 
@@ -2168,6 +2177,122 @@ func main() {
 		}
 	})
 
+	// --- WebSocket: /ws/api/stream : 全量机器人实时状态流 ---
+	//
+	// 与 /ws/api/connectbot 的区别：connectbot 是「单个机器人的控制台」，
+	// 带历史日志和地图，页面一关就断；stream 是「我名下所有机器人的状态」，
+	// 前端全程只开这一条，切页面、离开控制台都不影响数据的持续更新。
+	//
+	// 只推 status 与 bot_offline —— 聊天和地图仍走 connectbot，避免重复占带宽。
+	mux.HandleFunc("/ws/api/stream", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := wsUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("[WS] stream upgrade error: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		// 认证：浏览器 WebSocket 无法自定义请求头，令牌走首包
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		_, authMsg, err := conn.ReadMessage()
+		conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			return
+		}
+		var req struct {
+			AccessToken    string `json:"access_token"`
+			AccessTokenAlt string `json:"accesstoken"`
+		}
+		if err := json.Unmarshal(authMsg, &req); err != nil {
+			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "invalid json"})
+			return
+		}
+		tok := req.AccessToken
+		if tok == "" {
+			tok = req.AccessTokenAlt
+		}
+		tok = extractAccessToken(r, tok)
+		if tok == "" {
+			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "access_token required"})
+			return
+		}
+
+		token, err := jwt.Parse(tok, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			conn.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+		claims, _ := token.Claims.(jwt.MapClaims)
+		jhtUID, _ := claims["jht_uid"].(string)
+		if jhtUID == "" {
+			conn.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		// 该用户名下的机器人构成转发白名单。
+		// 这是安全边界：别人的机器人状态绝不能流到这条连接上。
+		owned, err := getBotsByUser(globalDB, jhtUID)
+		if err != nil {
+			conn.WriteJSON(map[string]interface{}{"code": 502, "message": "读取机器人列表失败"})
+			return
+		}
+		allowed := make(map[string]bool, len(owned))
+		for _, b := range owned {
+			allowed[b.Username] = true
+		}
+
+		sub := &botStreamSub{
+			conn: conn,
+			bots: allowed,
+			send: make(chan []byte, 128),
+			done: make(chan struct{}),
+		}
+		addBotStreamSub(sub)
+		defer removeBotStreamSub(sub)
+
+		// 所有写出都走 channel，由 writeLoop 独占写这条连接。
+		// gorilla/websocket 不允许多 goroutine 并发写，直接 conn.WriteJSON
+		// 会和 writeLoop 里的心跳 ping 撞车。
+		if ack, e := json.Marshal(map[string]interface{}{
+			"code": 200, "message": "subscribed", "bots": len(allowed),
+		}); e == nil {
+			sub.push(ack)
+		}
+		// 先补一遍缓存状态，页面不必干等下一个采集周期
+		for _, b := range owned {
+			js, ts := botStatusRow(globalDB, b.Username)
+			if js == "" || !json.Valid([]byte(js)) {
+				continue
+			}
+			out, e := json.Marshal(map[string]interface{}{
+				"botname": b.Username,
+				"data":    []map[string]interface{}{{"status": json.RawMessage(js), "status_time": ts}},
+			})
+			if e == nil {
+				sub.push(out)
+			}
+		}
+
+		go sub.writeLoop()
+
+		// 读循环只用于感知断开；pong 会延长读超时
+		conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		conn.SetPongHandler(func(string) error {
+			conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+			return nil
+		})
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+
 	// --- WebSocket: /ws/api/stopbot : 关闭机器人 ---
 	mux.HandleFunc("/ws/api/stopbot", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := wsUpgrader.Upgrade(w, r, nil)
@@ -2324,6 +2449,8 @@ func migrate(db *sql.DB) error {
 		auto_restore INTEGER DEFAULT 1,
 		auto_reconnect INTEGER DEFAULT 1,
 		manual_stop INTEGER DEFAULT 0,
+		status_json TEXT DEFAULT '',
+		status_time TEXT DEFAULT '',
 		last_exit_reason TEXT DEFAULT '',
 		last_exit_type TEXT DEFAULT '',
 		last_exit_time TEXT DEFAULT ''
@@ -2336,6 +2463,10 @@ func migrate(db *sql.DB) error {
 	db.Exec("ALTER TABLE bots ADD COLUMN auto_reconnect INTEGER DEFAULT 1")
 	// manual_stop: 1 表示用户主动下线过，自动重连巡护要放过它
 	db.Exec("ALTER TABLE bots ADD COLUMN manual_stop INTEGER DEFAULT 0")
+	// status_json: JS 节点上报的实时状态（位置/维度/所在服务器/邦国信息）
+	// 落库后即使没人开着控制台、或用户换了页面，卡片也能显示最近一次状态
+	db.Exec("ALTER TABLE bots ADD COLUMN status_json TEXT DEFAULT ''")
+	db.Exec("ALTER TABLE bots ADD COLUMN status_time TEXT DEFAULT ''")
 	// 上次退出原因（老库升级用，列已存在时 ALTER 会报错，忽略即可）
 	db.Exec("ALTER TABLE bots ADD COLUMN last_exit_reason TEXT DEFAULT ''")
 	db.Exec("ALTER TABLE bots ADD COLUMN last_exit_type TEXT DEFAULT ''")
