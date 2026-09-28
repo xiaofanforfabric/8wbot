@@ -456,26 +456,48 @@ function startBot(username) {
     port: SERVER_PORT,
     username: username,
     version: SERVER_VERSION,
-    // ── 关键：限制物理补帧 ──
+    // ── 限制原版 physics 的补帧上限 ──
     //
-    // mineflayer 的物理循环是 setInterval(50ms)，但 setInterval 不保证准时。
-    // 一旦 Node 卡住（GC、别的机器人、网络回调），deltaSeconds 变大，
-    // 它就用一个 while 循环把欠下的 tick 一次性补上：
+    // 说明：下面 plugins:{physics:false} 之后原版 physics 根本不会加载，
+    // 所以这一项在当前配置下是空转。保留它是因为一旦哪天回退到不带
+    // useCustomPhysics 的模式，它立刻就有用 —— 那种模式下原版 physics
+    // 会用 while 循环把欠下的 tick 一次性补上（默认上限 4），
+    // 每补一 tick 多发一个移动包。
     //
-    //   while (timeAccumulator >= PHYSICS_TIMESTEP) { tickPhysics(now); ... }
-    //
-    // 每补一 tick 就调一次 updatePosition，也就多发一个移动包。
-    // 默认上限是 4，所以一秒内可能发出远超 20 个包 —— 服务器 tick 是
-    // 20/秒，超出的部分在 GrimAC 眼里就是非法的，判 flying。
-    //
-    // 实测日志佐证：机器人刚登录、只发了一条 /u info（完全没在走路），
-    // packets 三秒内涨到 123，约 41 包/秒，正好是正常值的两倍，
-    // 随后被 GrimAC 以 "spamming invalid packets, 101 cancelled
-    // within a second" 踢掉。
-    //
-    // 设成 1：任何时候一帧最多补一个 tick，发包率钉死在 20/秒。
-    // 代价是服务器卡顿时物理走慢，但不会被踢 —— 这个交换划算。
-    maxCatchupTicks: 1
+    // 注意别把它当成这次的修复：实测加了这个参数之后发包率照旧
+    // （29 秒 1423 个包 ≈ 49 包/秒）。真正的病因是双循环，不是补帧。
+    maxCatchupTicks: 1,
+      // ── 关键：禁掉原版 physics 插件，让 reworked 独占发包权 ──
+      //
+      // 这是「双循环发包」的根治。证据链：
+      //
+      //   mineflayer/lib/plugins/physics.js:
+      //     let doPhysicsTimer = null           ← 闭包私有变量
+      //     setInterval(doPhysics, 50)          ← 一直在跑
+      //
+      //       if (bot.physicsEnabled && shouldUsePhysics) {
+      //         physics.simulatePlayer(...)       ← reworked 把它关了
+      //         bot.emit("physicsTick")
+      //       }
+      //       if (shouldUsePhysics) {
+      //         updatePosition(now)               ← ★ 在 if 外面！照发不误
+      //       }
+      //
+      //   @miner-org/mineflayer-physics-reworked:
+      //     bot.physicsEnabled = false          ← 以为这样就能让原版闭嘴
+      //     setInterval(doPhysics, 50)          ← 它也起了一个
+      //     clearInterval(自己的 doPhysicsTimer) ← 只能清自己的
+      //
+      // 原版那个定时器是闭包私有的，外部代码根本拿不到引用，
+      // 所以 reworked 永远停不掉它。结果是两个循环各发一份移动包，
+      // 发包率翻倍 —— 这正是日志里 41-64 包/秒的来源
+      //（服务器 tick 只有 20/秒，超出的部分 GrimAC 判 flying）。
+      //
+      // 改成不加载原版 physics：
+      //   - 只有 reworked 发 position 包，回到 20/秒
+      //   - physicsTick 事件由 reworked 自己 emit，自产自销
+      //   - 全库只有 creative.js 依赖 bot.physics，生存模式用不到
+    plugins: { physics: false },
     });
   bots[username] = bot;
   notifyBotStarted(username);
