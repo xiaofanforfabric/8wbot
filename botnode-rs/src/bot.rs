@@ -22,6 +22,12 @@ use crate::claimqueue::{ClaimQueue, QueueEvent};
 use crate::protocol::{EventData, claim_event, log_event, status_event};
 use crate::status::{self, Pos, Status};
 
+/// 询问当前子服的间隔。
+///
+/// 与原 JS 版的 `STATUS_SERVER_MS` 默认值一致（60 秒）。子服切换不频繁，
+/// 一分钟一次足够，也不会在服务器上刷出多余的指令。
+const SERVER_ASK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// 位置推送的最小间隔。
 ///
 /// 与原 JS 版的 `STATUS_POS_MS` 默认值一致（5 秒）。位置【变化】时才真正
@@ -61,6 +67,8 @@ pub struct Bot {
     /// 而队列自己管理 running/cursor 状态，每次提交重用同一个实例比反复
     /// 新建更简单，也让「刷新网页后还原进度」能拿到正在跑的那份快照。
     queue: Arc<ClaimQueue>,
+    /// 上次发 `/server` 的时间。
+    last_server_ask: parking_lot::Mutex<std::time::Instant>,
     /// 上次推送位置的时间。用于限频。
     last_pos_push: parking_lot::Mutex<std::time::Instant>,
     /// 上次推送出去的位置与维度。与当前相同就不重复推。
@@ -130,6 +138,7 @@ impl Bot {
             alive,
             kingdom: RwLock::new(None),
             claims: AtomicU64::new(0),
+            last_server_ask: parking_lot::Mutex::new(std::time::Instant::now()),
             last_pos_push: parking_lot::Mutex::new(std::time::Instant::now()),
             last_pos_sent: parking_lot::Mutex::new((None, None)),
             death_reported: AtomicBool::new(false),
@@ -189,6 +198,31 @@ impl Bot {
     fn push_status(&self) {
         let snapshot = self.status();
         self.emit(status_event(&snapshot));
+    }
+
+    /// 定期发 `/server` 查询当前所在子服。
+    ///
+    /// 原 JS 版每 60 秒发一次（`STATUS_SERVER_MS`），我漏了这一步 ——
+    /// 所以 `status.server` 永远是 null，前端「所在子服」一栏一直显示
+    /// 「—」。
+    ///
+    /// 用处不只是显示：`server` 能告诉运维机器人是在主世界、资源世界
+    /// 还是卡在认证大厅（认证大厅回的是 `auth`）。排查「机器人为什么不动」
+    /// 时这是第一条线索。
+    fn maybe_ask_server(&self) {
+        let now = std::time::Instant::now();
+        let mut last = self.last_server_ask.lock();
+        if now.duration_since(*last) < SERVER_ASK_INTERVAL {
+            return;
+        }
+        *last = now;
+        drop(last);
+
+        // 只在真的连上之后问。没连上时发消息不会有回应，只是白白刷日志。
+        if !self.is_alive() {
+            return;
+        }
+        let _ = self.say("/server");
     }
 
     /// 位置变化时才推状态帧。
@@ -630,6 +664,7 @@ async fn handle(
             // 「移动时能看到它在动」。
             bot.sync_position();
             bot.maybe_push_position();
+            bot.maybe_ask_server();
         }
         _ => {}
     }
