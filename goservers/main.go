@@ -1386,7 +1386,7 @@ func main() {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "message": "db error"})
 			return
 		}
-		if vbot == nil || vbot.Belong != jhtUID {
+		if vbot == nil || !canControlBot(jhtUID, r, vbot) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权验证"})
 			return
 		}
@@ -1457,7 +1457,7 @@ func main() {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "message": "db error"})
 			return
 		}
-		if vbot == nil || vbot.Belong != jhtUID {
+		if vbot == nil || !canControlBot(jhtUID, r, vbot) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人已不属于你（可能已被其他用户重新认领），请回到列表重新确认归属"})
 			return
 		}
@@ -1645,7 +1645,7 @@ func main() {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 404, "message": "不存在此机器人，请确认用户名"})
 			return
 		}
-		if bot.Belong != jhtUID {
+		if !canControlBot(jhtUID, r, bot) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
@@ -1746,7 +1746,7 @@ func main() {
 		}
 
 		bot, err := findBotByUsername(globalDB, req.BotName)
-		if err != nil || bot == nil || bot.Belong != jhtUID {
+		if err != nil || bot == nil || !canControlBot(jhtUID, r, bot) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
@@ -1816,7 +1816,7 @@ func main() {
 
 		// Check bot belongs to user
 		bot, err := findBotByUsername(globalDB, req.BotName)
-		if err != nil || bot == nil || bot.Belong != jhtUID {
+		if err != nil || bot == nil || !canControlBot(jhtUID, r, bot) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
@@ -1902,7 +1902,7 @@ func main() {
 		}
 
 		bot, err := findBotByUsername(globalDB, req.BotName)
-		if err != nil || bot == nil || bot.Belong != jhtUID {
+		if err != nil || bot == nil || !canControlBot(jhtUID, r, bot) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
@@ -2122,7 +2122,7 @@ func main() {
 
 		// Check bot belongs to user
 		bot, err := findBotByUsername(globalDB, auth.BotName)
-		if err != nil || bot == nil || bot.Belong != jhtUID {
+		if err != nil || bot == nil || !canControlBot(jhtUID, r, bot) {
 			bw.WriteJSON(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
@@ -2339,7 +2339,7 @@ func main() {
 
 		// Check bot belongs to user
 		bot, err := findBotByUsername(globalDB, req.BotName)
-		if err != nil || bot == nil || bot.Belong != jhtUID {
+		if err != nil || bot == nil || !canControlBot(jhtUID, r, bot) {
 			bw.WriteJSON(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
@@ -2588,7 +2588,7 @@ func main() {
 
 		// Check bot belongs to user
 		bot, err := findBotByUsername(globalDB, req.BotName)
-		if err != nil || bot == nil || bot.Belong != jhtUID {
+		if err != nil || bot == nil || !canControlBot(jhtUID, r, bot) {
 			bw.WriteJSON(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
@@ -2802,6 +2802,56 @@ func autoReconnectLoop(db *sql.DB, intervalEnv string) {
 //
 // 不存在「等级 >= N 就是管理员」这类规则：LevelID 是本站的展示性等级，
 // 不参与任何鉴权判断。真正的闸门只有这一个函数。
+// canControlBot 判定「某个已鉴权的用户能不能操作某个机器人」。
+//
+// 以前每个接口都自己写一遍 `bot.Belong != jhtUID`，一共 9 处。
+// 管理员要能控制他人机器人，就必须在这 9 处各加一个 isAdmin 分支 ——
+// 散落 9 份的权限判断迟早会漏掉一处，而漏掉的那处就是越权漏洞。
+// 所以统一收敛到这里，规则只有这一份。
+//
+// 管理员放行是刻意的：管理员的职责之一就是替用户处理出问题的机器人。
+func canControlBot(uid string, r *http.Request, bot *BotData) bool {
+	if bot == nil {
+		return false
+	}
+	if bot.Belong == uid {
+		return true
+	}
+	return isAdminJWT(r)
+}
+
+// isAdminJWT 从请求携带的 access_token 判断是不是管理员。
+//
+// 这里要再解析一次令牌，因为调用点手里只有 jhtUID 字符串，
+// 没有 UserData。失败一律当作非管理员 —— 权限判断的失败方向必须是拒绝。
+func isAdminJWT(r *http.Request) bool {
+	// 复用现成的取令牌逻辑（body 字段 → Authorization 头 → 查询参数），
+	// 不另造一套，免得两条路径对「令牌在哪」的理解不一致
+	tok := extractAccessToken(r, "")
+	if tok == "" {
+		return false
+	}
+	token, err := jwt.Parse(tok, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, jwt.ErrSignatureInvalid
+		}
+		return jwtSecret, nil
+	})
+	if err != nil || !token.Valid {
+		return false
+	}
+	claims, _ := token.Claims.(jwt.MapClaims)
+	uid, _ := claims["jht_uid"].(string)
+	if uid == "" {
+		return false
+	}
+	u, err := findUser(globalDB, uid)
+	if err != nil || u == nil {
+		return false
+	}
+	return isAdminUser(u)
+}
+
 func isAdminUser(u *UserData) bool {
 	// 规则：FanVerify 验证等级为 0 即管理员。
 	// 正常用户在 FanVerify 那边是 1 或 2，0 是人工改库才会出现的值。
