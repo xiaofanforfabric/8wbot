@@ -441,6 +441,10 @@ func main() {
 	// 推给浏览器。前端只开一条 /ws/api/stream，切页面不断开。
 	go jsEventsLoop(db)
 
+	// 周期性抓取 squaremap 地图数据（疆土多边形 / 王城坐标），
+	// 供控制台生成「在地图上查看」链接并解析机器人所处领地。
+	go squaremapLoop()
+
 	mux := http.NewServeMux()
 
 	// --- Logging middleware ---
@@ -1465,6 +1469,58 @@ func main() {
 	})
 
 	// --- POST /api/getbotstatus : 查询机器人状态 ---
+	// --- API: /api/mapinfo : 查询某个坐标的地图归属 ---
+	//
+	// 返回 squaremap 的世界列表、该坐标的网页链接、所处疆土、最近王城。
+	// 数据由 squaremapLoop 从 squaremap 的 settings.json / markers.json 缓存而来，
+	// 不在这里实时抓取，避免每次请求都打地图服务器。
+	mux.HandleFunc("/api/mapinfo", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 405, "msg": "method not allowed"})
+			return
+		}
+
+		var req struct {
+			AccessToken string  `json:"access_token"`
+			World       string  `json:"world"`
+			X           float64 `json:"x"`
+			Z           float64 `json:"z"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "invalid json"})
+			return
+		}
+		req.AccessToken = extractAccessToken(r, req.AccessToken)
+		if req.AccessToken == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token required"})
+			return
+		}
+
+		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		info, ok := mapLookup(req.World, req.X, req.Z)
+		if !ok {
+			// 缓存还没准备好（启动瞬间或地图不可达）
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 503, "message": "地图数据尚未就绪"})
+			return
+		}
+		info["code"] = "200"
+		json.NewEncoder(w).Encode(info)
+	})
+
 	mux.HandleFunc("/api/getbotstatus", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method != http.MethodPost {
