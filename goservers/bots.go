@@ -310,6 +310,9 @@ func handleNodeEvent(db *sql.DB, raw []byte) {
 			Status     json.RawMessage `json:"status"`
 			BotOffline bool            `json:"bot_offline"`
 			Reason     string          `json:"reason"`
+			// 扩地进度/结果。原样透传给浏览器，Go 不解析里面字段 ——
+			// 结构由 JS 节点与前端约定，中间层跟着解析容易两边不同步。
+			Expand json.RawMessage `json:"expand"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &events); err != nil {
@@ -334,6 +337,13 @@ func handleNodeEvent(db *sql.DB, raw []byte) {
 				out, _ := json.Marshal([]map[string]interface{}{{
 					"botname": ev.BotName,
 					"data":    []map[string]interface{}{{"bot_offline": true, "reason": d.Reason}},
+				}})
+				pushToBrowsers(ev.BotName, out)
+			}
+			if len(d.Expand) > 0 && string(d.Expand) != "null" {
+				out, _ := json.Marshal([]map[string]interface{}{{
+					"botname": ev.BotName,
+					"data":    []map[string]interface{}{{"expand": d.Expand}},
 				}})
 				pushToBrowsers(ev.BotName, out)
 			}

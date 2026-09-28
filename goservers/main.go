@@ -1800,6 +1800,101 @@ func main() {
 		json.NewEncoder(w).Encode(result)
 	})
 
+	// --- POST /api/expand : 网页操控扩地 ---
+	//
+	// 网页框选区块后调这里，Go 转发给内地 JS 节点的 /ws/api/expand。
+	// 鉴权与归属校验跟 /api/sendinfo 一致：必须持有有效 JWT 且机器人属于自己。
+	// 进度不从这里回，走 /ws/api/stream（JS 节点 → Go 事件流 → 浏览器）。
+	mux.HandleFunc("/api/expand", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 405, "msg": "method not allowed"})
+			return
+		}
+
+		var req struct {
+			AccessToken string  `json:"access_token"`
+			BotName     string  `json:"bot_name"`
+			Action      string  `json:"action"`   // "start"（默认）或 "stop"
+			Chunks      [][]int `json:"chunks"`   // [[cx,cz],...]
+			Occupied    [][]int `json:"occupied"` // 服务器已知已占区块，供接壤排序
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "invalid json"})
+			return
+		}
+		req.AccessToken = extractAccessToken(r, req.AccessToken)
+		if req.AccessToken == "" || req.BotName == "" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token and bot_name required"})
+			return
+		}
+
+		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+		claims, _ := token.Claims.(jwt.MapClaims)
+		jhtUID, _ := claims["jht_uid"].(string)
+		if jhtUID == "" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		bot, err := findBotByUsername(globalDB, req.BotName)
+		if err != nil || bot == nil || bot.Belong != jhtUID {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
+			return
+		}
+
+		isStop := req.Action == "stop"
+		if !isStop && len(req.Chunks) == 0 {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "message": "选区为空，请先在地图上框选区块"})
+			return
+		}
+
+		wsConn, _, err := jsDialer.Dial(getJSNodeURL("/ws/api/expand"), nil)
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "机器人服务异常，请联系管理员"})
+			return
+		}
+		defer wsConn.Close()
+
+		// 握手后 JS 节点先发一条 {ok:true,...}，读掉它再发正文
+		wsConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_, _, _ = wsConn.ReadMessage()
+		wsConn.SetReadDeadline(time.Time{})
+
+		payload := map[string]interface{}{"username": req.BotName}
+		if isStop {
+			payload["action"] = "stop"
+		} else {
+			payload["chunks"] = req.Chunks
+			payload["occupied"] = req.Occupied
+		}
+		sendReq, _ := json.Marshal(payload)
+		if err := wsConn.WriteMessage(websocket.TextMessage, sendReq); err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "扩地指令发送失败"})
+			return
+		}
+
+		wsConn.SetReadDeadline(time.Now().Add(8 * time.Second))
+		_, resp, err := wsConn.ReadMessage()
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "未收到扩地队列确认"})
+			return
+		}
+		var result map[string]interface{}
+		json.Unmarshal(resp, &result)
+		json.NewEncoder(w).Encode(result)
+	})
+
 	// --- GET /api/otp/qrcode : 扫码登录二维码代理 ---
 	//
 	// FanVerify 的 /openapi/genqrcode 要求把 accesstoken 放在 URL 查询参数里。

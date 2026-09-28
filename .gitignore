@@ -53,6 +53,11 @@ ssh_host_key
 **/*.sqlite
 *.sqlite3
 **/*.sqlite3
+# SQLite 的 WAL / 共享内存文件，运行时生成，绝不能进版本库
+*.sqlite-wal
+**/*.sqlite-wal
+*.sqlite-shm
+**/*.sqlite-shm
 
 ### Build artifacts ###
 *.exe

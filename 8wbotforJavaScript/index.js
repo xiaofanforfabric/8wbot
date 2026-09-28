@@ -2,11 +2,16 @@ require('dotenv').config();
 
 // launcher.js — 启动器，通过 WS /ws/api/startbot 启动机器人并实时推送日志
 const mineflayer = require('mineflayer');
+// 扩地寻路。这里用 mineflayer-pathfinder：Node 侧没有真 Baritone，
+// 而网页操控扩地是「逐块走近距离」，这个插件够用。
+const { pathfinder, goals } = require('mineflayer-pathfinder');
 const WebSocket = require('ws');
 const url = require('url');
 const fs = require('fs');
 const path = require('path');
 const ST = require('./status');
+const { ClaimQueue, orderSquare, parseClaimNotify, CHUNK_TIMEOUT_SEC, REPATH_AFTER_SEC } =
+  require('./claimqueue');
 
 // ════════════════════════════════════════════════════════════════
 // 上次退出原因记录
@@ -118,6 +123,77 @@ const SERVER_PORT = parseInt(process.env.MC_PORT) || 25565;
 const SERVER_VERSION = process.env.MC_VERSION || '1.21.4';
 
 const bots = {}; // username -> bot instance
+
+/** username -> ClaimQueue。网页操控扩地，每个机器人一条独立队列。 */
+const claimQueues = new Map();
+
+/** 玩家当前所在区块。JS 的 >> 对负数会先截断，必须先 floor 才是 Java 的 getBlockPos()>>4 语义 */
+function playerChunkOf(bot) {
+  if (!bot || !bot.entity || !bot.entity.position) return null;
+  const p = bot.entity.position;
+  return [Math.floor(p.x) >> 4, Math.floor(p.z) >> 4];
+}
+
+/** 扩地进度/结果推给订阅者 */
+function broadcastExpand(username, ev) {
+  broadcast(username, [{ botname: username, data: [{ expand: ev }] }]);
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 走到指定区块的中心。移植自参考实现的 moveToChunkWithBaritone：
+ * 设目标 → 每秒查一次是否已在该区块 → 寻路断了就重设目标 → 超时或中断返回 false。
+ */
+async function walkToChunk(bot, username, cx, cz) {
+  // 区块中心方块坐标
+  const bx = cx * 16 + 8;
+  const bz = cz * 16 + 8;
+  const q = claimQueues.get(username);
+
+  if (!bot.pathfinder) {
+    console.error(`[${username}] pathfinder 未加载，无法前往 (${cx},${cz})`);
+    return false;
+  }
+
+  try {
+    bot.pathfinder.setGoal(new goals.GoalXZ(bx, bz));
+  } catch (e) {
+    console.error(`[${username}] setGoal 失败: ${e.message}`);
+    return false;
+  }
+
+  const deadline = Date.now() + CHUNK_TIMEOUT_SEC * 1000;
+  let waited = 0;
+
+  while (Date.now() < deadline) {
+    await sleep(1000);
+    waited++;
+    if (!bot.entity) return false;
+    if (q && !q.running) return false; // 被中断
+
+    const pc = playerChunkOf(bot);
+    if (pc && pc[0] === cx && pc[1] === cz) {
+      try { bot.pathfinder.setGoal(null); } catch (_) {}
+      return true;
+    }
+
+    // 寻路中断（卡住/被取消）就重设目标。刚起步的前几秒不重设，
+    // 否则 setGoal 还没生效就被误判为中断。
+    if (waited > REPATH_AFTER_SEC) {
+      let moving = false;
+      try { moving = bot.pathfinder.isMoving(); } catch (_) {}
+      if (!moving) {
+        console.log(`[${username}] 前往 (${cx},${cz}) 寻路中断，重设目标`);
+        try { bot.pathfinder.setGoal(new goals.GoalXZ(bx, bz)); } catch (_) {}
+      }
+    }
+  }
+
+  try { bot.pathfinder.setGoal(null); } catch (_) {}
+  console.warn(`[${username}] 前往 (${cx},${cz}) 超时（${CHUNK_TIMEOUT_SEC}s）`);
+  return false;
+}
 
 // ════════════════════════════════════════════════════════════════
 // 事件总线
@@ -341,6 +417,22 @@ function startBot(username) {
   bots[username] = bot;
   notifyBotStarted(username);
 
+  // ── 扩地：加载寻路插件并建立队列 ──
+  try {
+    bot.loadPlugin(pathfinder);
+  } catch (e) {
+    console.warn(`[${username}] 寻路插件加载失败，扩地将不可用: ${e.message}`);
+  }
+  claimQueues.set(
+    username,
+    new ClaimQueue(bot, {
+      walkToChunk: (cx, cz) => walkToChunk(bot, username, cx, cz),
+      playerChunk: () => playerChunkOf(bot),
+      isUsable: () => !!bots[username] && !!bot.entity,
+      onEvent: (ev) => broadcastExpand(username, ev),
+    })
+  );
+
   // ── 资源包应答（必须处理，否则机器人根本进不了游戏）──
   // MC 1.20.3 起服务器会在 configuration 阶段推送资源包，并且「一直吊着该阶段
   // 直到客户端给出应答」。mineflayer 只抛出 resourcePack 事件、不会自动应答，
@@ -414,6 +506,17 @@ function startBot(username) {
     const text = jsonMsg.toString();
     try { handleStatusMessage(username, bot, text); } catch (e) {
       console.warn(`[${username}] 状态解析异常: ${e.message}`);
+    }
+    // 服务器开拓成功通知：疆土 (cx, cz) [bx, bz] 已为你的邦国开拓！
+    // 扩地队列靠它确认某区块真的开拓成功了。
+    try {
+      const notify = parseClaimNotify(text);
+      if (notify) {
+        const q = claimQueues.get(username);
+        if (q) q.markClaimed(notify.cx, notify.cz);
+      }
+    } catch (e) {
+      console.warn(`[${username}] 开拓通知解析异常: ${e.message}`);
     }
     broadcast(username, [{ botname: username, data: [{ chat: `[消息] ${text}` }] }]);
   });
@@ -744,6 +847,75 @@ try {
       ws.on('close', () => { unsubscribeWs(ws); eventWatchers.delete(ws); });
     }
 
+    // ─── /ws/api/expand ───
+    // 网页操控扩地。收 {username, chunks:[[cx,cz],...], occupied:[[cx,cz],...]} 开始，
+    // 或 {username, action:'stop'} 停止。进度通过订阅推给本连接。
+    // occupied 是服务器已知的已占区块，用于「接壤优先」排序。
+    else if (path === '/ws/api/expand') {
+      ws.send(JSON.stringify({ ok: true, msg: 'connected to 8wbot expand API' }));
+      // close 只挂一次，否则每条消息都挂一个新监听器
+      if (!ws._expandCloseHooked) {
+        ws._expandCloseHooked = true;
+        ws.on('close', () => unsubscribeWs(ws));
+      }
+      ws.on('message', (data) => {
+        let msg;
+        try { msg = JSON.parse(data); } catch (_) {
+          ws.send(JSON.stringify({ code: 400, message: 'invalid JSON' })); return;
+        }
+        const username = msg.username || msg.botname;
+        if (!username) { ws.send(JSON.stringify({ code: 400, message: 'username required' })); return; }
+
+        const bot = bots[username];
+        if (!bot) { ws.send(JSON.stringify({ code: 404, message: '机器人未运行，请先启动机器人' })); return; }
+
+        const q = claimQueues.get(username);
+        if (!q) { ws.send(JSON.stringify({ code: 500, message: '扩地队列未就绪' })); return; }
+
+        // 订阅这个机器人的数据流，进度才能推回去
+        subscribeBot(username, ws);
+
+        // ── 停止 ──
+        if (msg.action === 'stop' || msg.type === 'stop') {
+          const was = q.stop();
+          ws.send(JSON.stringify({
+            code: 200,
+            message: was ? '已停止扩地' : '当前没有正在执行的扩地任务',
+            stopped: was,
+          }));
+          broadcastExpand(username, Object.assign({ type: 'progress' }, q.snapshot('空闲')));
+          return;
+        }
+
+        // ── 开始 ──
+        const cells = Array.isArray(msg.chunks) ? msg.chunks : [];
+        if (cells.length === 0) {
+          ws.send(JSON.stringify({ code: 400, message: 'chunks 为空，没有可扩的区块' })); return;
+        }
+        const pc = playerChunkOf(bot);
+        if (!pc) {
+          ws.send(JSON.stringify({ code: 409, message: '机器人尚未进入世界（拿不到位置），请稍后重试' })); return;
+        }
+
+        const occupied = Array.isArray(msg.occupied) ? msg.occupied : [];
+        let ordered;
+        try {
+          ordered = orderSquare(cells, occupied, pc);
+        } catch (e) {
+          console.error(`[${username}] orderSquare 异常: ${e.message}`);
+          ordered = cells;
+        }
+
+        const ok = q.submit(ordered, occupied);
+        console.log(`[${username}] 扩地下发: ${cells.length} 块 → 排序后 ${ordered.length} 块，已占 ${occupied.length} 块`);
+        ws.send(JSON.stringify({
+          code: ok ? 200 : 400,
+          message: ok ? `已下发 ${ordered.length} 个区块，开始扩地` : '队列为空，未启动',
+          count: ordered.length,
+        }));
+      });
+    }
+
     else {
       ws.close(1002, 'unknown path');
     }
@@ -755,7 +927,7 @@ try {
   console.error('Failed to start WebSocket server (port busy?):', e && e.message);
 }
 
-console.log('Launcher ready — /ws/api/startbot and /ws/api/sendinfo');
+console.log('Launcher ready — /ws/api/startbot, /ws/api/sendinfo, /ws/api/expand');
 
 // Start SSH control server from ssh.js (if present)
 try {
