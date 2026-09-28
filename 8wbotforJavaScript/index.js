@@ -455,8 +455,28 @@ function startBot(username) {
     host: SERVER_HOST,
     port: SERVER_PORT,
     username: username,
-    version: SERVER_VERSION
-  });
+    version: SERVER_VERSION,
+    // ── 关键：限制物理补帧 ──
+    //
+    // mineflayer 的物理循环是 setInterval(50ms)，但 setInterval 不保证准时。
+    // 一旦 Node 卡住（GC、别的机器人、网络回调），deltaSeconds 变大，
+    // 它就用一个 while 循环把欠下的 tick 一次性补上：
+    //
+    //   while (timeAccumulator >= PHYSICS_TIMESTEP) { tickPhysics(now); ... }
+    //
+    // 每补一 tick 就调一次 updatePosition，也就多发一个移动包。
+    // 默认上限是 4，所以一秒内可能发出远超 20 个包 —— 服务器 tick 是
+    // 20/秒，超出的部分在 GrimAC 眼里就是非法的，判 flying。
+    //
+    // 实测日志佐证：机器人刚登录、只发了一条 /u info（完全没在走路），
+    // packets 三秒内涨到 123，约 41 包/秒，正好是正常值的两倍，
+    // 随后被 GrimAC 以 "spamming invalid packets, 101 cancelled
+    // within a second" 踢掉。
+    //
+    // 设成 1：任何时候一帧最多补一个 tick，发包率钉死在 20/秒。
+    // 代价是服务器卡顿时物理走慢，但不会被踢 —— 这个交换划算。
+    maxCatchupTicks: 1
+    });
   bots[username] = bot;
   notifyBotStarted(username);
 
