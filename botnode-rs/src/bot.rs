@@ -653,7 +653,8 @@ async fn handle(
             }
         }
         Event::Disconnect(reason) => {
-            bot.log("warn", format!("断开连接: {reason:?}"));
+            let why = describe_reason(&reason);
+            bot.log("warn", format!("断开连接: {why}"));
             bot.alive.store(false, Ordering::Relaxed);
             bot.push_offline(&describe_reason(&reason));
         }
