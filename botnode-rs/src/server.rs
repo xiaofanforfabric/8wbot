@@ -379,16 +379,20 @@ async fn handle_botlogs(mut ws: WebSocket, state: AppState) -> Result<()> {
         return Ok(());
     };
 
-    // 先补一帧当前状态：订阅者往往是刚打开控制台的界面，如果只转发之后
-    // 的事件，它要等到机器人下次说话才知道位置。
-    send_json(
-        &mut ws,
-        &EventFrame {
-            botname: req.username.clone(),
-            data: vec![status_event(&slot.bot.status())],
-        },
-    )
-    .await?;
+    // ⚠️ 这个 200 必须是【请求之后的第一帧】。
+    //
+    // Go 的 `BotLogs`（wsclient.go）在发完 username 之后只读一条消息，并且
+    // 要求它的 `code == 200`，否则返回 "botlogs: bot not running"。而
+    // `connectbot` 把那个错误当成「机器人离线」，直接给浏览器推
+    // `{"online": false}` —— 控制台于是显示离线并【禁用聊天输入框】。
+    //
+    // 我原来在这里先补了一帧 status，结果 Go 读到的是 status（没有 code
+    // 字段）→ Code 默认 0 → 判定未运行 → 控制台说离线。而机器人其实好好
+    // 在线，用户连验证码都发不出去，彻底卡死。
+    //
+    // 代价是没有「订阅即补一帧状态」的便利 —— 前端要等机器人下次推状态。
+    // 这个代价可以接受，而且前端本来就靠 `botOnline` 初值 true 显示在线。
+    send_json(&mut ws, &Response::ok("ok")).await?;
 
     forward_events(&mut ws, &slot.bot).await
 }

@@ -179,6 +179,25 @@ impl Bot {
         self.emit(status_event(&snapshot));
     }
 
+    /// 推一条「已离线」事件。
+    ///
+    /// 这是前端和 Go 判断机器人掉线的**唯一**信号 —— 它们不看 `online`
+    /// 字段的持续状态，只看这条一次性事件：
+    ///
+    /// - 前端 `ConsolePage.vue` 收到它就把状态置为离线、禁用聊天输入框
+    /// - `botStream.js` 收到它就把该机器人标记为 offline
+    /// - Go 的 `handleNodeEvent` 收到它就推给浏览器
+    ///
+    /// 我一开始漏了它。后果不只是「掉线时没提示」：前端 `botOnline` 的初值
+    /// 是 true 且只由这条事件驱动置 false，所以漏掉它意味着界面【永远显示
+    /// 在线】，机器人真掉线了用户也看不出来。
+    fn push_offline(&self, reason: &str) {
+        let mut m = EventData::new();
+        m.insert("bot_offline".into(), true.into());
+        m.insert("reason".into(), reason.to_string().into());
+        let _ = self.events.send(m);
+    }
+
     /// 发送一条聊天消息或命令。
     ///
     /// 以 `/` 开头就是命令 —— 协议里只有一个字段，由服务端区分，所以这里
@@ -543,10 +562,12 @@ async fn handle(
         Event::Disconnect(reason) => {
             bot.log("warn", format!("断开连接: {reason:?}"));
             bot.alive.store(false, Ordering::Relaxed);
+            bot.push_offline(&format!("{reason:?}"));
         }
         Event::ConnectionFailed(e) => {
             bot.log("error", format!("连接失败: {e}"));
             bot.alive.store(false, Ordering::Relaxed);
+            bot.push_offline(&e.to_string());
         }
         Event::Tick => {
             // 位置同步跟着 tick 走，但不必每 tick 都推给前端 —— 20 次/秒的
