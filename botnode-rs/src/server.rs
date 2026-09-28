@@ -768,11 +768,15 @@ mod tests {
     #[test]
     fn 帧形状是数组包对象() {
         let v = frame_json("xiaofanbot", log_event("info", "hi"));
-        // 前端按 `[{botname, data:[...]}]` 解析：这里检查 data 是数组而
-        // 不是对象 —— 后者会让前端的 `for (const item of msg.data)` 抛错。
-        assert!(v["data"].is_array());
-        assert_eq!(v["data"][0]["chat"], "[消息] hi");
-        assert_eq!(v["botname"], "xiaofanbot");
+        // 前端按 `[{botname, data:[...]}]` 解析。两层都要检查：
+        //   - 最外层是数组：前端第一句 `Array.isArray(data)` 靠它，
+        //     发成裸对象会掉进兜底分支，把整坨 JSON 打进控制台；
+        //   - `data` 是数组而不是对象：后者会让 `for (const item of
+        //     msg.data)` 抛错。
+        assert!(v.is_array(), "最外层必须是数组，实际: {v}");
+        assert!(v[0]["data"].is_array(), "data 必须是数组，实际: {v}");
+        assert_eq!(v[0]["data"][0]["chat"], "[消息] hi");
+        assert_eq!(v[0]["botname"], "xiaofanbot");
     }
 
     #[test]
@@ -780,6 +784,7 @@ mod tests {
         let st = crate::status::Status::default();
         let v = frame_json("bot", status_event(&st));
         // `status` 必须在 data[0] 下，前端取的是 `item.status`。
-        assert!(v["data"][0].get("status").is_some());
+        assert!(v.is_array(), "最外层必须是数组，实际: {v}");
+        assert!(v[0]["data"][0].get("status").is_some(), "实际: {v}");
     }
 }

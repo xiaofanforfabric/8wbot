@@ -135,12 +135,47 @@ pub struct EventsRequest {
 
 /// 推给订阅者的日志/状态帧。
 ///
-/// 形状是 `[{botname, data:[...]}]` —— 外面包一层数组是 JS 版既有的格式，
-/// 前端按这个形状解析，所以照搬。
-#[derive(Debug, Clone, Serialize)]
+/// # 最外层那层数组是必须的
+///
+/// 线上形状是 `[{botname, data:[...]}]`，**外面那层数组是契约的一部分**，
+/// 不是可选的包装。前端 `handleMessage` 的第一句就是：
+///
+/// ```js
+/// if (Array.isArray(data)) { for (const ev of data) ... ; return }
+/// if (!data || typeof data !== 'object') { appendLog(String(data)); return }
+/// ```
+///
+/// 发成裸对象 `{botname, data:[...]}` 时 `Array.isArray` 为 false，于是
+/// 整帧穿过所有正常分支、落到最后的 `appendLog(String(data))` —— 用户看到
+/// 控制台里是满屏的 `{"botname":"xiaofanbot","data":[...]}`。
+///
+/// 我一开始把注释写对了（「形状是 `[{...}]`」）却把结构体写成了裸对象，
+/// 注释和实现对不上，而编译器不会管注释。所以现在把数组包在序列化里 ——
+/// 让结构体本身无法表达错误形状，而不是靠每个发送点记得包一层。
+#[derive(Debug, Clone)]
 pub struct EventFrame {
     pub botname: String,
     pub data: Vec<EventData>,
+}
+
+impl serde::Serialize for EventFrame {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        // 单元素数组。用 seq 而不是 `[self]`，是为了不要求 Clone。
+        let mut seq = s.serialize_seq(Some(1))?;
+        seq.serialize_element(&InnerFrame {
+            botname: &self.botname,
+            data: &self.data,
+        })?;
+        seq.end()
+    }
+}
+
+/// `EventFrame` 的内层对象，只为上面那个 `Serialize` 而存在。
+#[derive(serde::Serialize)]
+struct InnerFrame<'a> {
+    botname: &'a str,
+    data: &'a [EventData],
 }
 
 /// 一帧里的一条事件。
@@ -243,10 +278,12 @@ mod tests {
             data: vec![log_event("info", "hello")],
         };
         let json = serde_json::to_value(&f).unwrap();
-        // 外层是对象，data 是数组 —— 前端按这个形状取。
-        assert_eq!(json["botname"], "xiaofanbot");
-        assert!(json["data"].is_array());
-        assert_eq!(json["data"][0]["chat"], "[消息] hello");
+        // 最外层必须是数组 —— 前端第一句就是 `Array.isArray(data)`，
+        // 裸对象会直接掉进兜底分支把整坨 JSON 打进控制台。
+        assert!(json.is_array(), "最外层必须是数组，实际: {json}");
+        assert_eq!(json[0]["botname"], "xiaofanbot");
+        assert!(json[0]["data"].is_array());
+        assert_eq!(json[0]["data"][0]["chat"], "[消息] hello");
     }
 
     /// 日志必须发 `chat` 字段，不能发 `{level, text, time}`。
