@@ -349,7 +349,6 @@ func main() {
 		log.Printf("CORS: 白名单 %v", corsOriginList)
 	}
 
-
 	// load or create jwt secret
 	secretPath := filepath.Join(baseDir, "jwt.secret")
 	if b, err := os.ReadFile(secretPath); err == nil && len(b) > 0 {
@@ -445,7 +444,6 @@ func main() {
 	// 推给浏览器。前端只开一条 /ws/api/stream，切页面不断开。
 	go jsEventsLoop(db)
 
-
 	mux := http.NewServeMux()
 
 	// --- Logging middleware ---
@@ -531,7 +529,7 @@ func main() {
 		// Call FanVerify API (GET request with query params)
 		apiURL := fmt.Sprintf("%s/openapi/user_verify?accesstoken=%s&uid=%s&pass_code=%s",
 			fanverifyAPIBase, fanverifyAccessToken, uidStr, passCode)
-		
+
 		resp, err := upstreamHTTPClient.Get(apiURL)
 		if err != nil {
 			log.Printf("fanverify api error: %v", err)
@@ -633,11 +631,22 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"code": 200,
 			"msg":  "Authentication successful",
+			// 前端的用户看板直接读这几个字段。以前只给了 fanverify_uid，
+			// 于是「账号 UID」显示成硬编码兜底值、「挂机配额」显示成默认 1，
+			// 全是假的。这里把真实值一并下发。
+			//
+			// 注意两个 level 不是一回事，别混：
+			//   level      —— FanVerify 那边的验证等级（社区身份）
+			//   level_id   —— 本站权限等级（userdata.level_id，SSH webuser 改的就是它）
 			"user_info": map[string]interface{}{
-				"fanverify_uid": userInfo.UID,
-				"create_time":   userInfo.RegTime,
-				"level":         levelInt,
-				"tag":           userInfo.Tag,
+				"jht_uid":                         u.JhtUID,
+				"fanverify_uid":                   userInfo.UID,
+				"create_time":                     userInfo.RegTime,
+				"level":                           levelInt,
+				"level_id":                        u.LevelID,
+				"remaining_bot_creation_quantity": u.RemainingBotCreationQuantity,
+				"is_admin":                        isAdminUser(u),
+				"tag":                             userInfo.Tag,
 			},
 			"accesstoken": tokStr,
 			"expires_at":  exp.Unix(),
@@ -985,11 +994,22 @@ func main() {
 
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"code": 200, "msg": "Authentication successful",
+			// 前端的用户看板直接读这几个字段。以前只给了 fanverify_uid，
+			// 于是「账号 UID」显示成硬编码兜底值、「挂机配额」显示成默认 1，
+			// 全是假的。这里把真实值一并下发。
+			//
+			// 注意两个 level 不是一回事，别混：
+			//   level      —— FanVerify 那边的验证等级（社区身份）
+			//   level_id   —— 本站权限等级（userdata.level_id，SSH webuser 改的就是它）
 			"user_info": map[string]interface{}{
-				"fanverify_uid": userInfo.UID,
-				"create_time":   userInfo.RegTime,
-				"level":         levelInt,
-				"tag":           userInfo.Tag,
+				"jht_uid":                         u.JhtUID,
+				"fanverify_uid":                   userInfo.UID,
+				"create_time":                     userInfo.RegTime,
+				"level":                           levelInt,
+				"level_id":                        u.LevelID,
+				"remaining_bot_creation_quantity": u.RemainingBotCreationQuantity,
+				"is_admin":                        isAdminUser(u),
+				"tag":                             userInfo.Tag,
 			},
 			"accesstoken": tokStr, "expires_at": exp.Unix(),
 		})
@@ -1069,7 +1089,26 @@ func main() {
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"code":            "200",
+			"code": "200",
+			// user_info 里必须放前端直接读的那份数据。
+			// 以前这里只给 user_id / level_uid / bots 几个平铺字段，
+			// 而前端的 userStore 取的是 res.user_info —— 取不到就整份丢弃，
+			// 于是用户看板上「账号 UID」显示成硬编码兜底值、「挂机配额」显示成
+			// 默认 1，全是假的。字段名对齐 /api/login 的那一份。
+			"user_info": map[string]interface{}{
+				"jht_uid":                         u.JhtUID,
+				"fanverify_uid":                   u.FanverifyUID,
+				"level":                           u.Level,
+				"level_id":                        u.LevelID,
+				"remaining_bot_creation_quantity": u.RemainingBotCreationQuantity,
+				"is_admin":                        isAdminUser(u),
+				"tag":                             u.Tag,
+				"status":                          u.Status,
+				"create_time":                     u.CreateTime,
+				"last_login_time":                 u.LastLoginTime,
+				"bots":                            botCount,
+			},
+			// 平铺字段保留，其它调用方可能还在用
 			"user_id":         u.JhtUID,
 			"level_uid":       u.LevelID,
 			"last_login_time": u.LastLoginTime,
@@ -1248,7 +1287,7 @@ func main() {
 
 		type botItem struct {
 			BotName        string `json:"bot_name"`
-			CreateTime     string `json:"create_time"`
+			CreateTime    string `json:"create_time"`
 			DSL            bool   `json:"DSL"`
 			Status         string `json:"status"`
 			AutoRestore    bool   `json:"auto_restore"`
@@ -1966,6 +2005,13 @@ func main() {
 	var wsUpgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
+
+	// 管理员通道。只挂 WS，不注册任何 HTTP 路由 ——
+	// 直接 curl 管理路径会落进 mux 兜底分支返回 404，连探测都做不到。
+	// 详见 admin.go 顶部说明。
+	registerAdminWS(mux, &wsUpgrader)
+	// 周期性把所有机器人位置推给在线管理员（全局地图）。没人在线时跳过查询。
+	go adminMapLoop()
 
 	// wsKeepAlive sets up ping/pong heartbeat on a WebSocket connection.
 	// Returns a stop function to clean up the goroutine.
@@ -2733,6 +2779,18 @@ func autoReconnectLoop(db *sql.DB, intervalEnv string) {
 	}
 }
 
+// isAdminUser 判定管理员。
+//
+// 规则只有一条：FanVerify 的 UID 为 0 即管理员。
+// 这是刻意借用 Linux 的约定 —— UID 0 就是 root。站长在 FanVerify 那边
+// 的 UID 是 0，所以他在本站也是管理员。
+//
+// 不存在「等级 >= N 就是管理员」这类规则：LevelID 是本站的展示性等级，
+// 不参与任何鉴权判断。真正的闸门只有这一个函数。
+func isAdminUser(u *UserData) bool {
+	return u != nil && u.FanverifyUID == 0
+}
+
 func findUser(db *sql.DB, uid string) (*UserData, error) {
 	// accesstoken / level_id / fanverify_uid / create_time / sim_level 都可能为 NULL ——
 	// 比如 SSH 的 webuser 只更新一部分列时。不套 COALESCE 的话 Scan 会直接报
@@ -3156,7 +3214,6 @@ func mapDataToPNG(b64Data string, width int) string {
 	}
 	return base64.StdEncoding.EncodeToString(buf.Bytes())
 }
-
 
 // ════════════════════════════════════════════════════════════════
 // 控制台历史日志
