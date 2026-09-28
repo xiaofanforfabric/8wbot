@@ -246,6 +246,19 @@ func pushToBrowsers(botname string, payload []byte) {
 	}
 }
 
+// dropBotFromSubs 把某个机器人从所有浏览器订阅的白名单里摘掉。
+//
+// 机器人删除后必须调这个：转发白名单是按机器人名缓存的，
+// 不摘掉的话每条订阅会一直挂着一个已经不存在的名字，
+// 用户重新建一个同名机器人时还会撞上旧的白名单状态。
+func dropBotFromSubs(botname string) {
+	botStreamMu.Lock()
+	for s := range botStreamSubs {
+		delete(s.bots, botname)
+	}
+	botStreamMu.Unlock()
+}
+
 // saveBotStatus 把 JS 节点上报的实时状态落库。
 // 落库的意义：用户切页面、关掉控制台、或者后端重启之后，卡片上仍然能显示
 // 最近一次已知的位置与邦国信息，而不是一片空白。

@@ -1336,6 +1336,121 @@ func main() {
 	})
 
 	// --- POST /api/verifybot : 验证机器人 ---
+	// --- POST /api/deletebot : 删除机器人（硬删除 + 先下线 + 退配额）---
+	//
+	// 权限：本人可删自己的，管理员可删任何人的（走 canControlBot）。
+	//
+	// 顺序很重要：先让 JS 节点把运行中的实例停掉，再从库里删。
+	// 反过来的话，机器人还在跑、但库里的记录已经没了 —— 那条连接就成了
+	// 无主的野进程，既不在列表里也停不掉，只能去 JS 节点上手动杀。
+	mux.HandleFunc("/api/deletebot", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 405, "msg": "method not allowed"})
+			return
+		}
+
+		var req struct {
+			AccessToken string `json:"access_token"`
+			BotName     string `json:"botname"`
+			BotNameAlt  string `json:"bot_name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "invalid json"})
+			return
+		}
+		if req.BotName == "" {
+			req.BotName = req.BotNameAlt
+		}
+		req.AccessToken = extractAccessToken(r, req.AccessToken)
+		if req.AccessToken == "" || req.BotName == "" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token and botname required"})
+			return
+		}
+
+		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+		claims, _ := token.Claims.(jwt.MapClaims)
+		jhtUID, _ := claims["jht_uid"].(string)
+		if jhtUID == "" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		bot, err := findBotByUsername(globalDB, req.BotName)
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "机器人服务异常，请联系管理员"})
+			return
+		}
+		if bot == nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 404, "message": "不存在此机器人"})
+			return
+		}
+		if !canControlBot(jhtUID, bot) {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权删除"})
+			return
+		}
+
+		// ── ① 先下线 ──
+		//
+		// 机器人本来就没在跑是常态（用户删一个早已停掉的），
+		// 这种情况不能算失败 —— JS 节点会回「机器人没有运行」，放过。
+		client := InitWSClient()
+		if err := client.StopBot(req.BotName); err != nil {
+			log.Printf("[DELBOT] %s 下线失败（按未运行处理，继续删除）: %v", req.BotName, err)
+		}
+
+		// ── ② 退配额给机器人的所有者 ──
+		//
+		// 退给 bot.Belong 而不是操作者 jhtUID：管理员替用户删机器人时，
+		// 配额应当回到那个用户头上，否则管理员能把别人的配额刷给自己。
+		owner := bot.Belong
+		if owner == "" {
+			owner = jhtUID
+		}
+		if u, err := findUser(globalDB, owner); err == nil && u != nil {
+			u.RemainingBotCreationQuantity++
+			if err := upsertUser(globalDB, u); err != nil {
+				log.Printf("[DELBOT] 退还配额失败 owner=%s: %v", owner, err)
+			}
+		} else if err != nil {
+			log.Printf("[DELBOT] 查用户失败 owner=%s: %v", owner, err)
+		}
+
+		// ── ③ 删库 ──
+		if err := deleteBot(globalDB, bot.Belong, req.BotName); err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "message": "删除失败: " + err.Error()})
+			return
+		}
+
+		// ── ④ 清掉订阅白名单里的残留 ──
+		//
+		// 浏览器那条 /ws/api/stream 的转发白名单是按机器人名缓存的，
+		// 不摘掉的话它会一直挂着一个已经不存在的名字。
+		dropBotFromSubs(req.BotName)
+
+		operator := "本人"
+		if jhtUID != bot.Belong {
+			operator = "管理员 " + jhtUID
+		}
+		log.Printf("[DELBOT] %s 删除了机器人 %s（owner=%s，配额已退还）", operator, req.BotName, bot.Belong)
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"code":    200,
+			"message": "机器人已删除",
+			"botname": req.BotName,
+		})
+	})
+
 	mux.HandleFunc("/api/verifybot", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method != http.MethodPost {
