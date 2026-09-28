@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -550,4 +551,81 @@ func (c *WSClient) SendCommandAndDetect(botname string, chatText string, timeout
 			}
 		}
 	}
+}
+
+// ════════════════════════════════════════════════════════════════
+// wsWriter —— 串行化对单个 WebSocket 连接的所有写操作
+//
+// 为什么必须有这一层：gorilla/websocket 明确禁止并发写，一旦有两个
+// goroutine 同时调用写方法，它会直接 panic("concurrent write to
+// websocket connection")。而 net/http 会把 handler 里的 panic 兜住并
+// 关掉连接，客户端只能看到一个没有任何解释的 1006。
+//
+// 原先 connectbot 正是这个结构：wsKeepAlive 的后台 goroutine 每 30 秒
+// 发一次 ping，同时主 handler（以及它派生的转发 goroutine）也在写，
+// 两者撞上就 panic —— 表现为控制台莫名其妙掉线且没有任何原因提示。
+// ════════════════════════════════════════════════════════════════
+
+type wsWriter struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
+	// broken 一旦置位就不再尝试写入，避免对已死连接反复报错刷日志
+	broken bool
+}
+
+func newWSWriter(conn *websocket.Conn) *wsWriter {
+	return &wsWriter{conn: conn}
+}
+
+func (w *wsWriter) write(fn func() error) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.broken {
+		return errors.New("websocket 已关闭")
+	}
+	if err := fn(); err != nil {
+		w.broken = true
+		return err
+	}
+	return nil
+}
+
+func (w *wsWriter) WriteJSON(v interface{}) error {
+	return w.write(func() error {
+		w.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		return w.conn.WriteJSON(v)
+	})
+}
+
+func (w *wsWriter) WriteMessage(messageType int, data []byte) error {
+	return w.write(func() error {
+		w.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		return w.conn.WriteMessage(messageType, data)
+	})
+}
+
+func (w *wsWriter) Ping() error {
+	return w.write(func() error {
+		w.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		return w.conn.WriteMessage(websocket.PingMessage, nil)
+	})
+}
+
+// CloseWith 先发一个正常的关闭帧再关连接。
+//
+// 直接 conn.Close() 是不发关闭帧的，浏览器一律看到 1006（异常关闭），
+// 完全拿不到原因。发一个关闭帧后，浏览器 onclose 里能拿到我们给的
+// code 和 reason，控制台就能把「为什么断」显示出来。
+func (w *wsWriter) CloseWith(code int, reason string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.broken {
+		w.conn.Close()
+		return
+	}
+	w.broken = true
+	msg := websocket.FormatCloseMessage(code, reason)
+	w.conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	_ = w.conn.WriteControl(websocket.CloseMessage, msg, time.Now().Add(3*time.Second))
+	w.conn.Close()
 }

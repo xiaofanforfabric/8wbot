@@ -1870,7 +1870,8 @@ func main() {
 
 	// wsKeepAlive sets up ping/pong heartbeat on a WebSocket connection.
 	// Returns a stop function to clean up the goroutine.
-	wsKeepAlive := func(conn *websocket.Conn) func() {
+	wsKeepAlive := func(w *wsWriter) func() {
+		conn := w.conn
 		const (
 			pongWait   = 60 * time.Second
 			pingPeriod = 30 * time.Second
@@ -1887,8 +1888,9 @@ func main() {
 			for {
 				select {
 				case <-ticker.C:
-					conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-					if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					// 必须走串行化写入：与 handler 的写并发会触发
+					// gorilla/websocket 的 panic，客户端表现为莫名其妙的 1006
+					if err := w.Ping(); err != nil {
 						return
 					}
 				case <-stop:
@@ -1905,8 +1907,12 @@ func main() {
 			log.Printf("[WS] upgrade error: %v", err)
 			return
 		}
-		defer conn.Close()
-		stopHeartbeat := wsKeepAlive(conn)
+		// 所有写操作都经过 wsWriter 串行化，避免与心跳 goroutine 并发写
+		bw := newWSWriter(conn)
+		// 断开时发一个正常的关闭帧。原先直接 conn.Close() 不发帧，
+		// 浏览器只能看到 1006（异常关闭），拿不到任何原因。
+		defer bw.CloseWith(websocket.CloseNormalClosure, "")
+		stopHeartbeat := wsKeepAlive(bw)
 		defer stopHeartbeat()
 
 		// Read auth message
@@ -1925,7 +1931,7 @@ func main() {
 			BotNameAlt     string `json:"bot_name"`
 		}
 		if err := json.Unmarshal(authMsg, &auth); err != nil {
-			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "invalid json"})
+			bw.WriteJSON(map[string]interface{}{"code": 400, "message": "invalid json"})
 			return
 		}
 		if auth.AccessToken == "" {
@@ -1936,7 +1942,7 @@ func main() {
 		}
 		auth.AccessToken = extractAccessToken(r, auth.AccessToken)
 		if auth.AccessToken == "" || auth.BotName == "" {
-			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "accesstoken and botname required"})
+			bw.WriteJSON(map[string]interface{}{"code": 400, "message": "accesstoken and botname required"})
 			return
 		}
 
@@ -1948,20 +1954,20 @@ func main() {
 			return jwtSecret, nil
 		})
 		if err != nil || !token.Valid {
-			conn.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			bw.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
 			return
 		}
 		claims, _ := token.Claims.(jwt.MapClaims)
 		jhtUID, _ := claims["jht_uid"].(string)
 		if jhtUID == "" {
-			conn.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			bw.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
 			return
 		}
 
 		// Check bot belongs to user
 		bot, err := findBotByUsername(globalDB, auth.BotName)
 		if err != nil || bot == nil || bot.Belong != jhtUID {
-			conn.WriteJSON(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
+			bw.WriteJSON(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
 
@@ -1989,7 +1995,7 @@ func main() {
 		historyB64 := base64.StdEncoding.EncodeToString([]byte(strings.Join(historyLines, "\n")))
 
 		// Send history to browser
-		conn.WriteJSON(map[string]interface{}{
+		bw.WriteJSON(map[string]interface{}{
 			"code": "200",
 			"data": []map[string]string{{"log": historyB64}},
 		})
@@ -2000,7 +2006,7 @@ func main() {
 		if err != nil {
 			// Bot offline — notify browser and keep connection open
 			log.Printf("[WS] connectbot botlogs (bot offline): %v", err)
-			conn.WriteJSON(map[string]interface{}{
+			bw.WriteJSON(map[string]interface{}{
 				"code":   "200",
 				"online": false,
 			})
@@ -2041,7 +2047,7 @@ func main() {
 							if d.MapData != "" && d.Width > 0 {
 								pngB64 := mapDataToPNG(d.MapData, d.Width)
 								if pngB64 != "" {
-									conn.WriteJSON(map[string]interface{}{
+									bw.WriteJSON(map[string]interface{}{
 										"type":    "map_image",
 										"botname": ev.BotName,
 										"image":   pngB64,
@@ -2084,7 +2090,7 @@ func main() {
 									if code, _ := rresult["code"].(float64); code == 200 {
 										log.Printf("[WS] auto-reconnect success for %s", name)
 										// Notify browser
-										conn.WriteJSON(map[string]interface{}{
+										bw.WriteJSON(map[string]interface{}{
 											"type": "auto_reconnect",
 											"msg":  "机器人已自动重连",
 										})
@@ -2095,7 +2101,7 @@ func main() {
 					}
 				}
 				// Forward to browser
-				if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				if err := bw.WriteMessage(websocket.TextMessage, msg); err != nil {
 					return
 				}
 				// Save to log file
@@ -2118,7 +2124,13 @@ func main() {
 				}
 			}
 		}()
+
+		// JS 链路断了（机器人掉线、内地节点重启等）。
+		// 原先这里直接返回，defer 关连接时不给任何原因，
+		// 用户在控制台只看到「通道已断开」，完全不知道发生了什么。
 		<-done
+		log.Printf("[WS] connectbot %s: JS 节点链路已断开", botName)
+		bw.CloseWith(websocket.CloseGoingAway, "机器人数据链路已断开（可能是机器人掉线或内地节点重启），请点「重连通道」")
 	})
 
 	// --- WebSocket: /ws/api/startbot : 启动机器人 ---
@@ -2128,8 +2140,11 @@ func main() {
 			log.Printf("[WS] startbot upgrade error: %v", err)
 			return
 		}
-		defer conn.Close()
-		stopHeartbeat := wsKeepAlive(conn)
+		// 与心跳共用同一个串行化写入器：各自 newWSWriter 的话锁不互斥，
+		// 心跳和 handler 的写仍会并发，照样 panic
+		bw := newWSWriter(conn)
+		defer bw.CloseWith(websocket.CloseNormalClosure, "")
+		stopHeartbeat := wsKeepAlive(bw)
 		defer stopHeartbeat()
 
 		// Read auth message
@@ -2145,14 +2160,14 @@ func main() {
 			BotName     string `json:"botname"`
 		}
 		if err := json.Unmarshal(authMsg, &req); err != nil {
-			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "invalid json"})
+			bw.WriteJSON(map[string]interface{}{"code": 400, "message": "invalid json"})
 			return
 		}
 		// 浏览器 WebSocket 无法自定义请求头，令牌通常由前端放在首包里；
 		// 同时兼容 Authorization 头与 ?token= 查询参数，方便脚本/调试调用。
 		req.AccessToken = extractAccessToken(r, req.AccessToken)
 		if req.AccessToken == "" || req.BotName == "" {
-			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "access_token and botname required"})
+			bw.WriteJSON(map[string]interface{}{"code": 400, "message": "access_token and botname required"})
 			return
 		}
 
@@ -2164,26 +2179,26 @@ func main() {
 			return jwtSecret, nil
 		})
 		if err != nil || !token.Valid {
-			conn.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			bw.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
 			return
 		}
 		claims, _ := token.Claims.(jwt.MapClaims)
 		jhtUID, _ := claims["jht_uid"].(string)
 		if jhtUID == "" {
-			conn.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			bw.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
 			return
 		}
 
 		// Check bot belongs to user
 		bot, err := findBotByUsername(globalDB, req.BotName)
 		if err != nil || bot == nil || bot.Belong != jhtUID {
-			conn.WriteJSON(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
+			bw.WriteJSON(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
 
 		// 归属验证闸门：未完成验证的机器人不允许上线
 		if bot.Status != "confirmed" {
-			conn.WriteJSON(map[string]interface{}{
+			bw.WriteJSON(map[string]interface{}{
 				"code":    403,
 				"message": "此机器人尚未完成归属验证，请先在机器人列表中点击「验证」完成归属确认",
 			})
@@ -2194,7 +2209,7 @@ func main() {
 		jsURL := getJSNodeURL("/ws/api/startbot")
 		jsConn, _, err := jsDialer.Dial(jsURL, nil)
 		if err != nil {
-			conn.WriteJSON(map[string]interface{}{"code": 502, "message": "bad gateway!!!无法连接到机器人服务"})
+			bw.WriteJSON(map[string]interface{}{"code": 502, "message": "bad gateway!!!无法连接到机器人服务"})
 			return
 		}
 		defer jsConn.Close()
@@ -2207,7 +2222,7 @@ func main() {
 		// Send start command
 		startReq, _ := json.Marshal(map[string]string{"username": req.BotName})
 		if err := jsConn.WriteMessage(websocket.TextMessage, startReq); err != nil {
-			conn.WriteJSON(map[string]interface{}{"code": 502, "message": "发送启动命令失败"})
+			bw.WriteJSON(map[string]interface{}{"code": 502, "message": "发送启动命令失败"})
 			return
 		}
 
@@ -2215,14 +2230,14 @@ func main() {
 		jsConn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		_, jsResp, err := jsConn.ReadMessage()
 		if err != nil {
-			conn.WriteJSON(map[string]interface{}{"code": 502, "message": "启动超时，未收到机器人响应"})
+			bw.WriteJSON(map[string]interface{}{"code": 502, "message": "启动超时，未收到机器人响应"})
 			return
 		}
 		var jsResult map[string]interface{}
 		json.Unmarshal(jsResp, &jsResult)
 
 		// Forward JS response to browser
-		conn.WriteJSON(jsResult)
+		bw.WriteJSON(jsResult)
 
 		// 用户主动上线：清掉「主动下线」标记，让自动重连巡护重新接管这个机器人。
 		// 409 也一并清除 —— 那表示机器人本来就在跑，同样不该被巡护当成下线处理。
@@ -2242,7 +2257,7 @@ func main() {
 					if err != nil {
 						return
 					}
-					if err := conn.WriteMessage(websocket.TextMessage, evtMsg); err != nil {
+					if err := bw.WriteMessage(websocket.TextMessage, evtMsg); err != nil {
 						return
 					}
 				}
@@ -2374,8 +2389,11 @@ func main() {
 			log.Printf("[WS] stopbot upgrade error: %v", err)
 			return
 		}
-		defer conn.Close()
-		stopHeartbeat := wsKeepAlive(conn)
+		// 与心跳共用同一个串行化写入器：各自 newWSWriter 的话锁不互斥，
+		// 心跳和 handler 的写仍会并发，照样 panic
+		bw := newWSWriter(conn)
+		defer bw.CloseWith(websocket.CloseNormalClosure, "")
+		stopHeartbeat := wsKeepAlive(bw)
 		defer stopHeartbeat()
 
 		// Read auth message
@@ -2391,14 +2409,14 @@ func main() {
 			BotName     string `json:"botname"`
 		}
 		if err := json.Unmarshal(authMsg, &req); err != nil {
-			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "invalid json"})
+			bw.WriteJSON(map[string]interface{}{"code": 400, "message": "invalid json"})
 			return
 		}
 		// 浏览器 WebSocket 无法自定义请求头，令牌通常由前端放在首包里；
 		// 同时兼容 Authorization 头与 ?token= 查询参数，方便脚本/调试调用。
 		req.AccessToken = extractAccessToken(r, req.AccessToken)
 		if req.AccessToken == "" || req.BotName == "" {
-			conn.WriteJSON(map[string]interface{}{"code": 400, "message": "access_token and botname required"})
+			bw.WriteJSON(map[string]interface{}{"code": 400, "message": "access_token and botname required"})
 			return
 		}
 
@@ -2410,20 +2428,20 @@ func main() {
 			return jwtSecret, nil
 		})
 		if err != nil || !token.Valid {
-			conn.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			bw.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
 			return
 		}
 		claims, _ := token.Claims.(jwt.MapClaims)
 		jhtUID, _ := claims["jht_uid"].(string)
 		if jhtUID == "" {
-			conn.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			bw.WriteJSON(map[string]interface{}{"code": 401, "message": "无效的access_token"})
 			return
 		}
 
 		// Check bot belongs to user
 		bot, err := findBotByUsername(globalDB, req.BotName)
 		if err != nil || bot == nil || bot.Belong != jhtUID {
-			conn.WriteJSON(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
+			bw.WriteJSON(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
 
@@ -2431,7 +2449,7 @@ func main() {
 		client := InitWSClient()
 		if err := client.StopBot(req.BotName); err != nil {
 			log.Printf("[WS] stopbot error: %v", err)
-			conn.WriteJSON(map[string]interface{}{"code": 502, "message": "关闭失败: " + err.Error()})
+			bw.WriteJSON(map[string]interface{}{"code": 502, "message": "关闭失败: " + err.Error()})
 			return
 		}
 
@@ -2441,7 +2459,7 @@ func main() {
 			log.Printf("[WS] 记录主动下线标记失败 %s: %v", req.BotName, err)
 		}
 
-		conn.WriteJSON(map[string]interface{}{"code": 200, "message": "机器人已断开"})
+		bw.WriteJSON(map[string]interface{}{"code": 200, "message": "机器人已断开"})
 	})
 
 	// --- Static file serving with config injection ---
