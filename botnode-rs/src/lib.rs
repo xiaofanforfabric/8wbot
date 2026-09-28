@@ -6,6 +6,7 @@
 
 pub mod bot;
 pub mod claimqueue;
+pub mod config;
 pub mod manager;
 pub mod protocol;
 pub mod server;

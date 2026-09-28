@@ -9,26 +9,37 @@
 //! 每个机器人因此有自己的线程和自己的 `current_thread` runtime，见
 //! `manager.rs` 文件头的说明。控制面用通道跟它们说话。
 //!
-//! ## 环境变量
+//! ## 配置
 //!
-//! - `MC_ADDRESS`   游戏服务器地址，默认 `bgjq.simpfun.cn:25565`
-//! - `CONTROL_ADDR` 本地监听地址，默认 `127.0.0.1:8088`
+//! 从 `.env` 和进程环境变量读取，变量名与原来的 JS 节点一致，现有那份
+//! `.env` 可以直接用：
 //!
-//! 监听地址默认只绑本机：这个端口能启停机器人、能代替它们说话，不该暴露。
+//! - `MC_HOST` / `MC_PORT`  游戏服务器，默认 `bgjq.simpfun.cn` / `25565`
+//! - `WS_PORT`              控制端口，默认 8088（只绑 127.0.0.1）
+//! - `INTERNAL_NODE_SECRET` 与 Go 后端共享的密钥，**不填则任何人可控制机器人**
+//!
+//! 详见 `config.rs`。监听地址默认只绑本机：这个端口能启停机器人、能代替
+//! 它们说话，不该暴露。
 
+use bgjq_bot::config::Config;
 use bgjq_bot::manager::Manager;
 use bgjq_bot::server::{self, AppState};
 use std::time::Duration;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-/// 游戏服务器地址。
-const DEFAULT_ADDRESS: &str = "bgjq.simpfun.cn:25565";
-
-/// 控制端口。绑 127.0.0.1 而不是 0.0.0.0 —— 见文件头。
-const DEFAULT_CONTROL: &str = "127.0.0.1:8088";
-
 fn main() {
+    // 先读配置再初始化日志 —— 顺序不能反。
+    //
+    // `.env` 里可能有 `RUST_LOG`，而 `EnvFilter::try_from_default_env()`
+    // 读的是进程环境变量。如果先初始化日志，那份 `.env` 里的日志级别就
+    // 永远不生效，表现为「我明明设了 debug 却什么都看不到」。
+    //
+    // 代价是配置载入那几条日志（「已载入 .env」）看不到 —— 可以接受，
+    // 因为它们在排查配置问题时才有用，而那时可以把 RUST_LOG 直接给到环境
+    // 变量里。
+    let cfg = Config::load();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -36,8 +47,21 @@ fn main() {
         )
         .init();
 
-    let address = std::env::var("MC_ADDRESS").unwrap_or_else(|_| DEFAULT_ADDRESS.to_string());
-    let control = std::env::var("CONTROL_ADDR").unwrap_or_else(|_| DEFAULT_CONTROL.to_string());
+    if cfg.secret_missing() {
+        // 用 error 而不是 warn：这不是「有点问题」，是任何能连到这个端口
+        // 的人都可以冒充机器人说话、启停它们。绑在 127.0.0.1 上降低了
+        // 风险，但反代通常会把公网流量引过来。
+        tracing::error!(
+            "INTERNAL_NODE_SECRET 未设置 —— 控制端口不受鉴权保护，任何能连上它的人都能操控机器人"
+        );
+    }
+
+    info!(
+        mc = %cfg.mc_address,
+        control = %cfg.control_addr,
+        auth = cfg.secret.is_some(),
+        "配置就绪"
+    );
 
     // 多线程：控制面只有网络 IO，不碰 Azalea 的 !Send 状态（每个机器人
     // 在自己的线程上，见 manager.rs）。
@@ -47,19 +71,19 @@ fn main() {
         .expect("无法建立 tokio runtime");
 
     rt.block_on(async move {
-        if let Err(e) = run(address, control).await {
+        if let Err(e) = run(cfg).await {
             tracing::error!("节点退出: {e}");
             std::process::exit(1);
         }
     });
 }
 
-async fn run(address: String, control: String) -> anyhow::Result<()> {
-    let manager = Manager::new(address.clone());
+async fn run(cfg: Config) -> anyhow::Result<()> {
+    let manager = Manager::new(cfg.mc_address.clone());
     let state = AppState::new(manager.clone());
 
-    let listener = tokio::net::TcpListener::bind(&control).await?;
-    info!(%address, %control, "机器人节点已启动");
+    let listener = tokio::net::TcpListener::bind(&cfg.control_addr).await?;
+    info!(mc = %cfg.mc_address, control = %cfg.control_addr, "机器人节点已启动");
 
     // 收到信号时把机器人一个个停掉再退出。
     //

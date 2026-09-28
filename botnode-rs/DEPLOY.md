@@ -28,19 +28,50 @@ cargo build --release
 
 产物：`target/release/bgjq-bot`（约 40 MB，已 strip）。
 
-## 3. 环境变量
+## 3. 配置：`.env` 或环境变量
 
-| 变量 | 必填 | 说明 |
-|---|---|---|
-| `INTERNAL_NODE_SECRET` | **是** | 与香港 Go 后端的同名变量填**同一个值** |
-| `MC_ADDRESS` | 否 | 默认 `bgjq.simpfun.cn:25565` |
-| `CONTROL_ADDR` | 否 | 默认 `127.0.0.1:8088` |
-| `RUST_LOG` | 否 | 默认 `info,azalea=warn,bevy=warn` |
+**两种都支持，变量名与原来的 JS 节点一致 —— 现有的
+`8wbotforJavaScript/.env` 可以直接拿来用，不用改。**
 
-`INTERNAL_NODE_SECRET` 不填的话节点会照常运行并打警告，但**任何人都能启停
-你的机器人** —— 这个端口能代替机器人说话。
+| 变量 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `INTERNAL_NODE_SECRET` | **是** | 无 | 与香港 Go 后端的同名变量填**同一个值** |
+| `MC_HOST` | 否 | `bgjq.simpfun.cn` | 游戏服务器地址 |
+| `MC_PORT` | 否 | `25565` | 游戏服务器端口 |
+| `MC_ADDRESS` | 否 | 由上面两个拼 | 想一次给全 `host:port` 时用这个 |
+| `WS_PORT` | 否 | `8088` | 控制端口（只绑 127.0.0.1） |
+| `CONTROL_ADDR` | 否 | `127.0.0.1:{WS_PORT}` | 想换绑定地址时用这个 |
+| `RUST_LOG` | 否 | `info,azalea=warn,bevy=warn` | 日志级别 |
+
+**优先级：进程环境变量 > `.env` 文件 > 内置默认值。**
+
+`.env` 的查找顺序是「当前目录 → 上一级 → 上两级」，所以从部署目录、
+`botnode-rs/` 或仓库根启动都能找到同一份。
+
+`INTERNAL_NODE_SECRET` 不填的话节点会照常运行，但会打一条 **error** 级别的
+警告 —— 任何能连到这个端口的人都能启停你的机器人、代替它们说话。
+
+### 用 .env（推荐，和 JS 节点一致）
+
+```bash
+# /opt/bgjq-bot/.env
+INTERNAL_NODE_SECRET=和香港那边一致的值
+MC_HOST=bgjq.simpfun.cn
+MC_PORT=25565
+WS_PORT=8889
+RUST_LOG=info,azalea=warn,bevy=warn
+```
+
+```bash
+chmod 600 /opt/bgjq-bot/.env     # 里面有密钥
+```
 
 ## 4. systemd 服务
+
+### 也可以走 systemd 的 EnvironmentFile
+
+用 `.env` 的话下面这份 `EnvironmentFile` 可以去掉；两种可以并存，环境变量
+优先。
 
 ```ini
 # /etc/systemd/system/bgjq-bot.service
