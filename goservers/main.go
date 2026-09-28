@@ -1976,22 +1976,10 @@ func main() {
 		os.MkdirAll(logsDir, 0755)
 		logFile := filepath.Join(logsDir, auth.BotName+".log")
 
-		// Load last 100 lines as base64 history
-		var historyLines []string
-		if f, err := os.Open(logFile); err == nil {
-			defer f.Close()
-			data, _ := io.ReadAll(f)
-			allLines := strings.Split(string(data), "\n")
-			start := 0
-			if len(allLines) > 100 {
-				start = len(allLines) - 100
-			}
-			for i := start; i < len(allLines); i++ {
-				if allLines[i] != "" {
-					historyLines = append(historyLines, allLines[i])
-				}
-			}
-		}
+		// 只取最后 100 行作为历史。只读文件末尾，不整读 ——
+		// 日志是只追加的，跑几个月后可能上百 MB，整读会在每次连控制台时
+		// 造成一次明显的内存尖峰。
+		historyLines := tailLogLines(logFile, historyLogLines)
 		historyB64 := base64.StdEncoding.EncodeToString([]byte(strings.Join(historyLines, "\n")))
 
 		// Send history to browser
@@ -2120,6 +2108,10 @@ func main() {
 							}
 						}
 						f.Close()
+						// 日志只追加、不轮转的话会无限涨下去，最终把磁盘写满，
+						// 而且每次读历史都要回溯一个巨大的文件。超过上限就裁剪，
+						// 只保留最近若干行。
+						trimLogFile(logFile)
 					}
 				}
 			}
@@ -3061,4 +3053,90 @@ func mapDataToPNG(b64Data string, width int) string {
 		return ""
 	}
 	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+
+// ════════════════════════════════════════════════════════════════
+// 控制台历史日志
+//
+// 上限必须前后端都有：后端限制「发多少」，前端限制「留多少」。
+// 只做一边的话，任何一条路径漏了都会把浏览器 DOM 撑爆。
+// ════════════════════════════════════════════════════════════════
+
+const (
+	// 连上控制台时最多回放多少条历史
+	historyLogLines = 100
+	// 日志文件超过这个大小就裁剪
+	maxLogFileBytes = 1 << 20 // 1 MiB
+	// 裁剪后保留多少行
+	maxLogFileLines = 5000
+	// tailLogLines 单次最多读多少字节。
+	// 这个值必须 >= maxLogFileBytes，否则裁剪时读不全 5000 行，
+	// 会出现「裁完还是那么大」的情况。
+	tailMaxRead = 1 << 20 // 1 MiB
+)
+
+// tailLogLines 读文件末尾的最后 n 行，不把整个文件读进内存。
+// 读取量本身也有上限，避免一个异常大的旧文件把内存吃掉。
+func tailLogLines(path string, n int) []string {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		return nil
+	}
+	size := st.Size()
+	start := int64(0)
+	truncated := false
+	if size > tailMaxRead {
+		start = size - tailMaxRead
+		truncated = true
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return nil
+	}
+	buf := make([]byte, size-start)
+	if _, err := io.ReadFull(f, buf); err != nil && err != io.ErrUnexpectedEOF {
+		return nil
+	}
+
+	lines := strings.Split(string(buf), "\n")
+	// 从中间截断的话第一行是半行，丢掉
+	if truncated && len(lines) > 0 {
+		lines = lines[1:]
+	}
+	// 文件末尾通常有个换行，Split 会多出一个空串。不去掉的话
+	// 「取最后 100 行」实际只会拿到 99 行。
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return lines
+}
+
+// trimLogFile 在日志文件超过 maxLogFileBytes 时只保留最近 maxLogFileLines 行。
+// 用「写临时文件 + rename」而不是原地截断，避免中途失败留下半个文件。
+func trimLogFile(path string) {
+	st, err := os.Stat(path)
+	if err != nil || st.Size() <= maxLogFileBytes {
+		return
+	}
+	lines := tailLogLines(path, maxLogFileLines)
+	if len(lines) == 0 {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+		os.Remove(tmp)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+	}
 }
