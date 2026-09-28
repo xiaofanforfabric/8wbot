@@ -1386,7 +1386,7 @@ func main() {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "message": "db error"})
 			return
 		}
-		if vbot == nil || !canControlBot(jhtUID, r, vbot) {
+		if vbot == nil || !canControlBot(jhtUID, vbot) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权验证"})
 			return
 		}
@@ -1457,7 +1457,7 @@ func main() {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "message": "db error"})
 			return
 		}
-		if vbot == nil || !canControlBot(jhtUID, r, vbot) {
+		if vbot == nil || !canControlBot(jhtUID, vbot) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人已不属于你（可能已被其他用户重新认领），请回到列表重新确认归属"})
 			return
 		}
@@ -1645,7 +1645,7 @@ func main() {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 404, "message": "不存在此机器人，请确认用户名"})
 			return
 		}
-		if !canControlBot(jhtUID, r, bot) {
+		if !canControlBot(jhtUID, bot) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
@@ -1746,7 +1746,7 @@ func main() {
 		}
 
 		bot, err := findBotByUsername(globalDB, req.BotName)
-		if err != nil || bot == nil || !canControlBot(jhtUID, r, bot) {
+		if err != nil || bot == nil || !canControlBot(jhtUID, bot) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
@@ -1816,7 +1816,7 @@ func main() {
 
 		// Check bot belongs to user
 		bot, err := findBotByUsername(globalDB, req.BotName)
-		if err != nil || bot == nil || !canControlBot(jhtUID, r, bot) {
+		if err != nil || bot == nil || !canControlBot(jhtUID, bot) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
@@ -1902,7 +1902,7 @@ func main() {
 		}
 
 		bot, err := findBotByUsername(globalDB, req.BotName)
-		if err != nil || bot == nil || !canControlBot(jhtUID, r, bot) {
+		if err != nil || bot == nil || !canControlBot(jhtUID, bot) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
@@ -2122,7 +2122,7 @@ func main() {
 
 		// Check bot belongs to user
 		bot, err := findBotByUsername(globalDB, auth.BotName)
-		if err != nil || bot == nil || !canControlBot(jhtUID, r, bot) {
+		if err != nil || bot == nil || !canControlBot(jhtUID, bot) {
 			bw.WriteJSON(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
@@ -2339,7 +2339,7 @@ func main() {
 
 		// Check bot belongs to user
 		bot, err := findBotByUsername(globalDB, req.BotName)
-		if err != nil || bot == nil || !canControlBot(jhtUID, r, bot) {
+		if err != nil || bot == nil || !canControlBot(jhtUID, bot) {
 			bw.WriteJSON(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
@@ -2588,7 +2588,7 @@ func main() {
 
 		// Check bot belongs to user
 		bot, err := findBotByUsername(globalDB, req.BotName)
-		if err != nil || bot == nil || !canControlBot(jhtUID, r, bot) {
+		if err != nil || bot == nil || !canControlBot(jhtUID, bot) {
 			bw.WriteJSON(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
 			return
 		}
@@ -2809,39 +2809,27 @@ func autoReconnectLoop(db *sql.DB, intervalEnv string) {
 // 散落 9 份的权限判断迟早会漏掉一处，而漏掉的那处就是越权漏洞。
 // 所以统一收敛到这里，规则只有这一份。
 //
+// 收的是已经鉴权过的 uid，不是 *http.Request。
+// 这一点很关键：WebSocket 接口的令牌在首包 body 里（浏览器 WS 设不了
+// Authorization 头），根本不在请求对象上。早先这里收 *http.Request 再去
+// 里面找令牌，于是控制台那条 WS 永远找不到令牌 —— 管理员被当成普通用户，
+// 进他人控制台照样 403。手里已经有 uid 了，直接拿来用。
+//
 // 管理员放行是刻意的：管理员的职责之一就是替用户处理出问题的机器人。
-func canControlBot(uid string, r *http.Request, bot *BotData) bool {
+func canControlBot(uid string, bot *BotData) bool {
 	if bot == nil {
 		return false
 	}
 	if bot.Belong == uid {
 		return true
 	}
-	return isAdminJWT(r)
+	return isAdminUID(uid)
 }
 
-// isAdminJWT 从请求携带的 access_token 判断是不是管理员。
+// isAdminUID 查库判断某个 uid 是不是管理员。
 //
-// 这里要再解析一次令牌，因为调用点手里只有 jhtUID 字符串，
-// 没有 UserData。失败一律当作非管理员 —— 权限判断的失败方向必须是拒绝。
-func isAdminJWT(r *http.Request) bool {
-	// 复用现成的取令牌逻辑（body 字段 → Authorization 头 → 查询参数），
-	// 不另造一套，免得两条路径对「令牌在哪」的理解不一致
-	tok := extractAccessToken(r, "")
-	if tok == "" {
-		return false
-	}
-	token, err := jwt.Parse(tok, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, jwt.ErrSignatureInvalid
-		}
-		return jwtSecret, nil
-	})
-	if err != nil || !token.Valid {
-		return false
-	}
-	claims, _ := token.Claims.(jwt.MapClaims)
-	uid, _ := claims["jht_uid"].(string)
+// 失败一律当作非管理员 —— 权限判断的失败方向必须是拒绝。
+func isAdminUID(uid string) bool {
 	if uid == "" {
 		return false
 	}
