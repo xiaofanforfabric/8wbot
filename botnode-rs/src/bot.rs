@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info};
 
+use crate::claimqueue::{ClaimQueue, QueueEvent};
 use crate::protocol::{EventData, claim_event, log_event, status_event};
 use crate::status::{self, Pos, Status};
 
@@ -40,11 +41,26 @@ pub struct Bot {
     /// 事件总线：机器人产出的日志、状态、开拓都从这里扇出。
     events: broadcast::Sender<EventData>,
     /// 连接是否还活着。用于 `/botstatus` 和停止后的判断。
-    alive: AtomicBool,
+    ///
+    /// 是 `Arc` 而不是裸的 `AtomicBool`：队列需要在自己的闭包里读它，
+    /// 而那个闭包活得比构造它的栈帧长。
+    alive: Arc<AtomicBool>,
     /// 邦国信息块的累积缓冲。
     kingdom: RwLock<Option<KingdomBuf>>,
     /// 已开拓的区块数，用于统计。
     claims: AtomicU64,
+    /// 疆域开拓队列。
+    ///
+    /// 在 `Bot::new` 里建好并常驻：扩地任务是「持续的」（用户原话：开很久），
+    /// 而队列自己管理 running/cursor 状态，每次提交重用同一个实例比反复
+    /// 新建更简单，也让「刷新网页后还原进度」能拿到正在跑的那份快照。
+    queue: Arc<ClaimQueue>,
+    /// 是否已经报告过这次死亡。
+    ///
+    /// Azalea 会把 `Event::Death` 派发多次（实测同一毫秒两次、14 毫秒后
+    /// 第三次）。不去重的话同一条死讯会在前端出现三遍，看起来像服务器出了
+    /// 问题。重生时清掉。
+    death_reported: AtomicBool,
     /// 停止标志。由 `Bot::new` 创建，`BotSlot` 复用同一个 `Arc`。
     ///
     /// 放在 `Bot` 上而不是只放在 `BotSlot` 上，是因为寻路循环在机器人线程
@@ -75,16 +91,44 @@ const KINGDOM_MAX_LINES: usize = 64;
 impl Bot {
     pub fn new(username: impl Into<String>) -> Arc<Self> {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let username = username.into();
+
+        // 队列的事件出口是个同步回调，直接投到机器人的事件总线上。
+        //
+        // 这里刻意【不】用 channel + 转发任务：那个转发任务需要 spawn，而
+        // `Bot::new` 会在没有 `LocalSet` 的地方被调用（测试、以及将来的
+        // 其它入口），`spawn_local` 在那里会 panic。回调同步执行，不依赖
+        // 任何 runtime。
+        let queue_events = events.clone();
+        let on_queue_event: Arc<dyn Fn(QueueEvent) + Send + Sync> =
+            Arc::new(move |ev: QueueEvent| {
+                let _ = queue_events.send(queue_event_to_data(&ev));
+            });
+
+        let alive = Arc::new(AtomicBool::new(false));
+        let alive_for_queue = alive.clone();
+        let queue = ClaimQueue::new(
+            on_queue_event,
+            Arc::new(move || alive_for_queue.load(Ordering::Relaxed)),
+        );
+
         Arc::new(Self {
-            username: username.into(),
+            username,
             client: RwLock::new(None),
             status: RwLock::new(Status::default()),
             events,
-            alive: AtomicBool::new(false),
+            alive,
             kingdom: RwLock::new(None),
             claims: AtomicU64::new(0),
+            death_reported: AtomicBool::new(false),
+            queue,
             stop_flag: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// 取开拓队列。
+    pub fn queue(&self) -> Arc<ClaimQueue> {
+        self.queue.clone()
     }
 
     /// 取停止标志。见 [`Bot::stop_flag`] 字段的说明。
@@ -185,6 +229,14 @@ impl Bot {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
         let mut reached = false;
+        // 连续多少次「没在寻路」就判定寻路已结束。
+        //
+        // 这是必要的：寻路器找不到路时会自己停下（天空岛四周是虚空，目标
+        // 不可达时的正常结果），而如果只等超时，队列就会为一块根本走不到
+        // 的地卡满整个超时（默认 300 秒），用户看到的是「不动了但还在扩地
+        // 中」。等 2 秒是为了容错 —— 寻路在两次重规划之间会有短暂的空隙。
+        let mut idle_ticks = 0;
+        const IDLE_TICKS_TO_GIVE_UP: u32 = 8;
 
         loop {
             ticker.tick().await;
@@ -204,6 +256,31 @@ impl Bot {
             if !self.is_alive() {
                 self.log("warn", "连接已断开，中断寻路");
                 break;
+            }
+
+            // 死亡会打断寻路，重生后又落在别处 —— 这时继续等下去毫无意义，
+            // 因为寻路器的路径是基于死前的位置算的。直接放弃这一块，让队列
+            // 去处理下一块（用户在天空岛上明确接受「摔了就重生继续」）。
+            if self.death_reported.load(Ordering::Relaxed) {
+                self.log("warn", "死亡打断了寻路，放弃这一块");
+                break;
+            }
+
+            // 寻路器还在干活 = 正在算路径，或者正在走一条路径。
+            //
+            // 两个都要看：只检查「在走」的话，重规划期间（正在算、还没开始
+            // 走）会被误判成已放弃。
+            if client.is_executing_path() || client.is_calculating_path() {
+                idle_ticks = 0;
+            } else {
+                idle_ticks += 1;
+                if idle_ticks >= IDLE_TICKS_TO_GIVE_UP {
+                    self.log(
+                        "warn",
+                        format!("寻路已停止（未能到达 ({chunk_x}, {chunk_z})），放弃这一块"),
+                    );
+                    break;
+                }
             }
         }
 
@@ -323,6 +400,38 @@ impl Bot {
     }
 }
 
+/// 把队列事件转成推给前端的一帧。
+///
+/// **必须包在 `expand` 字段里**：Go 后端的 `handleNodeEvent` 只认
+/// `data[].expand`（见 `bots.go`），其余字段一律忽略。我一开始用了
+/// `queue`/`claimed`/`failed` 三个平铺字段，那样 Go 收不到任何扩地进度，
+/// 而前端会一直显示「扩地中」直到超时 —— 没有报错，只是永远不更新。
+///
+/// 里面用 `type` 区分子类型，字段名与 JS 版一致，前端不用改解析。
+fn queue_event_to_data(ev: &QueueEvent) -> EventData {
+    let mut m = EventData::new();
+    let payload = match ev {
+        QueueEvent::Progress(snap) => {
+            let mut v = serde_json::to_value(snap).unwrap_or_default();
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("type".into(), "progress".into());
+            }
+            v
+        }
+        QueueEvent::Claimed { cx, cz } => {
+            serde_json::json!({"type": "claimed", "cx": cx, "cz": cz})
+        }
+        QueueEvent::Failed { cx, cz, reason } => {
+            serde_json::json!({"type": "failed", "cx": cx, "cz": cz, "reason": reason.as_str()})
+        }
+        QueueEvent::Log(text) => {
+            serde_json::json!({"type": "log", "msg": text})
+        }
+    };
+    m.insert("expand".into(), payload);
+    m
+}
+
 /// 把 Azalea 的世界名换成 mineflayer 的写法。
 ///
 /// mineflayer 给的是不带命名空间的 `overworld` / `the_nether` / `the_end`，
@@ -405,6 +514,9 @@ async fn handle(
             bot.log("info", "已登录");
         }
         Event::Spawn => {
+            // 重生也会触发 Spawn，清掉死亡标志 —— 否则复活之后再死一次
+            // 就报不出来了。
+            bot.death_reported.store(false, Ordering::Relaxed);
             bot.sync_position();
             bot.push_status();
             bot.log("info", format!("已进入世界: {}", describe_position(&bot)));
@@ -419,7 +531,14 @@ async fn handle(
             bot.on_chat(&line);
         }
         Event::Death(_) => {
-            bot.log("warn", "死亡");
+            // Azalea 会把 Death 派发多次（实测同一毫秒两次、14 毫秒后第三
+            // 次），所以这里去重。
+            //
+            // 不能用「health 从正变零」来判断：Death 到达时 health 已经是 0
+            // 了，那个条件永远不成立。用一个显式标志，重生时清掉。
+            if !bot.death_reported.swap(true, Ordering::Relaxed) {
+                bot.log("warn", "死亡");
+            }
         }
         Event::Disconnect(reason) => {
             bot.log("warn", format!("断开连接: {reason:?}"));
@@ -463,6 +582,14 @@ pub enum Command {
         chunk_x: i32,
         chunk_z: i32,
         timeout: std::time::Duration,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    /// 开始跑已装载的扩地队列。
+    ///
+    /// 队列本身在 `Bot` 上（`submit` 已把区块装载好），这一条只是让机器人
+    /// 线程去 `run` 它 —— 因为队列的执行要调寻路，而寻路只能在机器人自己
+    /// 的线程上操作 Azalea 的客户端。
+    RunQueue {
         reply: tokio::sync::oneshot::Sender<bool>,
     },
 }

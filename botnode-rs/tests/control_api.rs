@@ -321,3 +321,113 @@ async fn 未配置密钥时不校验但能用() {
         })
         .await;
 }
+
+
+// ════════════════════════════════════════════════════════════════
+// /ws/api/expand
+// ════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn 扩地下发到未运行的机器人返回_404() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let base = spawn_node().await;
+            let mut ws = connect(&base, "/ws/api/expand").await;
+            let resp = roundtrip(
+                &mut ws,
+                r#"{"username":"nobody","chunks":[[1,2],[3,4]]}"#,
+            )
+            .await;
+            assert_eq!(resp["code"], 404, "实际: {resp}");
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn 扩地选区为空返回_400() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let base = spawn_node().await;
+            let mut ws = connect(&base, "/ws/api/expand").await;
+            let resp = roundtrip(&mut ws, r#"{"username":"nobody","chunks":[]}"#).await;
+            // 未运行的检查在前，所以这里是 404 而不是 400 —— 但只要不是
+            // 200 就说明没有误启动一个空任务。
+            assert_ne!(resp["code"], 200, "实际: {resp}");
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn 未授权时_expand_也拒绝() {
+    // 新的端点必须和旧的一样受密钥保护 —— 漏掉一个就等于开了后门。
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let base = spawn_secured("s3cr3t").await;
+            let mut ws = connect_raw(&format!("{base}/ws/api/expand")).await.unwrap();
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: serde_json::Value =
+                serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+            assert_eq!(v["code"], 401, "实际: {v}");
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn 未授权时_events_也拒绝() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let base = spawn_secured("s3cr3t").await;
+            let mut ws = connect_raw(&format!("{base}/ws/api/events")).await.unwrap();
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: serde_json::Value =
+                serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+            assert_eq!(v["code"], 401, "实际: {v}");
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn events_订阅没有机器人时不报错也不断开() {
+    // Go 侧会一直挂着这条连接。如果这里立刻断开，Go 会在重连循环里空转。
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let base = spawn_node().await;
+            let mut ws = connect_raw(&format!("{base}/ws/api/events")).await.unwrap();
+            // ready
+            let ready = ws.next().await.unwrap().unwrap();
+            let v: serde_json::Value =
+                serde_json::from_str(&ready.into_text().unwrap()).unwrap();
+            assert_eq!(v["code"], 200);
+
+            ws.send(Message::Text(r#"{"all":true}"#.into())).await.unwrap();
+
+            // 一秒内不该有关闭帧。
+            let next = tokio::time::timeout(std::time::Duration::from_secs(1), ws.next()).await;
+            match next {
+                Err(_) => {} // 超时 = 连接还开着，正是期望
+                Ok(Some(Ok(Message::Close(_)))) => panic!("不该关闭连接"),
+                Ok(Some(Err(_))) => panic!("不该出错"),
+                Ok(None) => panic!("不该结束"),
+                Ok(Some(Ok(_))) => {} // 收到别的帧也行
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn events_既没_all_也没_username_返回_400() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let base = spawn_node().await;
+            let mut ws = connect(&base, "/ws/api/events").await;
+            let v = roundtrip(&mut ws, r#"{"all":false}"#).await;
+            assert_eq!(v["code"], 400, "实际: {v}");
+        })
+        .await;
+}

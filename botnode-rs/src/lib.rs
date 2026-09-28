@@ -5,6 +5,7 @@
 //! 都值得脱离网络单独测 —— 原 JS 版把 `status.js` 单独拆出来也是这个理由。
 
 pub mod bot;
+pub mod claimqueue;
 pub mod manager;
 pub mod protocol;
 pub mod server;

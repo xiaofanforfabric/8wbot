@@ -103,6 +103,36 @@ impl Response {
     }
 }
 
+/// `/ws/api/expand` 的请求体。
+///
+/// 与 Go 的 `POST /api/expand` 转发的形状一致（见 `main.go:2045`）：
+/// 停止时只带 `action:"stop"`，开始时代 `chunks` 和 `occupied`。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExpandRequest {
+    pub username: String,
+    /// `"stop"` 表示中断当前扩地任务。
+    #[serde(default)]
+    pub action: Option<String>,
+    /// 待扩区块，`[[cx, cz], ...]`。
+    #[serde(default)]
+    pub chunks: Vec<(i32, i32)>,
+    /// 服务器已知已占区块，供排序判断接壤。
+    #[serde(default)]
+    pub occupied: Vec<(i32, i32)>,
+}
+
+/// `/ws/api/events` 的订阅请求。
+///
+/// Go 发的是 `{"all":true}` —— 全局订阅，收所有机器人的事件。
+#[derive(Debug, Clone, Deserialize)]
+pub struct EventsRequest {
+    #[serde(default)]
+    pub all: bool,
+    /// 也可以只订阅一个机器人。
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
 /// 推给订阅者的日志/状态帧。
 ///
 /// 形状是 `[{botname, data:[...]}]` —— 外面包一层数组是 JS 版既有的格式，

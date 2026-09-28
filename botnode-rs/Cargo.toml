@@ -35,13 +35,14 @@ futures-util = "0.3"
 # - opt-level = 3：Azalea 每 tick 都跑物理和寻路，优化值得。
 # - lto + codegen-units = 1：跨 crate 内联，二进制更小、跑得更快。编译慢
 #   一倍多，但这是一次性的。
-# - panic = "abort"：不需要栈展开，二进制小一截。代价是单个机器人 panic
-#   会带掉整个节点 —— 可以接受，因为节点由 systemd 拉起，重启很快；而且
-#   一个 panic 的机器人本来也不该继续跑。
 # - strip：去掉符号，二进制从几十 MB 降到几 MB。
+#
+# 刻意【不】使用 panic = "abort"：这个节点要同时跑 20 个机器人，而 abort
+# 意味着任何一个机器人 panic 都会带掉整个进程 —— 20 个一起掉线。用默认的
+# unwind 则只死掉那一个线程，其余 19 个不受影响。代价是二进制大一点、
+# 有一点展开开销，对这个场景完全值得。
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
 strip = true

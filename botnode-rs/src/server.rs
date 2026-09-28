@@ -21,15 +21,24 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use futures_util::SinkExt;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
 
 use crate::manager::{Manager, StartError, StopError};
 use crate::protocol::{
-    BotRequest, Command, EventData, EventFrame, Response, SendInfoRequest, status_event,
+    BotRequest, Command, EventData, EventFrame, EventsRequest, ExpandRequest, Response,
+    SendInfoRequest, status_event,
 };
+
+/// 事件流重新扫描运行列表的间隔。
+///
+/// 一秒是个折中：新启动的机器人最多一秒后出现在管理面板里（人眼察觉不到），
+/// 而每秒遍历一次几十个名字的开销可以忽略。
+const RESCAN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 共享给所有路由的状态。
 #[derive(Clone)]
@@ -137,6 +146,8 @@ pub fn router(state: AppState) -> Router {
         .route("/ws/api/botstatus", get(botstatus))
         .route("/ws/api/botlogs", get(botlogs))
         .route("/ws/api/sendinfo", get(sendinfo))
+        .route("/ws/api/expand", get(expand))
+        .route("/ws/api/events", get(events))
         .with_state(state)
 }
 
@@ -432,6 +443,251 @@ async fn handle_sendinfo(mut ws: WebSocket, state: AppState) -> Result<()> {
     };
     send_json(&mut ws, &resp).await?;
     Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════
+// /ws/api/expand
+// ════════════════════════════════════════════════════════════════
+
+async fn expand(
+    ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let secret = extract_secret(&headers, &uri);
+    ws.on_upgrade(move |socket| async move {
+        if !state.authorized(secret.as_deref()) {
+            warn!("拒绝未经授权的 expand 握手");
+            return reject_unauthorized(socket).await;
+        }
+        if let Err(e) = handle_expand(socket, state).await {
+            debug!("expand 连接结束: {e}");
+        }
+    })
+}
+
+/// 下发扩地任务。
+///
+/// 与 JS 版一致：这条连接**不保持**。下发完就回一条结果并关闭 —— 进度通过
+/// 事件总线（`/ws/api/events`）推给 Go，再由 Go 转给浏览器。
+async fn handle_expand(mut ws: WebSocket, state: AppState) -> Result<()> {
+    send_json(&mut ws, &serde_json::json!({"code": 200, "message": "ready"})).await?;
+
+    let Some(req) = read_json::<ExpandRequest>(&mut ws).await? else {
+        return Ok(());
+    };
+    info!(username = %req.username, action = ?req.action, "收到扩地请求");
+
+    let Some(slot) = state.manager.get(&req.username) else {
+        send_json(&mut ws, &Response::not_found("机器人未在运行")).await?;
+        return Ok(());
+    };
+
+    // ── 停止 ──
+    if req.action.as_deref() == Some("stop") {
+        let was = slot.bot.queue().stop();
+        send_json(
+            &mut ws,
+            &Response::ok(if was {
+                "已停止扩地"
+            } else {
+                "当前没有正在执行的扩地任务"
+            })
+            .with("stopped", was),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // ── 开始 ──
+    if req.chunks.is_empty() {
+        send_json(&mut ws, &Response::bad_request("chunks 为空，没有可扩的区块")).await?;
+        return Ok(());
+    }
+
+    let Some(pc) = player_chunk(&slot.bot) else {
+        // 机器人还没进世界就拿不到位置，而排序要靠它选起点。回 409 让前端
+        // 稍后重试，比用一个瞎猜的起点排出一份要横穿选区的顺序好。
+        send_json(
+            &mut ws,
+            &Response::conflict("机器人尚未进入世界（拿不到位置），请稍后重试"),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let ordered = crate::claimqueue::order_square(&req.chunks, &req.occupied, Some(pc));
+    let count = ordered.len();
+
+    if !slot.bot.queue().submit(ordered, req.occupied.clone()) {
+        send_json(&mut ws, &Response::bad_request("队列为空，未启动")).await?;
+        return Ok(());
+    }
+
+    // 真正开始跑要把任务送进机器人线程 —— 队列的执行需要机器人那一侧的
+    // runtime（寻路只能在那个线程上操作 Azalea 的客户端）。
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    let _ = slot.commands.send(crate::bot::Command::RunQueue { reply });
+
+    info!(username = %req.username, chunks = req.chunks.len(), ordered = count, "扩地下发");
+    send_json(
+        &mut ws,
+        &Response::ok(format!("已下发 {count} 个区块，开始扩地")).with("count", count),
+    )
+    .await?;
+    Ok(())
+}
+
+/// 取机器人当前所在区块。
+fn player_chunk(bot: &Arc<crate::bot::Bot>) -> Option<(i32, i32)> {
+    let pos = bot.status().pos?;
+    Some(((pos.x / 16.0).floor() as i32, (pos.z / 16.0).floor() as i32))
+}
+
+// ════════════════════════════════════════════════════════════════
+// /ws/api/events
+// ════════════════════════════════════════════════════════════════
+
+async fn events(
+    ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let secret = extract_secret(&headers, &uri);
+    ws.on_upgrade(move |socket| async move {
+        if !state.authorized(secret.as_deref()) {
+            warn!("拒绝未经授权的 events 握手");
+            return reject_unauthorized(socket).await;
+        }
+        if let Err(e) = handle_events(socket, state).await {
+            debug!("events 连接结束: {e}");
+        }
+    })
+}
+
+/// 全局事件流。
+///
+/// Go 用它订阅所有机器人的状态与扩地进度（`bots.go: jsEventsOnce`），落库
+/// 并转给浏览器。这是「管理面板能看到全局」的唯一来源。
+///
+/// 与 `/botlogs` 的区别：`botlogs` 订阅一个机器人、且保持连接给调用方持续
+/// 消费；`events` 是全局的，会在启动时把**所有**在跑机器人的当前状态补一遍
+/// —— 不补的话，Go 重启之后要把每个机器人都重启一次才能重新知道它们的
+/// 状态。
+async fn handle_events(mut ws: WebSocket, state: AppState) -> Result<()> {
+    send_json(&mut ws, &serde_json::json!({"code": 200, "message": "ready"})).await?;
+
+    let Some(req) = read_json::<EventsRequest>(&mut ws).await? else {
+        return Ok(());
+    };
+    info!(all = req.all, username = ?req.username, "收到事件订阅");
+
+    // 订阅哪些机器人。
+    let names: Vec<String> = match (&req.username, req.all) {
+        (Some(name), _) => vec![name.clone()],
+        (None, true) => state.manager.running(),
+        (None, false) => {
+            send_json(&mut ws, &Response::bad_request("需要 all:true 或 username")).await?;
+            return Ok(());
+        }
+    };
+
+    // 先把每个机器人的当前状态补一遍。
+    let mut subs = Vec::new();
+    for name in &names {
+        if let Some(slot) = state.manager.get(name) {
+            send_json(
+                &mut ws,
+                &EventFrame {
+                    botname: name.clone(),
+                    data: vec![status_event(&slot.bot.status())],
+                },
+            )
+            .await?;
+            subs.push((name.clone(), slot.bot.subscribe()));
+        }
+    }
+
+    // 订阅之后要能发现【新启动】的机器人。
+    //
+    // Go 侧是一条长连接订阅（`jsEventsOnce` 拨通后一直读），而它可能在
+    // 任何机器人启动之前就连上来了 —— 实测就是这样：订阅建立时列表为空，
+    // 随后启动的机器人一条事件都推不过去，前端永远看不到状态。
+    //
+    // 所以这个循环每一轮都要重新扫一遍运行列表，把还没订阅的名字补上。
+    let mut subscribed: HashSet<String> = subs.iter().map(|(n, _)| n.clone()).collect();
+    let mut next_rescan = tokio::time::Instant::now() + RESCAN_INTERVAL;
+
+    if subs.is_empty() {
+        info!("事件订阅时没有运行中的机器人，将在有新机器人时自动纳入");
+    }
+
+    // 扇出所有订阅。用 select 轮询每个接收端 —— 数量是机器人数（几十），
+    // 每轮遍历一遍完全够用，不值得为它建索引。
+    loop {
+        // 先处理对端消息（断开检测）。
+        if let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(0), ws.recv()).await {
+            match msg {
+                Ok(Message::Close(_)) => return Ok(()),
+                Ok(_) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // 定期扫一遍运行列表，把新启动的机器人纳入订阅。
+        //
+        // 用轮询而不是「启动时通知」：通知要维护一份订阅者注册表，而订阅者
+        // 的连接可能随时断掉，那份表就得有一套清理逻辑。轮询的代价是几十个
+        // 名字的一次遍历，不值得为它增加状态。
+        if tokio::time::Instant::now() >= next_rescan {
+            next_rescan = tokio::time::Instant::now() + RESCAN_INTERVAL;
+            for name in state.manager.running() {
+                if subscribed.contains(&name) {
+                    continue;
+                }
+                if let Some(slot) = state.manager.get(&name) {
+                    info!(bot = %name, "事件流纳入新启动的机器人");
+                    // 先补一帧当前状态，否则订阅者要等它下次说话才知道它
+                    // 已经上线。
+                    send_json(
+                        &mut ws,
+                        &EventFrame {
+                            botname: name.clone(),
+                            data: vec![status_event(&slot.bot.status())],
+                        },
+                    )
+                    .await?;
+                    subs.push((name.clone(), slot.bot.subscribe()));
+                    subscribed.insert(name);
+                }
+            }
+        }
+
+        let mut sent_any = false;
+        for (name, rx) in subs.iter_mut() {
+            match rx.try_recv() {
+                Ok(data) => {
+                    let frame = EventFrame {
+                        botname: name.clone(),
+                        data: vec![data],
+                    };
+                    send_json(&mut ws, &frame).await?;
+                    sent_any = true;
+                }
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    debug!(bot = %name, skipped = n, "事件订阅者落后，跳过若干帧");
+                }
+                Err(_) => {}
+            }
+        }
+
+        if !sent_any {
+            // 没有事件时短暂让出，避免忙等占满一个核。
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 }
 
 // ════════════════════════════════════════════════════════════════

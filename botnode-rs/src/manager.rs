@@ -121,6 +121,19 @@ impl Manager {
         let handle = std::thread::Builder::new()
             .name(format!("bot-{username}"))
             .spawn(move || {
+                // panic 也要摘除记录。不这么做的话，panic 之后表里留着一个
+                // 死机器人：`/botstatus` 说它在，实际线程已经没了，而 Go
+                // 后端也就不会重新启动它 —— 表现为「机器人莫名其妙不见了
+                // 但系统说它在跑」。
+                //
+                // 用 `catch_unwind` 包住而不是依赖「reap 在最后一行」：
+                // panic 时最后一行根本不会执行。
+                let guard = PanicGuard {
+                    manager: manager.clone(),
+                    name: name.clone(),
+                    generation,
+                };
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // 每个机器人一个 current_thread runtime：Azalea 的连接
                 // future 不是 Send，只能待在单线程 runtime 上。
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -129,27 +142,29 @@ impl Manager {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
+                        // 摘除交给下面的 `PanicGuard` —— 让它成为唯一出口，
+                        // 免得将来有人在这里加分支时忘了 reap。
                         warn!(bot = %thread_name, "无法建立 runtime: {e}");
                         let _ = ready_tx.send(());
-                        manager.reap(&name, generation);
                         return;
                     }
                 };
 
                 let local = tokio::task::LocalSet::new();
-                local.block_on(&rt, async move {
-                    let conn = crate::bot::run(thread_bot.clone(), thread_address);
-                    let cmds = command_loop(thread_bot.clone(), commands_rx);
-                    // 报 ready 之后才开始跑 —— 顺序反过来的话，start() 可能
-                    // 在连接已经开始建立之后才返回。
-                    let _ = ready_tx.send(());
-                    tokio::select! {
-                        _ = conn => {}
-                        _ = cmds => {}
-                    }
-                });
-
-                manager.reap(&name, generation);
+                    local.block_on(&rt, async move {
+                        let conn = crate::bot::run(thread_bot.clone(), thread_address);
+                        let cmds = command_loop(thread_bot.clone(), commands_rx);
+                        // 报 ready 之后才开始跑 —— 顺序反过来的话，start()
+                        // 可能在连接已经开始建立之后才返回。
+                        let _ = ready_tx.send(());
+                        tokio::select! {
+                            _ = conn => {}
+                            _ = cmds => {}
+                        }
+                    });
+                }));
+                // 正常结束和 panic 都走到这里（guard 的 Drop 负责 reap）。
+                drop(guard);
             })
             .expect("无法建立机器人线程");
 
@@ -277,7 +292,52 @@ async fn command_loop(bot: Arc<Bot>, mut rx: mpsc::UnboundedReceiver<BotCommand>
                 let result = bot.goto_chunk(chunk_x, chunk_z, timeout, stop).await;
                 let _ = reply.send(result);
             }
+            BotCommand::RunQueue { reply } => {
+                // 队列已经由 `submit` 装载好（区块列表、游标、已占集合）。
+                // 这里只负责跑它 —— 必须跑在机器人线程上，因为执行要调寻路，
+                // 而寻路只能在持有 Azalea 客户端的那个线程上操作。
+                let _ = reply.send(true);
+                let me = bot.clone();
+                let queue = bot.queue();
+                // walk 闭包：走到区块中心。`goto_chunk` 是 async，而队列
+                // 只要一个 bool，所以这里把超时和停止标志都接上。
+                let stop = bot.stop_flag();
+                queue
+                    .clone()
+                    .run(move |cx, cz| {
+                        let me = me.clone();
+                        let stop = stop.clone();
+                        async move {
+                            me.goto_chunk(cx, cz, crate::claimqueue::CHUNK_TIMEOUT, stop)
+                                .await
+                        }
+                    })
+                    .await;
+            }
         }
+    }
+}
+
+/// 线程退出时（正常或 panic）把自己从运行表里摘掉。
+///
+/// 用 `Drop` 而不是在函数末尾调 `reap`：panic 时末尾那行不会执行，而
+/// 「线程死了但表里还有记录」会让 Go 后端永远不重启这个机器人。
+struct PanicGuard {
+    manager: Arc<Manager>,
+    name: String,
+    generation: u64,
+}
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        // 正在 panic 时 `reap` 里如果也要 panic，会变成双重 panic 而 abort
+        // 整个进程。所以这里吞掉 panic —— 摘除失败是可以接受的降级。
+        let manager = self.manager.clone();
+        let name = self.name.clone();
+        let generation = self.generation;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            manager.reap(&name, generation);
+        }));
     }
 }
 
@@ -341,6 +401,34 @@ mod tests {
         // 同一代：删。
         m.reap("bot1", 7);
         assert!(m.get("bot1").is_none(), "同一代应当被摘除");
+    }
+
+    #[test]
+    fn panic_也摘除记录() {
+        // 这条验证 PanicGuard：线程 panic 时不能留下死记录。
+        //
+        // 留下死记录的后果很隐蔽 —— `/botstatus` 说机器人在，实际线程已经
+        // 没了，而 Go 后端看到「在运行」就不会重启它。用户看到的是机器人
+        // 莫名其妙不见了，但系统说一切正常。
+        let m = Manager::new("127.0.0.1:1");
+        let mut bots = m.bots.lock();
+        bots.insert("bot1".into(), dummy_slot(3));
+        drop(bots);
+        assert!(m.get("bot1").is_some());
+
+        // 模拟线程 panic：guard 被 drop。
+        {
+            let _guard = PanicGuard {
+                manager: m.clone(),
+                name: "bot1".into(),
+                generation: 3,
+            };
+        } // <- drop 在这里发生，等同 panic 时的栈展开
+
+        assert!(
+            m.get("bot1").is_none(),
+            "panic 之后记录必须被摘除，否则 Go 后端不会重启它"
+        );
     }
 
     fn dummy_slot(generation: u64) -> Arc<BotSlot> {
