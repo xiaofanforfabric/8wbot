@@ -4,15 +4,16 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
+	"regexp"
 	"log"
-	"math"
 	"net/http"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 )
 
@@ -356,66 +357,25 @@ func mustBotStatusTime(botname string) string {
 }
 
 // ════════════════════════════════════════════════════════════════
-// squaremap 地图数据
+// squaremap 地图数据代理
 //
-// 服务器自带 squaremap 网页地图（默认 https://bgjq.simpfun.cn）。
-// 爬它有两个用处：
-//   ① 生成「在地图上查看该坐标」的链接 —— URL 形如
-//      ?world=<世界名>&zoom=<缩放>&x=<x>&z=<z>
-//   ② 用 markers.json 里的疆土多边形判断机器人当前站在谁的领地上，
-//      以及离哪个王城最近 —— 光看 XYZ 是不知道自己在哪儿的
+// 设计取舍：这里【只做代理】，不做任何解析。
 //
-// 重要事实（实测确认）：
-//   - squaremap 的标记坐标就是游戏方块坐标，不需要任何换算。
-//     用 /u info 报的王城坐标 (-7032, -9447) 去对 markers.json 里
-//     同名的王城标记，偏差 dx=0, dz=0。下界也没有坐标缩放。
-//   - 三个世界的 player_tracker.enabled 都是 false，地图上【没有】玩家
-//     位置，所以机器人坐标只能靠 mineflayer 上报，不能从地图拿。
+// 解析（160KB JSON、6500 多个多边形顶点、点在多边形判定）全部放在浏览器里做，
+// 后端只负责把原始 JSON 缓存住再转发出去，CPU 开销降到几乎为零。
 //
-// 缓存放服务端而不是让浏览器直接拉：markers.json 有 160KB 且 6500 多个
-// 多边形顶点，每个用户各自下载和做点在多边形判定并不划算。
+// 为什么不让浏览器直接抓 squaremap：
+//   bgjq.simpfun.cn 是裸 nginx，任何路径都没有 Access-Control-Allow-Origin，
+//   OPTIONS 预检直接 405。跨域 fetch 拿到的响应浏览器读不了。
+//
+// 为什么后端缓存仍然比浏览器直抓省：
+//   全局只抓一次给所有用户用，而不是每个用户各抓一次。
+//
+// 按需懒加载：没有 /api/mapmarkers 请求就不抓，没人用就没有任何流量。
+// 配合 ETag 条件请求，数据没变时 squaremap 返回 304，正文零传输。
 // ════════════════════════════════════════════════════════════════
 
 const defaultSquaremapBase = "https://bgjq.simpfun.cn"
-
-type mapPoint struct {
-	X float64 `json:"x"`
-	Z float64 `json:"z"`
-}
-
-type mapClaim struct {
-	Owner  string       `json:"owner"`
-	Shield bool         `json:"shield"`
-	Rings  [][]mapPoint `json:"-"`
-}
-
-type mapCapital struct {
-	Name string  `json:"name"`
-	X    float64 `json:"x"`
-	Z    float64 `json:"z"`
-}
-
-type mapWorldInfo struct {
-	Name        string `json:"name"`
-	DisplayName string `json:"display_name"`
-	Type        string `json:"type"`
-}
-
-type mapWorldData struct {
-	Capitals []mapCapital
-	Claims   []mapClaim
-}
-
-type squaremapCache struct {
-	Base    string
-	Worlds  []mapWorldInfo
-	ByWorld map[string]*mapWorldData
-}
-
-var (
-	squaremapMu   sync.RWMutex
-	squaremapData *squaremapCache
-)
 
 func squaremapBase() string {
 	if v := os.Getenv("SQUAREMAP_BASE"); v != "" {
@@ -424,277 +384,116 @@ func squaremapBase() string {
 	return defaultSquaremapBase
 }
 
-func fetchSquaremapJSON(url string, out interface{}) error {
-	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
+func squaremapTTL() time.Duration {
+	if v := os.Getenv("SQUAREMAP_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= time.Minute {
+			return d
+		}
 	}
-	// 带个正经 UA，别给人家服务器添乱
-	req.Header.Set("User-Agent", "8wbot/1.0 (+https://8w.bgjq.top)")
-	resp, err := client.Do(req)
+	return 30 * time.Minute
+}
+
+type squaremapEntry struct {
+	Body []byte
+	ETag string
+	At   time.Time
+}
+
+var (
+	squaremapMu    sync.Mutex
+	squaremapCache = map[string]*squaremapEntry{} // 路径 -> 缓存
+	squaremapHTTP  = &http.Client{Timeout: 30 * time.Second}
+)
+
+// fetchSquaremapRaw 取一个路径的原始 JSON。
+// 带 If-None-Match：squaremap 没变化时回 304，正文不传，直接沿用旧缓存。
+func fetchSquaremapRaw(path string) ([]byte, error) {
+	full := squaremapBase() + path
+
+	squaremapMu.Lock()
+	entry := squaremapCache[path]
+	ttl := squaremapTTL()
+	if entry != nil && time.Since(entry.At) < ttl {
+		body := entry.Body
+		squaremapMu.Unlock()
+		return body, nil
+	}
+	etag := ""
+	if entry != nil {
+		etag = entry.ETag
+	}
+	squaremapMu.Unlock()
+
+	req, err := http.NewRequest("GET", full, nil)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "8wbot/1.0 (+https://8w.bgjq.top)")
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+
+	resp, err := squaremapHTTP.Do(req)
+	if err != nil {
+		// 网络不通时退回旧缓存，总比让前端拿不到数据好
+		squaremapMu.Lock()
+		if entry != nil {
+			body := entry.Body
+			entry.At = time.Now()
+			squaremapMu.Unlock()
+			log.Printf("[MAP] %s 抓取失败，沿用旧缓存: %v", path, err)
+			return body, nil
+		}
+		squaremapMu.Unlock()
+		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	return json.NewDecoder(resp.Body).Decode(out)
-}
 
-// collectRings 递归收集「点字典构成的列表」。
-//
-// 必须递归的原因：squaremap 不同标记组的嵌套深度不一样。
-//
-//	income_zones:  points = [ring, ring]              环的列表
-//	union_claims:  points = [[ring], [ring], [ring]]  多边形的列表，每个多边形含若干环
-//
-// 硬编码任一种都会在另一种上失效。
-func collectRings(v interface{}, out *[][]mapPoint) {
-	arr, ok := v.([]interface{})
-	if !ok || len(arr) == 0 {
-		return
-	}
-	// 先试着把这一层整体当成一个环
-	pts := make([]mapPoint, 0, len(arr))
-	allPoints := true
-	for _, e := range arr {
-		m, ok := e.(map[string]interface{})
-		if !ok {
-			allPoints = false
-			break
-		}
-		x, okx := m["x"].(float64)
-		z, okz := m["z"].(float64)
-		if !okx || !okz {
-			allPoints = false
-			break
-		}
-		pts = append(pts, mapPoint{X: x, Z: z})
-	}
-	if allPoints && len(pts) >= 3 {
-		*out = append(*out, pts)
-		return
-	}
-	for _, e := range arr {
-		collectRings(e, out)
-	}
-}
-
-// pointInRings 判断点是否落在这些环围成的区域内，用奇偶规则。
-// 奇偶规则对两种情形都正确：多块互不相连的领地（落在其中任一块内即为真），
-// 以及带空洞的领地（外环内、洞内 → 命中两次 → 判为不在）。
-func pointInRings(x, z float64, rings [][]mapPoint) bool {
-	inside := false
-	for _, ring := range rings {
-		n := len(ring)
-		if n < 3 {
-			continue
-		}
-		for i, j := 0, n-1; i < n; j, i = i, i+1 {
-			xi, zi := ring[i].X, ring[i].Z
-			xj, zj := ring[j].X, ring[j].Z
-			// zj == zi 时这个条件必然为假，不会出现除零
-			if (zi > z) != (zj > z) {
-				if x < (xj-xi)*(z-zi)/(zj-zi)+xi {
-					inside = !inside
-				}
-			}
-		}
-	}
-	return inside
-}
-
-var claimOwnerRe = regexp.MustCompile(`疆土归属:\s*([^<]*)`)
-var claimShieldRe = regexp.MustCompile(`护盾开启:\s*([^<]*)`)
-
-// loadSquaremap 抓取一次全量地图数据。失败时保留旧缓存。
-func loadSquaremap() (*squaremapCache, error) {
-	base := squaremapBase()
-
-	var settings struct {
-		Worlds []mapWorldInfo `json:"worlds"`
-	}
-	if err := fetchSquaremapJSON(base+"/tiles/settings.json", &settings); err != nil {
-		return nil, fmt.Errorf("settings.json: %w", err)
-	}
-	if len(settings.Worlds) == 0 {
-		return nil, fmt.Errorf("settings.json 里没有世界列表")
-	}
-
-	cache := &squaremapCache{Base: base, Worlds: settings.Worlds, ByWorld: map[string]*mapWorldData{}}
-
-	for _, w := range settings.Worlds {
-		// markers.json 的元素结构与标记组一一对应；points 用 RawMessage
-		// 原样接住，交给 collectRings 递归处理嵌套差异。
-		var raw []struct {
-			ID      string `json:"id"`
-			Markers []struct {
-				Type   string          `json:"type"`
-				Popup  string          `json:"popup"`
-				Point  *mapPoint       `json:"point"`
-				Points json.RawMessage `json:"points"`
-			} `json:"markers"`
-		}
-		url := base + "/tiles/" + w.Name + "/markers.json"
-		if err := fetchSquaremapJSON(url, &raw); err != nil {
-			// 某个世界抓失败不影响其他世界
-			log.Printf("[MAP] %s 标记抓取失败: %v", w.Name, err)
-			cache.ByWorld[w.Name] = &mapWorldData{}
-			continue
-		}
-
-		wd := &mapWorldData{}
-		for _, group := range raw {
-			for _, m := range group.Markers {
-				switch group.ID {
-				case "union_capitals":
-					if m.Point == nil {
-						continue
-					}
-					name := stripHTMLTags(m.Popup)
-					name = strings.TrimSuffix(name, "的王城")
-					name = strings.TrimSuffix(name, "的据点")
-					name = strings.Trim(name, "「」 ")
-					if name == "" {
-						continue
-					}
-					wd.Capitals = append(wd.Capitals, mapCapital{Name: name, X: m.Point.X, Z: m.Point.Z})
-				case "union_claims":
-					if len(m.Points) == 0 {
-						continue
-					}
-					var pts interface{}
-					if err := json.Unmarshal(m.Points, &pts); err != nil {
-						continue
-					}
-					var rings [][]mapPoint
-					collectRings(pts, &rings)
-					if len(rings) == 0 {
-						continue
-					}
-					owner, shield := "", false
-					if mm := claimOwnerRe.FindStringSubmatch(m.Popup); len(mm) > 1 {
-						owner = strings.TrimSpace(mm[1])
-					}
-					if mm := claimShieldRe.FindStringSubmatch(m.Popup); len(mm) > 1 {
-						shield = strings.TrimSpace(mm[1]) == "是"
-					}
-					wd.Claims = append(wd.Claims, mapClaim{Owner: owner, Shield: shield, Rings: rings})
-				}
-			}
-		}
-		cache.ByWorld[w.Name] = wd
-	}
-
-	return cache, nil
-}
-
-// stripHTMLTags 去掉 popup 里的标签与实体，只留纯文本
-func stripHTMLTags(s string) string {
-	s = htmlTagRe.ReplaceAllString(s, "")
-	s = strings.ReplaceAll(s, "&nbsp;", " ")
-	return strings.TrimSpace(s)
-}
-
-var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
-
-// squaremapLoop 周期性刷新地图缓存。
-// 这些数据变化很慢（疆土和王城），10 分钟一次足够，也不用给地图服务器压力。
-func squaremapLoop() {
-	interval := 10 * time.Minute
-	if v := os.Getenv("SQUAREMAP_REFRESH"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d >= time.Minute {
-			interval = d
-		}
-	}
-
-	refresh := func() {
-		cache, err := loadSquaremap()
-		if err != nil {
-			log.Printf("[MAP] 地图数据刷新失败（保留旧缓存）: %v", err)
-			return
-		}
+	// 304：内容没变，续期即可
+	if resp.StatusCode == http.StatusNotModified {
 		squaremapMu.Lock()
-		squaremapData = cache
+		if entry != nil {
+			entry.At = time.Now()
+			body := entry.Body
+			squaremapMu.Unlock()
+			log.Printf("[MAP] %s 未变化（304），沿用缓存", path)
+			return body, nil
+		}
 		squaremapMu.Unlock()
-		total := 0
-		for _, wd := range cache.ByWorld {
-			total += len(wd.Claims)
-		}
-		log.Printf("[MAP] 地图数据已加载: %d 个世界，%d 块疆土", len(cache.Worlds), total)
+		return nil, fmt.Errorf("收到 304 但没有本地缓存")
 	}
 
-	refresh()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for range ticker.C {
-		refresh()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20)) // 上限 8MB，防异常大响应
+	if err != nil {
+		return nil, err
+	}
+
+	squaremapMu.Lock()
+	squaremapCache[path] = &squaremapEntry{Body: body, ETag: resp.Header.Get("ETag"), At: time.Now()}
+	squaremapMu.Unlock()
+
+	log.Printf("[MAP] %s 已抓取 %d 字节", path, len(body))
+	return body, nil
 }
 
-// squaremapSnapshot 取当前缓存的只读快照
-func squaremapSnapshot() *squaremapCache {
-	squaremapMu.RLock()
-	defer squaremapMu.RUnlock()
-	return squaremapData
-}
+// squaremapWorldRe 世界名白名单。世界名会被拼进 squaremap 的 URL 路径，
+// 不做限制的话 ../ 就能打到任意路径。
+var squaremapWorldRe = regexp.MustCompile(`^[A-Za-z0-9_]{1,64}$`)
 
-// mapLookup 查询某个坐标所在的世界信息、所处疆土与最近王城
-func mapLookup(world string, x, z float64) (map[string]interface{}, bool) {
-	cache := squaremapSnapshot()
-	if cache == nil {
-		return nil, false
+// checkJWT 只做令牌有效性判断，用于不需要区分用户的只读接口
+func checkJWT(tok string) bool {
+	if tok == "" {
+		return false
 	}
-
-	// 前端传的是 minecraft:overworld 这种维度名，地图用的是 minecraft_overworld
-	worldName := world
-	for _, w := range cache.Worlds {
-		if w.Name == world || w.DisplayName == world {
-			worldName = w.Name
-			break
+	t, err := jwt.Parse(tok, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, jwt.ErrSignatureInvalid
 		}
-	}
-
-	out := map[string]interface{}{
-		"base":   cache.Base,
-		"worlds": cache.Worlds,
-		"world":  worldName,
-	}
-
-	// 固定 zoom 3 是 squaremap 的默认与最大缩放，打开即是街区级视角
-	out["map_url"] = fmt.Sprintf("%s/?world=%s&zoom=3&x=%d&z=%d",
-		cache.Base, worldName, int(math.Floor(x)), int(math.Floor(z)))
-
-	wd := cache.ByWorld[worldName]
-	if wd == nil {
-		return out, true
-	}
-
-	// 所处疆土：可能同时落在多块里（重叠领地），只报第一块命中的
-	for _, c := range wd.Claims {
-		if pointInRings(x, z, c.Rings) {
-			out["territory"] = map[string]interface{}{"owner": c.Owner, "shield": c.Shield}
-			break
-		}
-	}
-
-	// 最近王城
-	best := -1
-	bestDist := 0.0
-	for i, c := range wd.Capitals {
-		dx, dz := c.X-x, c.Z-z
-		d := math.Sqrt(dx*dx + dz*dz)
-		if best < 0 || d < bestDist {
-			best, bestDist = i, d
-		}
-	}
-	if best >= 0 {
-		c := wd.Capitals[best]
-		out["nearest_capital"] = map[string]interface{}{
-			"name": c.Name, "x": int(c.X), "z": int(c.Z), "distance": int(bestDist),
-		}
-	}
-	return out, true
+		return jwtSecret, nil
+	})
+	return err == nil && t.Valid
 }

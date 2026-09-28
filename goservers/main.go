@@ -441,9 +441,6 @@ func main() {
 	// 推给浏览器。前端只开一条 /ws/api/stream，切页面不断开。
 	go jsEventsLoop(db)
 
-	// 周期性抓取 squaremap 地图数据（疆土多边形 / 王城坐标），
-	// 供控制台生成「在地图上查看」链接并解析机器人所处领地。
-	go squaremapLoop()
 
 	mux := http.NewServeMux()
 
@@ -462,7 +459,7 @@ func main() {
 			w.Header().Add("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With, Accept, Origin")
-			w.Header().Set("Access-Control-Expose-Headers", "Content-Type, Content-Length")
+			w.Header().Set("Access-Control-Expose-Headers", "Content-Type, Content-Length, X-Squaremap-Base")
 			w.Header().Set("Access-Control-Max-Age", "600")
 		}
 		if r.Method == http.MethodOptions {
@@ -1469,56 +1466,77 @@ func main() {
 	})
 
 	// --- POST /api/getbotstatus : 查询机器人状态 ---
-	// --- API: /api/mapinfo : 查询某个坐标的地图归属 ---
+	// --- API: /api/mapsettings : squaremap 的世界列表 ---
 	//
-	// 返回 squaremap 的世界列表、该坐标的网页链接、所处疆土、最近王城。
-	// 数据由 squaremapLoop 从 squaremap 的 settings.json / markers.json 缓存而来，
-	// 不在这里实时抓取，避免每次请求都打地图服务器。
-	mux.HandleFunc("/api/mapinfo", func(w http.ResponseWriter, r *http.Request) {
+	// 后端只做代理，不做解析。解析（点在多边形等）全部在浏览器里做，
+	// 后端 CPU 开销归零。按需懒加载：没人请求就不抓。
+	mux.HandleFunc("/api/mapsettings", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 405, "msg": "method not allowed"})
 			return
 		}
-
 		var req struct {
-			AccessToken string  `json:"access_token"`
-			World       string  `json:"world"`
-			X           float64 `json:"x"`
-			Z           float64 `json:"z"`
+			AccessToken string `json:"access_token"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "invalid json"})
 			return
 		}
-		req.AccessToken = extractAccessToken(r, req.AccessToken)
-		if req.AccessToken == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token required"})
-			return
-		}
-
-		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, jwt.ErrSignatureInvalid
-			}
-			return jwtSecret, nil
-		})
-		if err != nil || !token.Valid {
+		if !checkJWT(extractAccessToken(r, req.AccessToken)) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
 			return
 		}
+		// 把地图基址告诉前端，供它拼「在地图上查看」的链接。
+		// 走响应头而不是塞进 JSON，这样正文仍然是 squaremap 的原始内容，
+		// 基址也只有一个来源（后端），不会和前端配置漂移。
+		w.Header().Set("X-Squaremap-Base", squaremapBase())
 
-		info, ok := mapLookup(req.World, req.X, req.Z)
-		if !ok {
-			// 缓存还没准备好（启动瞬间或地图不可达）
-			json.NewEncoder(w).Encode(map[string]interface{}{"code": 503, "message": "地图数据尚未就绪"})
+		body, err := fetchSquaremapRaw("/tiles/settings.json")
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "地图数据获取失败"})
 			return
 		}
-		info["code"] = "200"
-		json.NewEncoder(w).Encode(info)
+		w.Write(body)
+	})
+
+	// --- API: /api/mapmarkers : 某个世界的原始 markers.json ---
+	//
+	// 原样转发，不做任何解析。世界名走白名单校验 —— 它会被拼进 URL 路径，
+	// 不校验的话 ../ 就能打到 squaremap 的任意路径。
+	mux.HandleFunc("/api/mapmarkers", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 405, "msg": "method not allowed"})
+			return
+		}
+		var req struct {
+			AccessToken string `json:"access_token"`
+			World       string `json:"world"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "invalid json"})
+			return
+		}
+		if !checkJWT(extractAccessToken(r, req.AccessToken)) {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+		if !squaremapWorldRe.MatchString(req.World) {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "invalid world"})
+			return
+		}
+		body, err := fetchSquaremapRaw("/tiles/" + req.World + "/markers.json")
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "地图数据获取失败"})
+			return
+		}
+		w.Write(body)
 	})
 
 	mux.HandleFunc("/api/getbotstatus", func(w http.ResponseWriter, r *http.Request) {
