@@ -22,6 +22,12 @@ use crate::claimqueue::{ClaimQueue, QueueEvent};
 use crate::protocol::{EventData, claim_event, log_event, status_event};
 use crate::status::{self, Pos, Status};
 
+/// 位置推送的最小间隔。
+///
+/// 与原 JS 版的 `STATUS_POS_MS` 默认值一致（5 秒）。位置【变化】时才真正
+/// 发出，所以静止的机器人完全不占带宽。
+const POS_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 机器人事件总线的容量。
 ///
 /// 订阅者落后超过这个数会丢消息而不是阻塞机器人 —— 一条日志不值得让整个
@@ -55,6 +61,10 @@ pub struct Bot {
     /// 而队列自己管理 running/cursor 状态，每次提交重用同一个实例比反复
     /// 新建更简单，也让「刷新网页后还原进度」能拿到正在跑的那份快照。
     queue: Arc<ClaimQueue>,
+    /// 上次推送位置的时间。用于限频。
+    last_pos_push: parking_lot::Mutex<std::time::Instant>,
+    /// 上次推送出去的位置与维度。与当前相同就不重复推。
+    last_pos_sent: parking_lot::Mutex<(Option<(i64, i64, i64)>, Option<String>)>,
     /// 是否已经报告过这次死亡。
     ///
     /// Azalea 会把 `Event::Death` 派发多次（实测同一毫秒两次、14 毫秒后
@@ -120,6 +130,8 @@ impl Bot {
             alive,
             kingdom: RwLock::new(None),
             claims: AtomicU64::new(0),
+            last_pos_push: parking_lot::Mutex::new(std::time::Instant::now()),
+            last_pos_sent: parking_lot::Mutex::new((None, None)),
             death_reported: AtomicBool::new(false),
             queue,
             stop_flag: Arc::new(AtomicBool::new(false)),
@@ -177,6 +189,42 @@ impl Bot {
     fn push_status(&self) {
         let snapshot = self.status();
         self.emit(status_event(&snapshot));
+    }
+
+    /// 位置变化时才推状态帧。
+    ///
+    /// 每 tick 推是浪费 —— 服务器 20 tick/秒，而人眼和地图都不需要那个
+    /// 频率。原 JS 版是 5 秒采一次、变化了才推，这里保持一致。
+    ///
+    /// **坐标取整**（与原 JS 的 `Math.floor` 一致）：不取整的话浮点末位
+    /// 一直在抖，等价于「永远在变化」，限频就白做了；而且地图上显示
+    /// `-6991.041460280879` 也没有意义。
+    fn maybe_push_position(&self) {
+        let now = std::time::Instant::now();
+        if now.duration_since(*self.last_pos_push.lock()) < POS_PUSH_INTERVAL {
+            return;
+        }
+        *self.last_pos_push.lock() = now;
+
+        let (pos, dim) = {
+            let st = self.status.read();
+            (
+                st.pos
+                    .map(|p| (p.x.floor() as i64, p.y.floor() as i64, p.z.floor() as i64)),
+                st.dimension.clone(),
+            )
+        };
+
+        // 位置和维度都没变就不推 —— 静止的机器人完全不占带宽。
+        {
+            let mut last = self.last_pos_sent.lock();
+            if *last == (pos, dim.clone()) {
+                return;
+            }
+            *last = (pos, dim);
+        }
+
+        self.push_status();
     }
 
     /// 推一条「已离线」事件。
@@ -562,7 +610,7 @@ async fn handle(
         Event::Disconnect(reason) => {
             bot.log("warn", format!("断开连接: {reason:?}"));
             bot.alive.store(false, Ordering::Relaxed);
-            bot.push_offline(&format!("{reason:?}"));
+            bot.push_offline(&describe_reason(&reason));
         }
         Event::ConnectionFailed(e) => {
             bot.log("error", format!("连接失败: {e}"));
@@ -570,13 +618,44 @@ async fn handle(
             bot.push_offline(&e.to_string());
         }
         Event::Tick => {
-            // 位置同步跟着 tick 走，但不必每 tick 都推给前端 —— 20 次/秒的
-            // 状态帧除了占带宽没有意义，人眼看不出来。
+            // 位置同步跟着 tick 走（内存里保持最新，供 botstatus 与扩地
+            // 排序用），但**推送**要限频。
+            //
+            // 原来这里只 sync 不 push，导致 pos 在内存里是新的、却从来没
+            // 发给任何人 —— 前端的实时地图因此永远拿不到坐标。我当时写的
+            // 注释是「不必每 tick 都推」，实现出来却成了「永不推」。
+            //
+            // 现在按原 JS 版的节奏来：每 5 秒看一次，位置或维度【变了】
+            // 才推。20 次/秒的状态帧除了占带宽没有意义，而地图需要的是
+            // 「移动时能看到它在动」。
             bot.sync_position();
+            bot.maybe_push_position();
         }
         _ => {}
     }
     Ok(())
+}
+
+/// 把断开原因转成一句人能读的话。
+///
+/// 直接 `{reason:?}` 会把整个 Rust 结构体打出来 —— 实测推给前端的是
+/// 800 多字符的 `Some(Text(TextComponent { base: BaseComponent {
+/// siblings: [], style: Style { color: Some(TextColor { value: 16733525, ...
+/// 而真正的信息只有末尾那句「您已经连接到此代理服务器了！」。
+///
+/// 用户在前端的掉线提示里看到那一大坨是什么都判断不出来的。
+fn describe_reason<T: std::fmt::Display>(reason: &Option<T>) -> String {
+    match reason {
+        // `FormattedText` 的 Display 输出纯文本，正是用户要看的
+        // （例如「您已经连接到此代理服务器了！」）。
+        //
+        // 写成泛型而不是具体类型：`FormattedText` 的公开路径在
+        // `azalea_chat::component` 里，而这个 crate 只直接依赖 `azalea`。
+        // 泛型让调用点的类型推导完成这件事，不用把 azalea-chat 提成显式
+        // 依赖 —— 那个依赖的版本必须和 azalea 内部用的一致，写死反而脆。
+        Some(text) => text.to_string(),
+        None => "服务器未给出原因".to_string(),
+    }
 }
 
 fn describe_position(bot: &Bot) -> String {
