@@ -443,7 +443,7 @@ func main() {
 				// 像「突然不行了」。
 				sreq, _ := json.Marshal(map[string]interface{}{
 					"botname": name,
-					"data":    []map[string]string{{"chat": "u restore confirm"}},
+					"data":    []map[string]string{{"chat": "/u restore confirm"}},
 				})
 				if err := sc.WriteMessage(websocket.TextMessage, sreq); err != nil {
 					log.Printf("[AUTO-RESTORE] %s: 发送失败: %v", name, err)
