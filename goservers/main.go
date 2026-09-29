@@ -1994,74 +1994,19 @@ func main() {
 			return
 		}
 		req.AccessToken = extractAccessToken(r, req.AccessToken)
-		if req.AccessToken == "" || req.BotName == "" {
-			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token and bot_name required"})
-			return
-		}
 
-		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, jwt.ErrSignatureInvalid
-			}
-			return jwtSecret, nil
-		})
-		if err != nil || !token.Valid {
-			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
-			return
-		}
-		claims, _ := token.Claims.(jwt.MapClaims)
-		jhtUID, _ := claims["jht_uid"].(string)
-		if jhtUID == "" {
-			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
-			return
-		}
-
-		bot, err := findBotByUsername(globalDB, req.BotName)
-		if err != nil || bot == nil || !canControlBot(jhtUID, bot) {
-			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
-			return
-		}
-
-		isStop := req.Action == "stop"
-		if !isStop && len(req.Chunks) == 0 {
-			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "message": "选区为空，请先在地图上框选区块"})
-			return
-		}
-
-		wsConn, _, err := jsDialer.Dial(getJSNodeURL("/ws/api/expand"), nil)
-		if err != nil {
-			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "机器人服务异常，请联系管理员"})
-			return
-		}
-		defer wsConn.Close()
-
-		// 握手后 JS 节点先发一条 {ok:true,...}，读掉它再发正文
-		wsConn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		_, _, _ = wsConn.ReadMessage()
-		wsConn.SetReadDeadline(time.Time{})
-
-		payload := map[string]interface{}{"username": req.BotName}
-		if isStop {
-			payload["action"] = "stop"
-		} else {
-			payload["chunks"] = req.Chunks
-			payload["occupied"] = req.Occupied
-		}
-		sendReq, _ := json.Marshal(payload)
-		if err := wsConn.WriteMessage(websocket.TextMessage, sendReq); err != nil {
-			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "扩地指令发送失败"})
-			return
-		}
-
-		wsConn.SetReadDeadline(time.Now().Add(8 * time.Second))
-		_, resp, err := wsConn.ReadMessage()
-		if err != nil {
-			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "未收到扩地队列确认"})
-			return
-		}
-		var result map[string]interface{}
-		json.Unmarshal(resp, &result)
-		json.NewEncoder(w).Encode(result)
+		// 真正干活的部分抽在 dispatchExpand 里，WebSocket 那条路径共用。
+		//
+		// 这个 HTTP 端点保留给旧客户端，但请求体超过 4096 字节时会被上游
+		// 截断（见 expandRequest 的注释），所以前端已改为走
+		// /ws/api/connectbot 下发 —— 那条路是 WebSocket 帧，没有这个限制。
+		json.NewEncoder(w).Encode(dispatchExpand(expandRequest{
+			AccessToken: req.AccessToken,
+			BotName:     req.BotName,
+			Action:      req.Action,
+			Chunks:      req.Chunks,
+			Occupied:    req.Occupied,
+		}))
 	})
 
 	// --- GET /api/otp/qrcode : 扫码登录二维码代理 ---
@@ -2384,6 +2329,79 @@ func main() {
 						// 只保留最近若干行。
 						trimLogFile(logFile)
 					}
+				}
+			}
+		}()
+
+		// 浏览器 → Go 的下行帧。
+		//
+		// 原来这个方向根本没有读循环 —— 浏览器发什么都石沉大海。扩地下发
+		// 走的是 HTTP，而 api.xiaofanai.uk 在请求体超过 4096 字节时会把
+		// body 截断（实测 4091 成功、4101 失败，100% 稳定），2000 个区块
+		// 的 JSON 有 32KB，根本发不出去。WebSocket 帧没有这个限制，
+		// 所以扩地改从这条已经建好的连接下发。
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[WS] connectbot %s 读循环 panic: %v", botName, r)
+				}
+			}()
+			for {
+				_, msg, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				var frame struct {
+					Type        string  `json:"type"`
+					ReqID       string  `json:"req_id"`
+					BotName     string  `json:"botname"`
+					BotNameAlt  string  `json:"bot_name"`
+					Action      string  `json:"action"`
+					Chunks      [][]int `json:"chunks"`
+					Occupied    [][]int `json:"occupied"`
+					AccessToken string  `json:"access_token"`
+				}
+				if err := json.Unmarshal(msg, &frame); err != nil {
+					bw.WriteJSON(map[string]interface{}{"code": 400, "message": "invalid json"})
+					continue
+				}
+				if frame.Type != "expand" {
+					// 其它类型暂不支持。回一条而不是静默丢弃 —— 静默会让
+					// 调用方一直等一个不会来的回复。
+					bw.WriteJSON(map[string]interface{}{
+						"code":    400,
+						"type":    frame.Type,
+						"message": "不支持的帧类型",
+					})
+					continue
+				}
+				name := frame.BotName
+				if name == "" {
+					name = frame.BotNameAlt
+				}
+				if name == "" {
+					name = botName
+				}
+				tok := frame.AccessToken
+				if tok == "" {
+					tok = auth.AccessToken
+				}
+				result := dispatchExpand(expandRequest{
+					AccessToken: tok,
+					BotName:     name,
+					Action:      frame.Action,
+					Chunks:      frame.Chunks,
+					Occupied:    frame.Occupied,
+				})
+				// 回包带上 type 和 req_id。多个扩地请求可能并发在飞
+				// （用户连点、或先 start 后立刻 stop），不带 req_id 的话
+				// 前端只能按到达顺序猜，容易把 stop 的答复认成 start 的。
+				result["type"] = "expand"
+				if frame.ReqID != "" {
+					result["req_id"] = frame.ReqID
+				}
+				if err := bw.WriteJSON(result); err != nil {
+					return
 				}
 			}
 		}()
@@ -3483,4 +3501,88 @@ func trimLogFile(path string) {
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
 	}
+}
+
+// expandRequest 是扩地下发的入参。HTTP 与 WebSocket 两条路径共用。
+//
+// 之所以要有 WebSocket 这条路：api.xiaofanai.uk 在请求体超过 4096 字节时
+// 会把 body 截断（实测 4091 字节成功、4101 字节失败，100% 稳定复现），
+// 而 2000 个区块的 JSON 有 32KB。截断后 Go 收到的是残缺 JSON，
+// 只能回一句没头没尾的 invalid json。WebSocket 帧没有这个限制。
+type expandRequest struct {
+	AccessToken string
+	BotName     string
+	Action      string
+	Chunks      [][]int
+	Occupied    [][]int
+}
+
+// dispatchExpand 把一次扩地下发转给节点，返回给调用方的响应体。
+//
+// 抽成函数是为了让 HTTP 与 WebSocket 两条路径走同一份逻辑 —— 两边各写
+// 一遍的话，鉴权、归属校验、错误码迟早会分叉。
+func dispatchExpand(req expandRequest) map[string]interface{} {
+	if req.AccessToken == "" || req.BotName == "" {
+		return map[string]interface{}{"code": 400, "msg": "access_token and bot_name required"}
+	}
+
+	token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, jwt.ErrSignatureInvalid
+		}
+		return jwtSecret, nil
+	})
+	if err != nil || !token.Valid {
+		return map[string]interface{}{"code": 401, "message": "无效的access_token"}
+	}
+	claims, _ := token.Claims.(jwt.MapClaims)
+	jhtUID, _ := claims["jht_uid"].(string)
+	if jhtUID == "" {
+		return map[string]interface{}{"code": 401, "message": "无效的access_token"}
+	}
+
+	bot, err := findBotByUsername(globalDB, req.BotName)
+	if err != nil || bot == nil || !canControlBot(jhtUID, bot) {
+		return map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"}
+	}
+
+	isStop := req.Action == "stop"
+	if !isStop && len(req.Chunks) == 0 {
+		return map[string]interface{}{"code": 400, "message": "选区为空，请先在地图上框选区块"}
+	}
+
+	wsConn, _, err := jsDialer.Dial(getJSNodeURL("/ws/api/expand"), nil)
+	if err != nil {
+		return map[string]interface{}{"code": 502, "message": "机器人服务异常，请联系管理员"}
+	}
+	defer wsConn.Close()
+
+	// 握手后 JS 节点先发一条 {ok:true,...}，读掉它再发正文
+	wsConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, _, _ = wsConn.ReadMessage()
+	wsConn.SetReadDeadline(time.Time{})
+
+	payload := map[string]interface{}{"username": req.BotName}
+	if isStop {
+		payload["action"] = "stop"
+	} else {
+		payload["chunks"] = req.Chunks
+		payload["occupied"] = req.Occupied
+	}
+	sendReq, _ := json.Marshal(payload)
+	if err := wsConn.WriteMessage(websocket.TextMessage, sendReq); err != nil {
+		return map[string]interface{}{"code": 502, "message": "扩地指令发送失败"}
+	}
+
+	wsConn.SetReadDeadline(time.Now().Add(8 * time.Second))
+	_, resp, err := wsConn.ReadMessage()
+	if err != nil {
+		return map[string]interface{}{"code": 502, "message": "未收到扩地队列确认"}
+	}
+	var result map[string]interface{}
+	json.Unmarshal(resp, &result)
+	if result == nil {
+		result = map[string]interface{}{"code": 502, "message": "扩地队列返回了无法解析的内容"}
+	}
+	return result
 }
