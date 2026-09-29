@@ -112,17 +112,35 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// 而不是错误。
 async fn read_json<T: serde::de::DeserializeOwned>(ws: &mut WebSocket) -> Result<Option<T>> {
     loop {
-        match ws.recv().await {
-            Some(Ok(Message::Text(text))) => {
-                let parsed = serde_json::from_str(&text)?;
-                return Ok(Some(parsed));
-            }
-            // 协议只用文本。二进制帧按协议违规处理，回一个错误比静默忽略好
-            // —— 静默会让调用方一直等一个不会来的回复。
+        // 先把这一帧取出来，让 `ws` 的借用在这里结束。
+        //
+        // 不能直接在 `match ws.recv().await` 的分支里再 `send_json(&mut ws, ...)`
+        // —— 那样 ws 已经被 recv 借住了，编译器会拒绝第二处可变借用。
+        let frame = ws.recv().await;
+        let text = match frame {
+            Some(Ok(Message::Text(t))) => t,
+            // 协议只用文本。二进制帧按协议违规处理：回一个错误比静默忽略好，
+            // 静默会让调用方一直等一个不会来的回复。
             Some(Ok(Message::Binary(_))) => return Ok(None),
             Some(Ok(Message::Close(_))) | None => return Ok(None),
             Some(Ok(_)) => continue, // ping/pong
             Some(Err(e)) => return Err(e.into()),
+        };
+
+        // 解析失败不能 `?` 抛出去。`?` 会让 handler 返回 Err、连接随即关闭，
+        // 调用方看到的是「连接断了」而不是「你的 JSON 有问题」—— 排查时
+        // 完全没有方向。回一条带原始错误和片段的消息。
+        match serde_json::from_str::<T>(&text) {
+            Ok(parsed) => return Ok(Some(parsed)),
+            Err(e) => {
+                let mut preview: String = text.chars().take(200).collect();
+                if text.chars().count() > 200 {
+                    preview.push('…');
+                }
+                warn!(error = %e, body = %preview, "请求 JSON 解析失败");
+                send_json(&mut *ws, &Response::bad_request(format!("请求格式错误: {e}"))).await?;
+                return Ok(None);
+            }
         }
     }
 }
