@@ -15,6 +15,7 @@ use azalea::entity::{Jumping, Physics};
 use azalea::local_player::WorldHolder;
 use azalea::mining::{Mining, MiningSystems, StopMiningBlockEvent};
 use azalea::pathfinder::goals::XZGoal;
+use azalea::pathfinder::{moves, PathfinderOpts};
 use azalea::prelude::*;
 use azalea::registry::builtin::BlockKind;
 use azalea::{Event, Vec3};
@@ -446,10 +447,34 @@ impl Bot {
             format!("前往区块 ({chunk_x}, {chunk_z})，距离 {distance:.0} 格"),
         );
 
-        client.start_goto(XZGoal {
-            x: block_x,
-            z: block_z,
-        });
+        // 用剥掉挖矿的配置寻路。
+        //
+        // Azalea 的 goto 是 Baritone 那套 A* 的完整移植，本身没问题；
+        // 问题在**默认配置**：`PathfinderOpts::new()` 是 `allow_mining(true)`
+        // 加 `moves::default_move`（basic + parkour + uncommon）。
+        //
+        // 允许挖矿带来的正是用户报的那串毛病：
+        //   - 水在寻路眼里只是「成本有限的方块」，挖穿比绕路便宜 →
+        //     挖水 → 走到水上 → 冰霜行者冻出霜冰 → 又觉得冰挡路挖掉 →
+        //     底下又是水。死循环，永远不会前进。
+        //   - 冰霜行者是**故意**穿的，本来该靠它跨海，挖矿把这套玩法拆了。
+        //
+        // `allow_mining(false)` 直接把这个洞从源头堵上 —— 比在执行阶段
+        // 拦 `Mining` 组件干净得多（那个插件现在只是兜底）。
+        //
+        // `successors_fn` 换成 `basic_move`：默认的 `default_move` 还含
+        // parkour。机器人跑在用户那座天空岛上，四周是虚空，跑酷跳失败
+        // 就是掉下去 —— 收益极小而代价是一条命。
+        let opts = PathfinderOpts::new()
+            .allow_mining(false)
+            .successors_fn(moves::basic::basic_move);
+        client.start_goto_with_opts(
+            XZGoal {
+                x: block_x,
+                z: block_z,
+            },
+            opts,
+        );
 
         let deadline = tokio::time::Instant::now() + timeout;
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -495,6 +520,19 @@ impl Bot {
                 break;
             }
 
+            // 方向交给寻路器，我们只负责在水里按住空格（见
+            // `hold_jump_in_water`）。所以这里**不能**停它 —— 停了就没人
+            // 给方向了。
+            //
+            // 一个已知的局限：`basic_move` 的水中分支里，走向
+            // `!is_block_water` 的邻居是 `continue` —— 也就是说寻路器算出的
+            // 那条「在水里游」的路径不包含上岸/上冰的边。所以水里的方向是
+            // 「继续往前游」，能不能上岸取决于冰霜行者有没有在正前方冻出冰。
+            //
+            // 但这不是我们能在这里修的：Azalea 没实现游泳，水中移动图就是
+            // 这样。按住空格让它浮着、不掉下去淹死，是客户端这边唯一该做的
+            // 事 —— 剩下的交给服务端的冰霜行者。
+            //
             // 寻路器还在干活 = 正在算路径，或者正在走一条路径。
             //
             // 两个都要看：只检查「在走」的话，重规划期间（正在算、还没开始
@@ -732,40 +770,28 @@ impl Plugin for NoIceMiningPlugin {
         // 我们才读得到。同 tick 内叫停，下一个 tick 它就不会继续挖了。
         app.add_systems(GameTick, cancel_ice_mining.after(MiningSystems));
         // 溺水自救跟挖矿无关，单独挂一条，不排序。
-        app.add_systems(GameTick, swim_up_when_drowning);
+        app.add_systems(GameTick, hold_jump_in_water);
     }
 }
 
-/// 在水里就按住空格 —— 这就是「游泳」。
+/// 在水里就按住空格 —— 让人浮起来，不沉底。
 ///
 /// ## 为什么必须有这个
 ///
-/// 真人掉进水里会自动浮起来，是因为**客户端一直按住空格**：MC 的游泳就是
-/// 靠跳跃键往上顶。Azalea 没有实现这件事 —— `plugins/movement.rs` 里两处
-/// `// TODO: swimming`，而 `jump_if_in_water` 只在**执行寻路步骤时**才会被
-/// 调到（`execute_forward_move` 那些函数里）。
+/// Azalea 完全没有实现游泳：
+///   - `plugins/movement.rs` 里两处 `// TODO: swimming`
+///   - 冰霜行者零实现（整个 Azalea 里只有语言文件那句 "Frost Walker"）
+///   - `jump_if_in_water` 只在**执行寻路步骤时**才会被调到
 ///
-/// 于是掉水里只要不是在寻路，就没有任何东西叫它往上，机器人会一直沉到
-/// 淹死 —— 用户看到的就是 `wans7891 drowned`，而真人同样位置会浮在水面上
-/// 走过去。
+/// 于是掉水里没有任何东西叫机器人往上，它会一路沉到底。沉到底之后人贴在
+/// 水底，服务端根本不认为它「在水面上」，冰霜行者因此永远不触发 ——
+/// 这就是用户说的「光浮上去冰霜行者无法变冰」的另一半。
 ///
-/// 所以这里每 tick 查一次：在水里就按住空格。离开水面就松开，免得在陆地
-/// 上乱跳。
+/// 这里只负责**垂直**那一半（空格）。水平那一半在
+/// [`Bot::swim_toward`] 里，因为那需要知道目标在哪。
 ///
-/// `Physics::is_in_water()` 读的是 `was_touching_water`，与 Azalea 寻路器
-/// 自己用的判断是同一个来源。
-fn swim_up_when_drowning(
-    query: Query<(&Physics, &mut Jumping)>,
-) {
-    for (physics, mut jumping) in query {
-        **jumping = physics.is_in_water();
-    }
-}
-
-/// 每 tick 检查一次：正在挖冰就取消。
-///
-/// `WorldHolder` 是**组件**不是资源，所以跟 `Mining` 一起从查询里取 ——
-/// 这也是 Azalea 自己的挖矿系统拿世界的方式。
+/// `Physics::is_in_water()` 读的是 `was_touching_water` —— 和 Azalea
+/// 寻路器自己用的判断同一个来源，所以「什么算在水里」两边一致。
 fn cancel_ice_mining(
     mut commands: Commands,
     mut stop_events: MessageWriter<StopMiningBlockEvent>,
@@ -783,6 +809,35 @@ fn cancel_ice_mining(
         // 还在，会反复取消同一次挖掘。
         commands.entity(entity).remove::<Mining>();
         stop_events.write(StopMiningBlockEvent { entity });
+    }
+}
+
+/// 在水里就一直按住空格 —— 这就是「游泳」，也是唯一需要客户端做的事。
+///
+/// ## 为什么必须有
+///
+/// 冰霜行者把水冻成冰是**服务端**逻辑；客户端这边要做的就是让机器人
+/// 「贴着水面待着」而不是沉底。真人掉水里不会淹死，就是因为客户端一直
+/// 按着空格把人顶在水面上。
+///
+/// Azalea 没做这件事：
+///   - `plugins/movement.rs` 里两处 `// TODO: swimming`
+///   - 冰霜行者零实现（整个 Azalea 里只有语言文件那句 "Frost Walker"）
+///   - `jump_if_in_water` 只在**执行寻路步骤时**才会被调到
+///
+/// 所以掉水里没有任何东西叫它往上，会一路沉到淹死 —— 用户日志里那条
+/// `wans7891 drowned`。
+///
+/// ## 方向不归我们管
+///
+/// 方向交给寻路器（它有路径）。我们只补它缺的那一半：垂直方向的空格。
+///
+/// `Physics::is_in_water()` 读的是 `was_touching_water` —— 和 Azalea
+/// 寻路器自己用的判断同一个来源，所以「什么算在水里」两边一致。
+fn hold_jump_in_water(mut query: Query<(&Physics, &mut Jumping)>) {
+    for (physics, mut jumping) in &mut query {
+        // 在水里就一直按着空格，人就不会沉底。
+        **jumping = physics.is_in_water();
     }
 }
 
