@@ -11,6 +11,7 @@
 
 use azalea::app::{App, Plugin};
 use azalea::ecs::prelude::{Commands, Entity, IntoScheduleConfigs, MessageWriter, Query};
+use azalea::entity::{Jumping, Physics};
 use azalea::local_player::WorldHolder;
 use azalea::mining::{Mining, MiningSystems, StopMiningBlockEvent};
 use azalea::pathfinder::goals::XZGoal;
@@ -462,14 +463,6 @@ impl Bot {
         let mut idle_ticks = 0;
         const IDLE_TICKS_TO_GIVE_UP: u32 = 8;
 
-        // 在水里连续多少个 tick 就放弃。
-        //
-        // 不能一进水就中断：冰霜行者冻冰需要一瞬间，穿过去的时候身体可能
-        // 有一两 tick 贴在水面上。250ms 一次 tick，4 次约 1 秒 —— 真掉下去
-        // 的话 1 秒足够脱离，没掉下去的话也早就冻上冰了。
-        let mut water_ticks = 0;
-        const WATER_TICKS_TO_GIVE_UP: u32 = 4;
-
         loop {
             ticker.tick().await;
 
@@ -500,26 +493,6 @@ impl Bot {
             if self.death_reported.load(Ordering::Relaxed) {
                 self.log("warn", "死亡打断了寻路，等待重生后重试");
                 break;
-            }
-
-            // 掉水里了。
-            //
-            // 冰霜行者铺的霜冰只有几秒寿命，机器人站在上面等确认、
-            // 或者走到一半冰化了，就会直接沉下去。而 Azalea 没有实现
-            // 游泳自救（`plugins/movement.rs` 里两处 `TODO: swimming`），
-            // 落水之后只会一直往下沉到淹死 —— 日志里那条
-            // `wans7891 drowned` 就是这么来的。
-            //
-            // 这里不试图游回岸边：路径是基于「站在陆地上」算的，掉水里
-            // 之后那条路径已经没有意义了。直接中断，让外层换一块。
-            if is_in_water(&client) {
-                water_ticks += 1;
-                if water_ticks >= WATER_TICKS_TO_GIVE_UP {
-                    self.log("warn", "掉进水里了，中断寻路");
-                    break;
-                }
-            } else {
-                water_ticks = 0;
             }
 
             // 寻路器还在干活 = 正在算路径，或者正在走一条路径。
@@ -720,30 +693,6 @@ fn is_forbidden_block(kind: BlockKind) -> bool {
     )
 }
 
-/// 机器人所在的那一格是不是水。
-///
-/// 用来判断「掉进海里了」。冰霜行者铺的霜冰几秒就会融化，机器人要是正好
-/// 站在上面，就会直接沉下去 —— 而 Azalea 没有实现游泳自救
-/// （`plugins/movement.rs` 里两处 `// TODO: swimming`），落水后只会溺死。
-fn is_in_water(client: &Client) -> bool {
-    let world = client.world();
-    let pos = client.position();
-    let world = world.read();
-    let body = azalea::BlockPos::new(
-        pos.x.floor() as i32,
-        pos.y.floor() as i32,
-        pos.z.floor() as i32,
-    );
-    // 看身体和头部两格：水面高度不固定，脚下一格可能已经是空气了，
-    // 但头还在水里。
-    [0, 1].iter().any(|dy| {
-        world
-            .get_block_state(azalea::BlockPos::new(body.x, body.y + dy, body.z))
-            .map(|s| s.as_block_kind() == BlockKind::Water)
-            .unwrap_or(false)
-    })
-}
-
 fn in_chunk(pos: Vec3, chunk_x: i32, chunk_z: i32) -> bool {
     const CHUNK: f64 = 16.0;
     let cx = (pos.x / CHUNK).floor() as i32;
@@ -782,6 +731,34 @@ impl Plugin for NoIceMiningPlugin {
         // 排在 Azalea 自己的挖矿系统之后：先让它把 `Mining` 组件写出来，
         // 我们才读得到。同 tick 内叫停，下一个 tick 它就不会继续挖了。
         app.add_systems(GameTick, cancel_ice_mining.after(MiningSystems));
+        // 溺水自救跟挖矿无关，单独挂一条，不排序。
+        app.add_systems(GameTick, swim_up_when_drowning);
+    }
+}
+
+/// 在水里就按住空格 —— 这就是「游泳」。
+///
+/// ## 为什么必须有这个
+///
+/// 真人掉进水里会自动浮起来，是因为**客户端一直按住空格**：MC 的游泳就是
+/// 靠跳跃键往上顶。Azalea 没有实现这件事 —— `plugins/movement.rs` 里两处
+/// `// TODO: swimming`，而 `jump_if_in_water` 只在**执行寻路步骤时**才会被
+/// 调到（`execute_forward_move` 那些函数里）。
+///
+/// 于是掉水里只要不是在寻路，就没有任何东西叫它往上，机器人会一直沉到
+/// 淹死 —— 用户看到的就是 `wans7891 drowned`，而真人同样位置会浮在水面上
+/// 走过去。
+///
+/// 所以这里每 tick 查一次：在水里就按住空格。离开水面就松开，免得在陆地
+/// 上乱跳。
+///
+/// `Physics::is_in_water()` 读的是 `was_touching_water`，与 Azalea 寻路器
+/// 自己用的判断是同一个来源。
+fn swim_up_when_drowning(
+    query: Query<(&Physics, &mut Jumping)>,
+) {
+    for (physics, mut jumping) in query {
+        **jumping = physics.is_in_water();
     }
 }
 
