@@ -422,16 +422,44 @@ func main() {
 				targetURL := getJSNodeURL("/ws/api/sendinfo")
 				sc, _, serr := jsDialer.Dial(targetURL, nil)
 				if serr != nil {
+					// 以前这里是光秃秃的 continue —— 节点连不上时整轮无人知晓，
+					// 用户只看到「自动恢复没反应」，服务端日志里一行都没有。
+					log.Printf("[AUTO-RESTORE] %s: 连接节点失败: %v", name, serr)
 					continue
 				}
 				sc.SetReadDeadline(time.Now().Add(3 * time.Second))
 				_, _, _ = sc.ReadMessage()
 				sc.SetReadDeadline(time.Time{})
+				// 字段名必须是 chat。
+				//
+				// Rust 节点（botnode-rs）的 Command 结构体只反序列化 `chat`，
+				// 未知字段被 serde 静默忽略。以前这里发的是 `command`，于是
+				// 请求进了服务端的循环、`chat` 是 None、什么都没发出去，
+				// 但因为「没有失败」它照样回 200「已发送」——
+				// 机器人永远收不到 u restore confirm，且全链路无任何报错。
+				//
+				// 浏览器控制台（api/index.js）发的就是 {chat, command}，所以
+				// 手动发指令一直正常，只有这里坏 —— 这也解释了为什么它看起来
+				// 像「突然不行了」。
 				sreq, _ := json.Marshal(map[string]interface{}{
 					"botname": name,
-					"data":    []map[string]string{{"command": "u restore confirm"}},
+					"data":    []map[string]string{{"chat": "u restore confirm"}},
 				})
-				sc.WriteMessage(websocket.TextMessage, sreq)
+				if err := sc.WriteMessage(websocket.TextMessage, sreq); err != nil {
+					log.Printf("[AUTO-RESTORE] %s: 发送失败: %v", name, err)
+					sc.Close()
+					continue
+				}
+				sc.SetReadDeadline(time.Now().Add(3 * time.Second))
+				_, resp, rerr := sc.ReadMessage()
+				sc.SetReadDeadline(time.Time{})
+				if rerr != nil {
+					log.Printf("[AUTO-RESTORE] %s: 未收到回执: %v", name, rerr)
+				} else {
+					// 回执里带 code。400 会说明是哪里失败（例如机器人没在运行），
+					// 只打「已发送」会把失败也吞掉。
+					log.Printf("[AUTO-RESTORE] %s: %s", name, strings.TrimSpace(string(resp)))
+				}
 				sc.Close()
 			}
 		}
