@@ -2214,10 +2214,28 @@ func main() {
 				"code":   "200",
 				"online": false,
 			})
-			// Stay connected until browser disconnects
+			// 机器人离线，但浏览器这条连接要留着 —— 用户可能点「重连通道」
+			// 或直接下发扩地（扩地下发不依赖日志转发）。
+			//
+			// 原来这里是个哑循环：收到什么帧都丢掉，只是等连接关闭。
+			// 后果是离线状态下点扩地，前端等满超时也拿不到任何回复。
 			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
+				_, msg, err := conn.ReadMessage()
+				if err != nil {
 					return
+				}
+				// 离线时只有扩地需要处理；其它帧回一句说明。
+				var probe struct {
+					Type string `json:"type"`
+				}
+				if json.Unmarshal(msg, &probe) == nil && probe.Type == "expand" {
+					// 交给下面统一的读循环处理不了（这里已经 return 不出去），
+					// 所以就地回一条明确的拒绝，比让前端干等好。
+					bw.WriteJSON(map[string]interface{}{
+						"type":    "expand",
+						"code":    503,
+						"message": "机器人当前离线，扩地指令无法下发。请先让它上线。",
+					})
 				}
 			}
 		}
@@ -2349,8 +2367,10 @@ func main() {
 			for {
 				_, msg, err := conn.ReadMessage()
 				if err != nil {
+					log.Printf("[WS] connectbot %s 读循环结束: %v", botName, err)
 					return
 				}
+				log.Printf("[WS] connectbot %s 收到浏览器帧: %s", botName, string(msg))
 				var frame struct {
 					Type        string  `json:"type"`
 					ReqID       string  `json:"req_id"`
@@ -2386,6 +2406,9 @@ func main() {
 				if tok == "" {
 					tok = auth.AccessToken
 				}
+				log.Printf("[WS] connectbot %s 开始下发扩地: bot=%s action=%q chunks=%d occupied=%d",
+					botName, name, frame.Action, len(frame.Chunks), len(frame.Occupied))
+				t0 := time.Now()
 				result := dispatchExpand(expandRequest{
 					AccessToken: tok,
 					BotName:     name,
@@ -2393,6 +2416,7 @@ func main() {
 					Chunks:      frame.Chunks,
 					Occupied:    frame.Occupied,
 				})
+				log.Printf("[WS] connectbot %s 扩地下发耗时 %v，回包 %v", botName, time.Since(t0), result)
 				// 回包带上 type 和 req_id。多个扩地请求可能并发在飞
 				// （用户连点、或先 start 后立刻 stop），不带 req_id 的话
 				// 前端只能按到达顺序猜，容易把 stop 的答复认成 start 的。
