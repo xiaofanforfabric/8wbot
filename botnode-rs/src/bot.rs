@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info};
 
-use crate::claimqueue::{ClaimQueue, QueueEvent};
+use crate::claimqueue::{is_stopped, ClaimQueue, QueueEvent};
 use crate::protocol::{EventData, claim_event, log_event, status_event};
 use crate::status::{self, Pos, Status};
 
@@ -328,7 +328,83 @@ impl Bot {
     /// 返回的 future 在到达、超时或被停止时结束，结果是是否真的到了。
     /// 判断依据是位置落在目标区块内，而不是「寻路函数返回了」—— 寻路被
     /// 中断时也会返回，那种情况不算到达。
+    /// 走到某个区块。中途死亡会自动等重生并重新寻路。
+    ///
+    /// 为什么要包一层重试：机器人跑在天空岛上，掉进虚空是常态（用户明确
+    /// 接受「摔了就重生继续」）。原来的实现在检测到死亡标志时直接放弃这一
+    /// 块 —— 而死亡标志从死亡到重生之间一直是置位的，于是**一次死亡会让
+    /// 整个队列在几百毫秒内全部失败**：每块都是「未到达目标」，440 块一秒
+    /// 刷完，一块都没扩。
+    ///
+    /// 现在死亡只是打断当前这一次寻路，重生后从新位置重新算路径继续走。
+    /// 只有重生迟迟不来（[`REVIVE_WAIT`]）才放弃这一块。
     pub async fn goto_chunk(
+        self: &Arc<Self>,
+        chunk_x: i32,
+        chunk_z: i32,
+        timeout: std::time::Duration,
+        stop: Arc<AtomicBool>,
+    ) -> bool {
+        /// 单次死亡后等重生的上限。服务器重生很快，给 20 秒足够覆盖
+        /// 「死亡界面停留 + 区块加载」；再久就是真的卡住了（比如掉线）。
+        const REVIVE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+        /// 整块的重试次数上限。防止「一直死一直重试」把一块拖成无底洞。
+        const MAX_ATTEMPTS: u32 = 4;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            if is_stopped(&stop) {
+                return false;
+            }
+            let ok = self.goto_chunk_once(chunk_x, chunk_z, timeout, stop.clone()).await;
+            if ok {
+                return true;
+            }
+            if is_stopped(&stop) {
+                return false;
+            }
+            // 只有「因为死亡而中断」才值得重试 —— 其它失败原因（走不到、
+            // 超时、用户停止）重试也是一样的结果，白白拖长时间。
+            if !self.death_reported.load(Ordering::Relaxed) {
+                return false;
+            }
+            if attempt == MAX_ATTEMPTS {
+                self.log(
+                    "warn",
+                    format!("({chunk_x}, {chunk_z}) 连续 {MAX_ATTEMPTS} 次因死亡中断，放弃这一块"),
+                );
+                return false;
+            }
+
+            self.log(
+                "info",
+                format!("被死亡打断，等待重生后重试 ({attempt}/{MAX_ATTEMPTS})"),
+            );
+            // 等重生。`Event::Spawn` 会把 death_reported 清掉。
+            let deadline = tokio::time::Instant::now() + REVIVE_WAIT;
+            loop {
+                if is_stopped(&stop) {
+                    return false;
+                }
+                if !self.death_reported.load(Ordering::Relaxed) {
+                    break; // 重生了
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    self.log("warn", "等待重生超时，放弃这一块");
+                    return false;
+                }
+                if !self.is_alive() {
+                    self.log("warn", "连接已断开，放弃这一块");
+                    return false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            self.log("info", format!("已重生，继续前往 ({chunk_x}, {chunk_z})"));
+        }
+        false
+    }
+
+    /// 一次寻路尝试。返回是否到达；被死亡打断时返回 false 且死亡标志仍置位。
+    async fn goto_chunk_once(
         self: &Arc<Self>,
         chunk_x: i32,
         chunk_z: i32,
@@ -388,10 +464,13 @@ impl Bot {
             }
 
             // 死亡会打断寻路，重生后又落在别处 —— 这时继续等下去毫无意义，
-            // 因为寻路器的路径是基于死前的位置算的。直接放弃这一块，让队列
-            // 去处理下一块（用户在天空岛上明确接受「摔了就重生继续」）。
+            // 因为寻路器的路径是基于死前的位置算的。中断这一次尝试，
+            // 由外层 goto_chunk 等重生后从新位置重新寻路。
+            //
+            // 注意这里**不能**清 death_reported：外层靠它判断「该重试」。
+            // 它由 Event::Spawn（重生）清除。
             if self.death_reported.load(Ordering::Relaxed) {
-                self.log("warn", "死亡打断了寻路，放弃这一块");
+                self.log("warn", "死亡打断了寻路，等待重生后重试");
                 break;
             }
 
