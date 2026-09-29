@@ -9,6 +9,10 @@
 //! 记过这个坑 —— 反复重设计划让移动包节奏剧烈抖动，在反作弊眼里比正常走路
 //! 可疑得多。Azalea 的寻路自带重规划，直接调用就好。
 
+use azalea::app::{App, Plugin};
+use azalea::ecs::prelude::{Commands, Entity, IntoScheduleConfigs, MessageWriter, Query};
+use azalea::local_player::WorldHolder;
+use azalea::mining::{Mining, MiningSystems, StopMiningBlockEvent};
 use azalea::pathfinder::goals::XZGoal;
 use azalea::prelude::*;
 use azalea::registry::builtin::BlockKind;
@@ -395,28 +399,6 @@ impl Bot {
         false
     }
 
-    /// 机器人是否正踩在冰上，或身体所在格是冰。
-    ///
-    /// 检查三格：脚下、身体、以及身体正前方一格。只看脚下的话，机器人
-    /// 会先走上去才发现 —— 而踩上去的瞬间冰霜行者已经生效了。多看一格
-    /// 身体位置能提前一步发现。
-    fn standing_on_forbidden(&self, client: &Client) -> bool {
-        let world = client.world();
-        let pos = client.position();
-        let world = world.read();
-        // 身体所在格
-        let body = azalea::BlockPos::new(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32);
-        for dy in [-1, 0] {
-            let p = azalea::BlockPos::new(body.x, body.y + dy, body.z);
-            if let Some(state) = world.get_block_state(p) {
-                if is_forbidden_block(state.as_block_kind()) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     /// 一次寻路尝试。返回是否到达；被死亡打断时返回 false 且死亡标志仍置位。
     async fn goto_chunk_once(
         self: &Arc<Self>,
@@ -474,20 +456,6 @@ impl Bot {
             }
             if !self.is_alive() {
                 self.log("warn", "连接已断开，中断寻路");
-                break;
-            }
-
-            // 站在冰上就中断。
-            //
-            // 冰霜行者鞋子把水冻成霜冰，霜冰在寻路眼里是普通可挖方块 ——
-            // 挖掉，下面又是水，再冻，再挖。这个循环永远不会前进，机器人
-            // 卡在海面上一直挖。用户的描述是「一到海上就挖方块去水里，
-            // 一走冰霜行者鞋子又把冰补上了，然后又挖冰」。
-            //
-            // Azalea 没有「禁止挖某类方块」的设置（水的挖掘成本是有限的，
-            // 只要路径更短它就会挖），所以只能在执行阶段发现即叫停。
-            if self.standing_on_forbidden(&client) {
-                self.log("warn", "踩到冰了（冰霜行者会把水冻成冰，寻路会陷入挖冰循环），放弃这一块");
                 break;
             }
 
@@ -706,6 +674,58 @@ fn horizontal_distance(pos: Vec3, x: i32, z: i32) -> f64 {
     (dx * dx + dz * dz).sqrt()
 }
 
+/// 禁止寻路挖冰的插件。
+///
+/// ## 为什么需要它
+///
+/// 冰霜行者鞋子是**故意**穿的：踩在水面上会把水冻成霜冰，机器人因此能横跨
+/// 海面。问题出在寻路器不知道这件事 —— 在它眼里水只是「成本有限的方块」，
+/// 挖穿比绕路便宜，于是它规划出「挖水过去」的路径。等它走到水上，冰霜行者
+/// 冻出霜冰，寻路器又觉得这块冰挡路，把它挖掉 —— 底下又是水，再冻再挖。
+/// 这个循环永远不会前进。
+///
+/// Azalea 没有「禁止挖某类方块」的开关：`MiningCache::cost_for` 对任何方块
+/// 都返回有限成本，`moves::MovesCtx::mine` 里也只有一个全局 `can_mine`。
+/// 所以只能在它真正开始挖的那一刻叫停。
+///
+/// ## 为什么拦 `Mining` 组件而不是「脚下是不是冰」
+///
+/// 踩在冰上正是我们要的正常状态。只有**正在挖**冰才是问题，
+/// 而 `Mining` 组件恰好记录了「当前正在挖哪个方块」。
+struct NoIceMiningPlugin;
+
+impl Plugin for NoIceMiningPlugin {
+    fn build(&self, app: &mut App) {
+        // 排在 Azalea 自己的挖矿系统之后：先让它把 `Mining` 组件写出来，
+        // 我们才读得到。同 tick 内叫停，下一个 tick 它就不会继续挖了。
+        app.add_systems(GameTick, cancel_ice_mining.after(MiningSystems));
+    }
+}
+
+/// 每 tick 检查一次：正在挖冰就取消。
+///
+/// `WorldHolder` 是**组件**不是资源，所以跟 `Mining` 一起从查询里取 ——
+/// 这也是 Azalea 自己的挖矿系统拿世界的方式。
+fn cancel_ice_mining(
+    mut commands: Commands,
+    mut stop_events: MessageWriter<StopMiningBlockEvent>,
+    query: Query<(Entity, &Mining, &WorldHolder)>,
+) {
+    for (entity, mining, holder) in &query {
+        let world = holder.shared.read();
+        let Some(state) = world.get_block_state(mining.pos) else {
+            continue;
+        };
+        if !is_forbidden_block(state.as_block_kind()) {
+            continue;
+        }
+        // 摘掉组件本身：只发 stop 事件的话，下一个 tick 读到的 `Mining`
+        // 还在，会反复取消同一次挖掘。
+        commands.entity(entity).remove::<Mining>();
+        stop_events.write(StopMiningBlockEvent { entity });
+    }
+}
+
 /// 启动一个机器人，直到连接结束才返回。
 ///
 /// 这是个长期运行的任务：Azalea 的 `ClientBuilder::start` 会一直跑到断开，
@@ -714,6 +734,7 @@ pub async fn run(bot: Arc<Bot>, address: String) -> anyhow::Result<()> {
     info!(bot = %bot.username, address, "正在连接");
 
     let builder = ClientBuilder::new()
+        .add_plugins(NoIceMiningPlugin)
         .set_handler(handle)
         .set_state(HandlerState { bot: Some(bot.clone()) });
 
