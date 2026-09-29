@@ -350,14 +350,17 @@ impl Bot {
         timeout: std::time::Duration,
         stop: Arc<AtomicBool>,
     ) -> bool {
-        /// 死亡后固定等这么久再继续。
+        /// 死亡后固定等这么久，然后强制当作已重生活着继续。
         ///
-        /// 不轮询 `death_reported` 等它被 `Event::Spawn` 清掉 —— 服务器
-        /// 重生本身就很快，等标志只是多一层不确定：标志没清就干等，清早了
-        /// 又白等。固定 1 秒后直接重新寻路，重生没完成的话寻路会自然重试。
+        /// 服务器是**自动重生**的，死后一秒左右人已经站在出生点了。所以
+        /// 不需要去等 `Event::Spawn`（它并不保证会到，见下面清标志那段），
+        /// 睡够就走。
         const REVIVE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
         /// 整块的重试次数上限。防止「一直死一直重试」把一块拖成无底洞。
         const MAX_ATTEMPTS: u32 = 4;
+
+        // 上一轮是不是从死亡里恢复过来的。决定这一轮失败后还要不要再试。
+        let mut recovering = false;
 
         for attempt in 1..=MAX_ATTEMPTS {
             if is_stopped(&stop) {
@@ -372,7 +375,12 @@ impl Bot {
             }
             // 只有「因为死亡而中断」才值得重试 —— 其它失败原因（走不到、
             // 超时、用户停止）重试也是一样的结果，白白拖长时间。
-            if !self.death_reported.load(Ordering::Relaxed) {
+            //
+            // 但上一轮要是我们自己清过死亡标志，这一轮的失败就不是死亡
+            // 造成的了：可能是「刚重生、人还没站稳」导致的寻路失败。那种
+            // 情况必须再试，不能直接判死。所以用一个标志记住「这一轮是从
+            // 死亡里恢复过来的」。
+            if !self.death_reported.load(Ordering::Relaxed) && !recovering {
                 return false;
             }
             if attempt == MAX_ATTEMPTS {
@@ -395,6 +403,21 @@ impl Bot {
                 self.log("warn", "连接已断开，放弃这一块");
                 return false;
             }
+
+            // ★ 自己把死亡标志清掉。
+            //
+            // 服务器是**自动重生**的：死后一秒左右人就已经站在出生点了。
+            // 但 `death_reported` 只由 `Event::Spawn` 清除，而那个事件在
+            // 这里并不保证会到 —— 结果是下一轮 `goto_chunk_once` 第一个
+            // tick 又读到标志还置着，立刻 break，四次重试在 1 秒内烧完，
+            // 整块判失败。用户看到的是一秒钟刷四行「死亡打断了寻路」。
+            //
+            // 既然重生是服务器保证的、时间也基本固定，就不要再去等一个
+            // 不保证会来的事件：睡够 1 秒，直接把状态改成活着继续走。
+            self.death_reported.store(false, Ordering::Relaxed);
+            self.sync_position();
+            self.push_status();
+            recovering = true;
         }
         false
     }
@@ -472,7 +495,8 @@ impl Bot {
             // 由外层 goto_chunk 等重生后从新位置重新寻路。
             //
             // 注意这里**不能**清 death_reported：外层靠它判断「该重试」。
-            // 它由 Event::Spawn（重生）清除。
+            // 清它的是外层（睡够 1 秒后强制清），以及 Event::Spawn。
+            // 不能指望 Spawn —— 它在自动重生的服务器上并不保证会到。
             if self.death_reported.load(Ordering::Relaxed) {
                 self.log("warn", "死亡打断了寻路，等待重生后重试");
                 break;
