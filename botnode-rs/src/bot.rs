@@ -439,6 +439,14 @@ impl Bot {
         let mut idle_ticks = 0;
         const IDLE_TICKS_TO_GIVE_UP: u32 = 8;
 
+        // 在水里连续多少个 tick 就放弃。
+        //
+        // 不能一进水就中断：冰霜行者冻冰需要一瞬间，穿过去的时候身体可能
+        // 有一两 tick 贴在水面上。250ms 一次 tick，4 次约 1 秒 —— 真掉下去
+        // 的话 1 秒足够脱离，没掉下去的话也早就冻上冰了。
+        let mut water_ticks = 0;
+        const WATER_TICKS_TO_GIVE_UP: u32 = 4;
+
         loop {
             ticker.tick().await;
 
@@ -468,6 +476,26 @@ impl Bot {
             if self.death_reported.load(Ordering::Relaxed) {
                 self.log("warn", "死亡打断了寻路，等待重生后重试");
                 break;
+            }
+
+            // 掉水里了。
+            //
+            // 冰霜行者铺的霜冰只有几秒寿命，机器人站在上面等确认、
+            // 或者走到一半冰化了，就会直接沉下去。而 Azalea 没有实现
+            // 游泳自救（`plugins/movement.rs` 里两处 `TODO: swimming`），
+            // 落水之后只会一直往下沉到淹死 —— 日志里那条
+            // `wans7891 drowned` 就是这么来的。
+            //
+            // 这里不试图游回岸边：路径是基于「站在陆地上」算的，掉水里
+            // 之后那条路径已经没有意义了。直接中断，让外层换一块。
+            if is_in_water(&client) {
+                water_ticks += 1;
+                if water_ticks >= WATER_TICKS_TO_GIVE_UP {
+                    self.log("warn", "掉进水里了，中断寻路");
+                    break;
+                }
+            } else {
+                water_ticks = 0;
             }
 
             // 寻路器还在干活 = 正在算路径，或者正在走一条路径。
@@ -510,6 +538,13 @@ impl Bot {
         // 疆土开拓：走路触发，服务器主动通知。这是唯一能知道「刚开拓了哪一块」
         // 的来源，所以优先识别。
         if let Some(claim) = status::parse_claim(text) {
+            // ★ 必须把坐标告诉队列，否则 `wait_notify` 永远收不到确认，
+            //   每一块都要白等满 `CHUNK_TIMEOUT`（300 秒）。
+            //
+            //   这是个漏掉的接线：`mark_claimed` 一直存在，但从来没人调用，
+            //   所以队列里的 `claimed` 集合永远是空的。用户看到的现象是
+            //   「服务器明明告诉他好了，他还要等 5 分钟」。
+            self.queue.mark_claimed(claim.chunk_x, claim.chunk_z);
             self.claims.fetch_add(1, Ordering::Relaxed);
             let mut st = self.status.write();
             st.last_claim = Some(claim);
@@ -659,6 +694,30 @@ fn is_forbidden_block(kind: BlockKind) -> bool {
         kind,
         BlockKind::Ice | BlockKind::PackedIce | BlockKind::FrostedIce | BlockKind::BlueIce
     )
+}
+
+/// 机器人所在的那一格是不是水。
+///
+/// 用来判断「掉进海里了」。冰霜行者铺的霜冰几秒就会融化，机器人要是正好
+/// 站在上面，就会直接沉下去 —— 而 Azalea 没有实现游泳自救
+/// （`plugins/movement.rs` 里两处 `// TODO: swimming`），落水后只会溺死。
+fn is_in_water(client: &Client) -> bool {
+    let world = client.world();
+    let pos = client.position();
+    let world = world.read();
+    let body = azalea::BlockPos::new(
+        pos.x.floor() as i32,
+        pos.y.floor() as i32,
+        pos.z.floor() as i32,
+    );
+    // 看身体和头部两格：水面高度不固定，脚下一格可能已经是空气了，
+    // 但头还在水里。
+    [0, 1].iter().any(|dy| {
+        world
+            .get_block_state(azalea::BlockPos::new(body.x, body.y + dy, body.z))
+            .map(|s| s.as_block_kind() == BlockKind::Water)
+            .unwrap_or(false)
+    })
 }
 
 fn in_chunk(pos: Vec3, chunk_x: i32, chunk_z: i32) -> bool {
