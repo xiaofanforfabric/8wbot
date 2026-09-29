@@ -11,6 +11,7 @@
 
 use azalea::pathfinder::goals::XZGoal;
 use azalea::prelude::*;
+use azalea::registry::builtin::BlockKind;
 use azalea::{Event, Vec3};
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -345,9 +346,12 @@ impl Bot {
         timeout: std::time::Duration,
         stop: Arc<AtomicBool>,
     ) -> bool {
-        /// 单次死亡后等重生的上限。服务器重生很快，给 20 秒足够覆盖
-        /// 「死亡界面停留 + 区块加载」；再久就是真的卡住了（比如掉线）。
-        const REVIVE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+        /// 死亡后固定等这么久再继续。
+        ///
+        /// 不轮询 `death_reported` 等它被 `Event::Spawn` 清掉 —— 服务器
+        /// 重生本身就很快，等标志只是多一层不确定：标志没清就干等，清早了
+        /// 又白等。固定 1 秒后直接重新寻路，重生没完成的话寻路会自然重试。
+        const REVIVE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
         /// 整块的重试次数上限。防止「一直死一直重试」把一块拖成无底洞。
         const MAX_ATTEMPTS: u32 = 4;
 
@@ -377,28 +381,38 @@ impl Bot {
 
             self.log(
                 "info",
-                format!("被死亡打断，等待重生后重试 ({attempt}/{MAX_ATTEMPTS})"),
+                format!("被死亡打断，{REVIVE_DELAY:?} 后继续 ({attempt}/{MAX_ATTEMPTS})"),
             );
-            // 等重生。`Event::Spawn` 会把 death_reported 清掉。
-            let deadline = tokio::time::Instant::now() + REVIVE_WAIT;
-            loop {
-                if is_stopped(&stop) {
-                    return false;
-                }
-                if !self.death_reported.load(Ordering::Relaxed) {
-                    break; // 重生了
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    self.log("warn", "等待重生超时，放弃这一块");
-                    return false;
-                }
-                if !self.is_alive() {
-                    self.log("warn", "连接已断开，放弃这一块");
-                    return false;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            tokio::time::sleep(REVIVE_DELAY).await;
+            if is_stopped(&stop) {
+                return false;
             }
-            self.log("info", format!("已重生，继续前往 ({chunk_x}, {chunk_z})"));
+            if !self.is_alive() {
+                self.log("warn", "连接已断开，放弃这一块");
+                return false;
+            }
+        }
+        false
+    }
+
+    /// 机器人是否正踩在冰上，或身体所在格是冰。
+    ///
+    /// 检查三格：脚下、身体、以及身体正前方一格。只看脚下的话，机器人
+    /// 会先走上去才发现 —— 而踩上去的瞬间冰霜行者已经生效了。多看一格
+    /// 身体位置能提前一步发现。
+    fn standing_on_forbidden(&self, client: &Client) -> bool {
+        let world = client.world();
+        let pos = client.position();
+        let world = world.read();
+        // 身体所在格
+        let body = azalea::BlockPos::new(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32);
+        for dy in [-1, 0] {
+            let p = azalea::BlockPos::new(body.x, body.y + dy, body.z);
+            if let Some(state) = world.get_block_state(p) {
+                if is_forbidden_block(state.as_block_kind()) {
+                    return true;
+                }
+            }
         }
         false
     }
@@ -460,6 +474,20 @@ impl Bot {
             }
             if !self.is_alive() {
                 self.log("warn", "连接已断开，中断寻路");
+                break;
+            }
+
+            // 站在冰上就中断。
+            //
+            // 冰霜行者鞋子把水冻成霜冰，霜冰在寻路眼里是普通可挖方块 ——
+            // 挖掉，下面又是水，再冻，再挖。这个循环永远不会前进，机器人
+            // 卡在海面上一直挖。用户的描述是「一到海上就挖方块去水里，
+            // 一走冰霜行者鞋子又把冰补上了，然后又挖冰」。
+            //
+            // Azalea 没有「禁止挖某类方块」的设置（水的挖掘成本是有限的，
+            // 只要路径更短它就会挖），所以只能在执行阶段发现即叫停。
+            if self.standing_on_forbidden(&client) {
+                self.log("warn", "踩到冰了（冰霜行者会把水冻成冰，寻路会陷入挖冰循环），放弃这一块");
                 break;
             }
 
@@ -651,6 +679,20 @@ fn normalize_dimension(world: &str) -> String {
 }
 
 /// 位置是否落在某个区块内。
+/// 会让人踩上去就出事、或者会自我循环的方块。
+///
+/// 目前只有冰类。冰霜行者鞋子踩水会把它冻成**霜冰**，而霜冰在寻路眼里是
+/// 普通可挖方块 —— 挖掉，下面又是水，再冻，再挖。这个循环永远不会前进，
+/// 机器人就卡在海面上不动了。
+///
+/// 所以只要发现脚下或正前方是冰，就判定这次寻路走不通，中断它换一块。
+fn is_forbidden_block(kind: BlockKind) -> bool {
+    matches!(
+        kind,
+        BlockKind::Ice | BlockKind::PackedIce | BlockKind::FrostedIce | BlockKind::BlueIce
+    )
+}
+
 fn in_chunk(pos: Vec3, chunk_x: i32, chunk_z: i32) -> bool {
     const CHUNK: f64 = 16.0;
     let cx = (pos.x / CHUNK).floor() as i32;
@@ -850,6 +892,39 @@ pub struct BotSlot {
 
 #[cfg(test)]
 mod tests {
+    use super::is_forbidden_block;
+    use azalea::registry::builtin::BlockKind;
+
+    #[test]
+    fn 冰类方块被拦() {
+        // 冰霜行者会踩水成霜冰，而霜冰在寻路眼里是普通可挖方块 ——
+        // 挖掉又是水，再冻再挖，永远不会前进。
+        assert!(is_forbidden_block(BlockKind::Ice));
+        assert!(is_forbidden_block(BlockKind::FrostedIce));
+        assert!(is_forbidden_block(BlockKind::PackedIce));
+        assert!(is_forbidden_block(BlockKind::BlueIce));
+    }
+
+    #[test]
+    fn 普通地面不被拦() {
+        // 拦太宽会让机器人寸步难行，这些必须放行
+        assert!(!is_forbidden_block(BlockKind::Stone));
+        assert!(!is_forbidden_block(BlockKind::Dirt));
+        assert!(!is_forbidden_block(BlockKind::GrassBlock));
+        assert!(!is_forbidden_block(BlockKind::OakPlanks));
+    }
+
+    #[test]
+    fn 水和雪不被拦() {
+        // 水本身不该拦：Azalea 的避让逻辑（is_liquid → 成本无穷）已经在
+        // 路径层面处理了它。我们这里拦的是「冰」—— 冰霜行者造出来的那个
+        // 会自我循环的东西。雪也不拦，走在雪上没问题。
+        assert!(!is_forbidden_block(BlockKind::Water));
+        assert!(!is_forbidden_block(BlockKind::Snow));
+        assert!(!is_forbidden_block(BlockKind::SnowBlock));
+    }
+
+
     use super::*;
 
     #[test]
