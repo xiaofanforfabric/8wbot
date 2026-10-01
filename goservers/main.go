@@ -1382,21 +1382,29 @@ func main() {
 			LastExitReason string `json:"last_exit_reason"`
 			LastExitType   string `json:"last_exit_type"`
 			LastExitTime   string `json:"last_exit_time"`
+			// HasLoginPassword 只告诉前端「设过没有」，**不返回密码本身**。
+			//
+			// 界面靠它决定按钮显示「自动登录」还是「自动登录 ✓」。
+			// 把密码发给前端没有任何用处 —— 前端不需要拿它做任何事，
+			// 而一旦发出去它就会出现在浏览器内存、devtools、以及任何
+			// 抓包工具里。
+			HasLoginPassword bool `json:"has_login_password"`
 		}
 		var items []botItem
 		for _, b := range bots {
 			items = append(items, botItem{
-				BotName:        b.Username,
-				CreateTime:     b.CreationTime,
-				DSL:            b.DSL,
-				Status:         b.Status,
-				AutoRestore:    b.AutoRestore,
-				AutoReconnect:  b.AutoReconnect,
-				LastExitReason: b.LastExitReason,
-				LastExitType:   b.LastExitType,
-				LastExitTime:   b.LastExitTime,
-				StatusJSON:     mustBotStatusJSON(b.Username),
-				StatusTime:     mustBotStatusTime(b.Username),
+				BotName:          b.Username,
+				CreateTime:       b.CreationTime,
+				DSL:              b.DSL,
+				Status:           b.Status,
+				AutoRestore:      b.AutoRestore,
+				AutoReconnect:    b.AutoReconnect,
+				LastExitReason:   b.LastExitReason,
+				LastExitType:     b.LastExitType,
+				LastExitTime:     b.LastExitTime,
+				StatusJSON:       mustBotStatusJSON(b.Username),
+				StatusTime:       mustBotStatusTime(b.Username),
+				HasLoginPassword: botHasLoginPassword(db, b.Username),
 			})
 		}
 
@@ -1627,6 +1635,126 @@ func main() {
 			"bot_simpass_uid": uid,
 			"server":          "auth",
 			"chat":            chat,
+		})
+	})
+
+	// --- POST /api/setloginpassword : 设置自动登录密码 ---
+	//
+	// 给已确认归属的机器人存一个登录密码，供自动登录用（见 maybeAutoLogin）。
+	//
+	// 新账号（走过 /reg）本来就有密码，这个接口主要是给**老账号**用的 ——
+	// 它们绑的是简幻通，服务器除了「输入 6 位验证码」还给了「/login <密码>」，
+	// 那个密码用户自己知道，但机器人不知道，得让用户告诉它一次。
+	//
+	// ★ 存之前**当场试一次** /login。理由：
+	//   密码错了如果只是静静存进库，用户以为配好了，直到某天机器人掉线
+	//   自动登录失败才发现 —— 而那时候他多半已经忘了自己填过什么。
+	//   当场验证能让他在还看着这个界面的时候就知道对不对。
+	//
+	//   代价是多一次 30 秒的往返。值得。
+	mux.HandleFunc("/api/setloginpassword", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 405, "msg": "method not allowed"})
+			return
+		}
+
+		var req struct {
+			AccessToken string `json:"access_token"`
+			BotName     string `json:"bot_name"`
+			Password    string `json:"password"`
+			// Verify=false 只存不验，用于「用户想先存着，下次掉线再说」。
+			// 默认 true。
+			SkipVerify bool `json:"skip_verify"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "invalid json"})
+			return
+		}
+		req.AccessToken = extractAccessToken(r, req.AccessToken)
+		if req.AccessToken == "" || req.BotName == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token and bot_name required"})
+			return
+		}
+
+		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+		claims, _ := token.Claims.(jwt.MapClaims)
+		jhtUID, _ := claims["jht_uid"].(string)
+		if jhtUID == "" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		bot, err := findBotByUsername(globalDB, req.BotName)
+		if err != nil || bot == nil || !canControlBot(jhtUID, bot) {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人不属于你，你无权控制"})
+			return
+		}
+
+		// 空密码 = 清除。
+		//
+		// 用户可能填错过、或者不想再自动登录了，得有条退路。
+		// 没有这个分支的话，一旦存进去就再也删不掉（填空会被前端的
+		// 「至少 6 个字符」拦住）。
+		if req.Password == "" {
+			// 直接写 SQL，不走 setBotAccount —— 那个函数的语义是「只更新
+			// 非空的部分」，传空串它什么都不做，清不掉。
+			if _, err := globalDB.Exec(
+				"UPDATE bots SET login_password = '' WHERE username = ?", req.BotName); err != nil {
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "message": "清除失败: " + err.Error()})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": "200", "message": "已关闭自动登录"})
+			return
+		}
+
+		if len([]rune(req.Password)) < 6 {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "message": "密码至少 6 个字符"})
+			return
+		}
+
+		// 机器人得先在线才能试密码 —— /login 是发给游戏服务器的。
+		client := InitWSClient()
+		if !req.SkipVerify {
+			online, serr := client.GetBotStatus(req.BotName)
+			if serr != nil || !online {
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"code":    409,
+					"message": "机器人当前不在线，无法验证密码。请先点「上线」再设置。",
+				})
+				return
+			}
+			// 密码不进日志。
+			resp, verr := client.SendLoginAndDetect(req.BotName, req.Password, 30*time.Second)
+			if verr != nil {
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"code":    400,
+					"message": "密码验证失败，请确认密码是否正确。" + resp,
+				})
+				return
+			}
+		}
+
+		if err := setBotAccount(globalDB, req.BotName, "", req.Password); err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "message": "保存失败: " + err.Error()})
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"code":    "200",
+			"message": "已开启自动登录，以后机器人掉线会自动用这个密码登录。",
 		})
 	})
 
@@ -3318,6 +3446,16 @@ func maybeAutoLogin(db *sql.DB, botname, chat string) {
 		}
 		log.Printf("[AUTO-LOGIN] %s 自动登录成功", botname)
 	}()
+}
+
+// botHasLoginPassword 判断某个机器人设过自动登录密码没有。
+//
+// 只返回布尔 —— 密码本身不出后端。
+func botHasLoginPassword(db *sql.DB, username string) bool {
+	var pw string
+	err := db.QueryRow(
+		"SELECT COALESCE(login_password, '') FROM bots WHERE username = ?", username).Scan(&pw)
+	return err == nil && pw != ""
 }
 
 // botLoginPassword 取某个机器人存的登录密码。
