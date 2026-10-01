@@ -515,9 +515,8 @@ func main() {
 	// 「有人开着控制台页面」时才有效：控制台一关，连接断开、协程退出，
 	// 机器人掉线后再也没有人管它 —— 而「自动重连」本来应该是常驻能力。
 	go autoReconnectLoop(db, envVars["AUTO_RECONNECT_INTERVAL"])
-	// 自动登录：把「进程在、但卡在验证界面」的机器人送进游戏。
-	// 和上面的重连巡护分开跑 —— 拉进程和过验证是两种失败、两套退避。
-	go autoLoginLoop(db, envVars["AUTO_LOGIN_INTERVAL"])
+	// 自动登录不另起巡护：它挂在事件流上（见 maybeAutoLogin）。
+	// 节点每推来一条聊天，都会看看是不是服务器在索要验证。
 
 	// 常驻订阅 JS 节点的全局事件流，把位置/维度/服务器/邦国信息落库并
 	// 推给浏览器。前端只开一条 /ws/api/stream，切页面不断开。
@@ -3199,129 +3198,126 @@ func autoReconnectLoop(db *sql.DB, intervalEnv string) {
 	}
 }
 
-// autoLoginLoop 常驻巡护：发现机器人停在「请验证」界面就替它登录。
+// 服务器索要验证时的提示语。
 //
-// ## 为什么需要它
+// 命中任意一句就说明这个机器人现在**卡在验证界面**，需要登录。
+// 这几句取自服务器实际输出（简幻通验证插件）：
 //
-// 服务器每次连接都要求重新验证（SimpPass：120 秒内完成，否则踢出）。
-// 只把机器人「拉起来」是不够的 —— 它会卡在验证界面，什么也做不了，
-// 用户看到「在线」但其实是个僵尸。
+//	新账号：请选择一种方式完成身份验证
+//	        绑定简幻通账号: /auth <简幻通UID> <验证码>
+//	        注册本地账号: /reg <密码> <重复密码>
 //
-// 老账号有两条路：让用户给 6 位验证码（要人守着），或者 /login <密码>。
-// 新账号更直接：注册时设的本地密码就是登录凭据。
-//
-// 两种账号都能用密码自动登录 —— 前提是用户给机器人设过密码
-// （新账号走 /reg 时存的，老账号可以由用户在游戏里 /login 一次之后
-// 由我们记下来）。所以这里只处理「库里存了 login_password」的机器人。
-//
-// ## 和 autoReconnectLoop 的分工
-//
-// autoReconnectLoop 负责「把进程拉起来」，这个负责「把它送进游戏」。
-// 合并成一个循环会让退避逻辑互相干扰：拉起是网络问题、登录是密码问题，
-// 两种失败的退避节奏完全不同。
-func autoLoginLoop(db *sql.DB, intervalEnv string) {
-	interval := 20 * time.Second
-	if v := strings.TrimSpace(intervalEnv); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d >= 5*time.Second {
-			interval = d
-		}
-	}
-
-	// 每台机器人单独记退避，理由同 autoReconnectLoop：密码错了不该
-	// 每 20 秒猛敲一次。
-	type loginState struct {
-		lastAttempt time.Time
-		fails       int
-	}
-	states := make(map[string]*loginState)
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	log.Printf("[AUTO-LOGIN] 巡护已启动，检查间隔 %s", interval)
-
-	for range ticker.C {
-		names, err := autoLoginCandidates(db)
-		if err != nil {
-			log.Printf("[AUTO-LOGIN] 查询失败: %v", err)
-			continue
-		}
-		if len(names) == 0 {
-			continue
-		}
-
-		client := InitWSClient()
-		for _, name := range names {
-			st := states[name]
-			if st == nil {
-				st = &loginState{}
-				states[name] = st
-			}
-			backoff := interval
-			for i := 0; i < st.fails && i < 4; i++ {
-				backoff *= 2
-			}
-			if !st.lastAttempt.IsZero() && time.Since(st.lastAttempt) < backoff {
-				continue
-			}
-
-			// ping 一下。进程都没起来的话，登录无从谈起 —— 那是
-			// autoReconnectLoop 的活。
-			online, err := client.GetBotStatus(name)
-			if err != nil || !online {
-				continue
-			}
-
-			pw, err := botLoginPassword(db, name)
-			if err != nil || pw == "" {
-				continue
-			}
-
-			st.lastAttempt = time.Now()
-			// 密码不进日志。
-			log.Printf("[AUTO-LOGIN] %s 尝试自动登录", name)
-			chat, err := client.SendLoginAndDetect(name, pw, 30*time.Second)
-			if err != nil {
-				st.fails++
-				// 失败原因里可能有服务器回复，但**不含密码**。
-				log.Printf("[AUTO-LOGIN] %s 登录失败（连续第 %d 次）: %v / %s", name, st.fails, err, chat)
-				continue
-			}
-			st.fails = 0
-			log.Printf("[AUTO-LOGIN] %s 自动登录成功", name)
-		}
-	}
+//	老账号：欢迎回来！您绑定的简幻通UID是: 102448
+//	        直接输入 6 位验证码，或使用 /login <密码> 完成验证
+var verifyPrompts = []string{
+	"请选择一种方式完成身份验证",
+	"您绑定的简幻通UID是",
+	"注册本地账号",
+	"请在 120 秒内完成验证",
 }
 
-// autoLoginCandidates 列出「该尝试自动登录」的机器人。
+// 同一个机器人两次自动登录之间的最小间隔。
 //
-// 条件：
-//   - status='confirmed'：还没验证通过的机器人不该自动登录（它连密码都没有）
-//   - manual_stop=0：用户主动下线的别去碰
-//   - login_password 非空：没密码无从登起
+// 服务器索要验证时会一次推好几行（「欢迎来到服务器！」「请选择一种方式
+// 完成身份验证」「绑定简幻通账号: ...」「注册本地账号: ...」），每一行
+// 都会触发一次 maybeAutoLogin。不去重的话会连发四五条 /login，
+// 而服务器只认第一条 —— 甚至可能因为重复命令把人踢了。
 //
-// 刻意**不**看 auto_reconnect：那个开关管的是「进程掉了要不要拉起来」，
-// 而这里是「进程在、但卡在验证界面」。用户关掉自动重连往往只是不想让它
-// 反复重启，不代表他想每次都被那个验证界面卡住。
-func autoLoginCandidates(db *sql.DB) ([]string, error) {
-	rows, err := db.Query(
-		`SELECT username FROM bots
-		 WHERE status = 'confirmed'
-		   AND COALESCE(manual_stop, 0) = 0
-		   AND COALESCE(login_password, '') != ''`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+// 取 30 秒：正常登录往返只要几秒，而同一次验证提示的几行几乎同时到达。
+const autoLoginCooldown = 30 * time.Second
 
-	var names []string
-	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			continue
-		}
-		names = append(names, n)
+var (
+	autoLoginMu   sync.Mutex
+	autoLoginLast = map[string]time.Time{}
+)
+
+// maybeAutoLogin 在机器人说出「我需要验证」时替它登录。
+//
+// ## 为什么是事件驱动而不是轮询
+//
+// 最初写的是轮询：每 20 秒扫一遍库，看到进程在就盲发 /login。有两个毛病：
+//
+//   - **已经在游戏里正常跑的机器人也会被发。** 判断依据只有「进程在不在」，
+//     分不出「在游戏里」和「卡在验证界面」。于是一台好端端的机器人每 20 秒
+//     被 /login 一次，服务器回一句「您已经登录了」，往聊天里刷垃圾。
+//   - **慢。** 机器人被踢下线后要等最多 20 秒才开始登录，用户看到一段
+//     明明进程在、却什么也干不了的空白。
+//
+// 改成看事件流：节点把每条聊天都推过来（on_chat → log → emit），这里识别
+// 验证提示，**只在真的需要时才登录**，而且几乎无缝。
+//
+// 这也正是需求原话「如果**识别到**登录状态过期，自动执行 /login」。
+func maybeAutoLogin(db *sql.DB, botname, chat string) {
+	if botname == "" {
+		return
 	}
-	return names, rows.Err()
+
+	needed := false
+	for _, p := range verifyPrompts {
+		if strings.Contains(chat, p) {
+			needed = true
+			break
+		}
+	}
+	if !needed {
+		return
+	}
+
+	// 去重：同一次验证提示会连着来好几行。
+	autoLoginMu.Lock()
+	if last, ok := autoLoginLast[botname]; ok && time.Since(last) < autoLoginCooldown {
+		autoLoginMu.Unlock()
+		return
+	}
+	// 先占位再干活，避免两行提示几乎同时到达时都通过检查。
+	autoLoginLast[botname] = time.Now()
+	autoLoginMu.Unlock()
+
+	// 只有 confirmed 且用户没主动下线的才碰。
+	//
+	// manual_stop 是关键：用户点过「下线」之后机器人正是断线状态，
+	// 任何一句残留聊天都可能把它拉回来，下线按钮就白点了。
+	// 条件直接写进 SQL，不走 BotData。
+	//
+	// findBotByUsername 的 SELECT 里没有 manual_stop（它服务的是另一批
+	// 调用方），为这一个字段去改它的查询会牵动所有调用点。这里本来就是
+	// 一次单行查询，自己写更直接。
+	var status string
+	err := db.QueryRow(
+		"SELECT COALESCE(status,'no') FROM bots WHERE username = ? AND COALESCE(manual_stop,0) = 0",
+		botname).Scan(&status)
+	if err != nil {
+		// ErrNoRows 也走这里：机器人不存在，或者用户主动下线过 ——
+		// 两种都不该自动登录。
+		return
+	}
+	if status != "confirmed" {
+		return
+	}
+
+	pw, err := botLoginPassword(db, botname)
+	if err != nil || pw == "" {
+		// 没存过密码（老账号，或用户还没设过）—— 只能等用户在网页上
+		// 手动验证。这不是错误，是正常状态。
+		return
+	}
+
+	go func() {
+		// 密码不进日志。
+		log.Printf("[AUTO-LOGIN] %s 被要求验证，尝试自动登录", botname)
+		client := InitWSClient()
+		resp, err := client.SendLoginAndDetect(botname, pw, 30*time.Second)
+		if err != nil {
+			log.Printf("[AUTO-LOGIN] %s 自动登录失败: %v / %s", botname, err, resp)
+			// 失败要清掉时间戳，否则 30 秒内重试会被当成重复 ——
+			// 用户立刻改密码重试得能马上生效。
+			autoLoginMu.Lock()
+			delete(autoLoginLast, botname)
+			autoLoginMu.Unlock()
+			return
+		}
+		log.Printf("[AUTO-LOGIN] %s 自动登录成功", botname)
+	}()
 }
 
 // botLoginPassword 取某个机器人存的登录密码。

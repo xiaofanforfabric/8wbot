@@ -321,6 +321,13 @@ func handleNodeEvent(db *sql.DB, raw []byte) {
 		BotName string `json:"botname"`
 		Data    []struct {
 			Status     json.RawMessage `json:"status"`
+			// Chat 是节点推来的每条聊天/日志文本。
+			//
+			// 自动登录要用它：服务器在需要验证时会说「请选择一种方式
+			// 完成身份验证」「您绑定的简幻通UID是」，那就是该登录的时机。
+			// 换成轮询盲发的话，已经在游戏里正常跑的机器人也会被反复
+			// 发 /login，往聊天里刷垃圾命令。
+			Chat string `json:"chat"`
 			BotOffline bool            `json:"bot_offline"`
 			Reason     string          `json:"reason"`
 			// 扩地进度/结果。原样透传给浏览器，Go 不解析里面字段 ——
@@ -345,6 +352,10 @@ func handleNodeEvent(db *sql.DB, raw []byte) {
 					"data":    []map[string]interface{}{{"status": d.Status}},
 				}})
 				pushToBrowsers(ev.BotName, out)
+			}
+			// 聊天文本：看是不是服务器在索要验证。
+			if d.Chat != "" {
+				maybeAutoLogin(db, ev.BotName, d.Chat)
 			}
 			if d.BotOffline {
 				out, _ := json.Marshal([]map[string]interface{}{{

@@ -688,15 +688,33 @@ func loginOutcome(chat string) (bool, error) {
 // 和 SendCommandAndDetect 的区别是判定逻辑可换（`judge`），因为 /reg
 // 和 /login 的成功回复跟「输验证码」不是同一套措辞。
 func (c *WSClient) sendCommandAndWait(botname string, command string, timeout time.Duration, judge outcome) (string, error) {
-	raw, ok := activeSessions.Load(botname)
-	if !ok {
-		return "", fmt.Errorf("no active verify session for %s, start verify first", botname)
+	// 有会话（用户正在网页上验证）就复用它，没有就自己开一条。
+	//
+	// ★ 这个「没有就自己开」是必须的，不是优化。
+	//
+	// 会话（activeSessions）只在 StartBotAndDetectKind 里写 —— 也就是
+	// **用户在网页上点「验证」**那条路。自动登录巡护（autoLoginLoop）从不
+	// 走那条路，所以它调过来时表里一定是空的。早先这里一 Load 不到就返回
+	// `no active verify session`，于是自动登录**每一次都失败**，日志里
+	// 只有一行「登录失败」，看起来像密码错，实际是根本没发出去。
+	var conn *websocket.Conn
+	var session *BotSession
+	if raw, ok := activeSessions.Load(botname); ok {
+		session = raw.(*BotSession)
+		conn = session.Conn()
+	} else {
+		var derr error
+		conn, _, derr = jsDialer.Dial(getJSNodeURL("/ws/api/events"), nil)
+		if derr != nil {
+			return "", fmt.Errorf("events dial: %w", derr)
+		}
+		defer conn.Close()
+		// 只订阅这一个机器人 —— 自动登录只关心它的回复。
+		sub, _ := json.Marshal(map[string]interface{}{"username": botname})
+		if werr := conn.WriteMessage(websocket.TextMessage, sub); werr != nil {
+			return "", fmt.Errorf("events subscribe: %w", werr)
+		}
 	}
-	session := raw.(*BotSession)
-	defer func() {
-		session.Close()
-		activeSessions.Delete(botname)
-	}()
 
 	if err := c.sendInfoOnce(botname, command); err != nil {
 		if !isBotNotRunningErr(err) {
@@ -709,15 +727,30 @@ func (c *WSClient) sendCommandAndWait(botname string, command string, timeout ti
 		if rerr != nil {
 			return "", fmt.Errorf("机器人已掉线，重新启动也失败: %w", rerr)
 		}
-		session.Replace(newConn)
+		if session != nil {
+			session.Replace(newConn)
+			conn = newConn
+		} else {
+			// 自建的那条已经认了旧连接，重开后重新订阅一条。
+			conn.Close()
+			conn, _, rerr = jsDialer.Dial(getJSNodeURL("/ws/api/events"), nil)
+			if rerr != nil {
+				return "", fmt.Errorf("events redial: %w", rerr)
+			}
+			defer conn.Close()
+			sub, _ := json.Marshal(map[string]interface{}{"username": botname})
+			if werr := conn.WriteMessage(websocket.TextMessage, sub); werr != nil {
+				return "", fmt.Errorf("events resubscribe: %w", werr)
+			}
+		}
 		if err2 := c.sendInfoOnce(botname, command); err2 != nil {
 			return "", err2
 		}
 	}
 
-	session.Conn().SetReadDeadline(time.Now().Add(timeout))
+	conn.SetReadDeadline(time.Now().Add(timeout))
 	for {
-		_, msg, err := session.Conn().ReadMessage()
+		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			return "", fmt.Errorf("event read: %w", err)
 		}
