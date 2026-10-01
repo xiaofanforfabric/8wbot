@@ -157,13 +157,44 @@ impl Manager {
                         // 报 ready 之后才开始跑 —— 顺序反过来的话，start()
                         // 可能在连接已经开始建立之后才返回。
                         let _ = ready_tx.send(());
+                        // ★ 这里不能只等两个 future 自然结束。
+                        //
+                        // 「连不上」那条路上它们**都不会**结束：
+                        //
+                        //   · `conn` —— Azalea 的 `ClientBuilder::start()` 内部
+                        //     是 swarm，要等**所有** bot 退出才返回；连不上的那
+                        //     个 bot 仍留在 swarm 里，于是 `start()` 一直挂着。
+                        //     实测日志里有「连接失败: Connection refused」，
+                        //     却从来没有「连接结束」（那行在 `run` 返回之后）。
+                        //
+                        //   · `cmds` —— `command_loop` 等的是 `commands_rx`，
+                        //     而 `commands_tx` 在 `BotSlot` 里；`BotSlot` 由
+                        //     `reap` 从表里移除，而 `reap` 在**线程退出时**才跑。
+                        //
+                        // 两者互等就是死锁：线程永不退出，它那套 runtime
+                        // （eventpoll + eventfd + socket）也永不释放。用户看到的
+                        //
+                        //     WARN 无法建立 runtime: Too many open files (os error 24)
+                        //
+                        // 就是这么攒出来的 —— 每轮「启动失败」泄漏 3 个 fd，
+                        // Go 的自动重连每 60 秒来一次，很快就到上限。
+                        //
+                        // 所以加第三条退出路径：**连接已经掉了就收工**。
+                        //
+                        // 宽限期是必要的：`alive` 在 `Event::Login` 之前一直是
+                        // false，而建连要几百毫秒。不等就直接判死会把正常的
+                        // 连接过程掐断。
                         tokio::select! {
                             _ = conn => {}
                             _ = cmds => {}
+                            _ = wait_until_down(&thread_bot) => {
+                                tracing::info!(bot = %thread_name, "连接已掉线，收工");
+                            }
                         }
                     });
                 }));
                 // 正常结束和 panic 都走到这里（guard 的 Drop 负责 reap）。
+                tracing::info!(bot = %name, "机器人线程即将退出");
                 drop(guard);
             })
             .expect("无法建立机器人线程");
@@ -275,6 +306,49 @@ impl Manager {
 ///
 /// 通道关闭（`/stopbot` 或关停）就返回，从而结束 `block_on`，让连接任务被
 /// drop 掉。
+/// 等到「连接建立过、又断掉了」。
+///
+/// 分两段，因为 `alive` 的生命周期是：
+///
+/// ```text
+///   启动 ──── false ────[Login]──── true ────[断开]──── false ──── 一直 false
+/// ```
+///
+/// 如果只等「`alive` 是 false 就返回」，那启动那一瞬间（还没 Login）就会
+/// 立刻返回，把正常连接掐断。所以要先等它变 true，再等它变回 false。
+///
+/// 两个超时都是**兜底**，不是正常路径：
+///   · `UP_TIMEOUT` —— 一直连不上（DNS 失败、服务器关机）时不会走 Login，
+///     总不能永远等下去。
+///   · `DOWN_TIMEOUT` —— 连上之后一直不掉线，那是正常工作状态；这个分支
+///     本来就不该触发，给个足够长的上界只是为了不让 future 永远挂着。
+async fn wait_until_down(bot: &Arc<Bot>) {
+    use std::time::Duration;
+
+    const UP_TIMEOUT: Duration = Duration::from_secs(30);
+    const DOWN_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+    const POLL: Duration = Duration::from_millis(200);
+
+    if !wait_for(bot, true, UP_TIMEOUT, POLL).await {
+        return;
+    }
+    let _ = wait_for(bot, false, DOWN_TIMEOUT, POLL).await;
+}
+
+/// 轮询等 `bot.is_alive()` 变成 `want`。返回是否等到了（false = 超时）。
+async fn wait_for(bot: &Arc<Bot>, want: bool, timeout: std::time::Duration, poll: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if bot.is_alive() == want {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
 async fn command_loop(bot: Arc<Bot>, mut rx: mpsc::UnboundedReceiver<BotCommand>) {
     while let Some(cmd) = rx.recv().await {
         match cmd {

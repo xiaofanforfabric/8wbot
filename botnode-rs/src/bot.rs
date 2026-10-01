@@ -186,6 +186,42 @@ impl Bot {
         self.client.read().clone()
     }
 
+    /// 断开连接时把缓存的 `Client` 放掉。
+    ///
+    /// ## 为什么必须放
+    ///
+    /// `Bot` 和 Azalea 的 ECS 之间有一个**循环引用**：
+    ///
+    /// ```text
+    ///   Bot.client : RwLock<Option<Client>>  ─────┐
+    ///                                             │ Arc<ClientInner>（含 socket、任务）
+    ///   ECS 里的 HandlerState { Arc<Bot> }   ←────┘
+    /// ```
+    ///
+    /// `HandlerState` 是 `set_state` 交给 Azalea 的，它存在 ECS world 里、
+    /// 持有 `Arc<Bot>`；而 `Bot` 又攥着 `Client`。两边互保，谁都不会 drop ——
+    /// 连接早就断了，`ClientInner` 里的 fd 却一直挂着。
+    ///
+    /// 实测：每启停一次泄漏 2 个 fd（`anon_inode` + `socket`），线性增长，
+    /// 累积到上限就是用户看到的
+    /// `无法建立 runtime: Too many open files (os error 24)` ——
+    /// 因为新建 runtime 本身要 eventpoll + eventfd，而那时已经一个都开不出来。
+    ///
+    /// ## 为什么清这里就能断环
+    ///
+    /// ECS world 随 `ClientInner` 一起活。`Bot.client` 一旦置 `None`，
+    /// `ClientInner` 的强引用计数只剩 ECS 内部那一份；连接任务结束时
+    /// 任务本身被 drop，它持有的 world 也跟着走，于是
+    /// `HandlerState` → `Arc<Bot>` 一起释放。环断在 `Bot.client` 这一侧。
+    ///
+    /// 反过来（指望 Azalea 先释放 ECS）不行：那是 `builder.start()` 内部的
+    /// 生命周期，我们够不着。
+    fn release_client(&self) {
+        if self.client.write().take().is_some() {
+            tracing::debug!(bot = %self.username, "已释放 Client 引用");
+        }
+    }
+
     fn emit(&self, data: EventData) {
         // 没有订阅者时 `send` 返回 Err，这是正常情况而不是故障：机器人可能
         // 先于任何控制台连接启动。丢掉即可。
@@ -447,26 +483,40 @@ impl Bot {
             format!("前往区块 ({chunk_x}, {chunk_z})，距离 {distance:.0} 格"),
         );
 
-        // 用剥掉挖矿的配置寻路。
+        // 寻路配置。
         //
         // Azalea 的 goto 是 Baritone 那套 A* 的完整移植，本身没问题；
-        // 问题在**默认配置**：`PathfinderOpts::new()` 是 `allow_mining(true)`
-        // 加 `moves::default_move`（basic + parkour + uncommon）。
+        // 问题在**默认配置**：`PathfinderOpts::new()` 用
+        // `successors_fn: moves::default_move`，也就是 basic + parkour +
+        // uncommon。
         //
-        // 允许挖矿带来的正是用户报的那串毛病：
-        //   - 水在寻路眼里只是「成本有限的方块」，挖穿比绕路便宜 →
-        //     挖水 → 走到水上 → 冰霜行者冻出霜冰 → 又觉得冰挡路挖掉 →
-        //     底下又是水。死循环，永远不会前进。
-        //   - 冰霜行者是**故意**穿的，本来该靠它跨海，挖矿把这套玩法拆了。
+        // 我只换掉 `successors_fn`，**不动 `allow_mining`**（保持默认的 true）。
         //
-        // `allow_mining(false)` 直接把这个洞从源头堵上 —— 比在执行阶段
-        // 拦 `Mining` 组件干净得多（那个插件现在只是兜底）。
+        // ── 为什么不禁挖矿 ──
         //
-        // `successors_fn` 换成 `basic_move`：默认的 `default_move` 还含
-        // parkour。机器人跑在用户那座天空岛上，四周是虚空，跑酷跳失败
-        // 就是掉下去 —— 收益极小而代价是一条命。
+        // 我一度在这里写了 `.allow_mining(false)`，理由是「从源头堵住挖冰」。
+        // 那是错的，而且代价很大：`allow_mining(false)` 把 `MiningCache`
+        // 的 `has_pickaxe` 置成 false，于是**所有**方块的 `cost_for_breaking`
+        // 都变成 `INFINITY`。而 `basic.rs::ascend_move` 第一件事就是
+        //
+        //     let break_cost_1 = cost_for_breaking_block(pos.up(2), cache);
+        //     if break_cost_1 == f32::INFINITY { return; }
+        //
+        // —— 头顶只要有任何方块就直接放弃，**连跳都不跳**。于是机器人
+        // 面对比海面高一格的岸时，既不上也不挖，就站在岸边不动。用户报的
+        // 「他就站在岸边，不上去，也不挖方块」就是这个。
+        //
+        // 挖冰那件事已经在 `cancel_ice_mining` 里按方块类型精确拦住了
+        // （只拦 Ice / PackedIce / FrostedIce / BlueIce），不需要把整个挖矿
+        // 能力一起关掉。那个插件比这个开关干净得多，因为它区分「挖什么」。
+        //
+        // ── 为什么换 successors_fn ──
+        //
+        // 默认的 `default_move` 含 `parkour`。机器人跑在用户那座天空岛上，
+        // 四周是虚空，跑酷跳失败就是掉下去 —— 收益极小而代价是一条命。
+        // `basic_move` 保留了 forward / ascend / descend / diagonal，
+        // 正是走路和上下坡需要的全部。
         let opts = PathfinderOpts::new()
-            .allow_mining(false)
             .successors_fn(moves::basic::basic_move);
         client.start_goto_with_opts(
             XZGoal {
@@ -858,6 +908,15 @@ pub async fn run(bot: Arc<Bot>, address: String) -> anyhow::Result<()> {
 
     let exit = builder.start(account, address.as_str()).await;
     bot.alive.store(false, Ordering::Relaxed);
+    // 兜底再清一次。
+    //
+    // 上面的 `Event::Disconnect` 分支已经清过一次，但那个事件**不保证会到** ——
+    // 建连失败、握手被拒、任务被 drop 这些路径都不会派发它。漏掉一次就是
+    // 一次 fd 泄漏，而这里的代价只是一次写锁。
+    //
+    // 放在 `start()` 返回之后还有个好处：这时连接任务已经结束了，
+    // `HandlerState` 那边的强引用也已经松开，清掉就能真的收回。
+    bot.release_client();
     bot.log("info", format!("连接结束: {exit:?}"));
     Ok(())
 }
@@ -930,11 +989,13 @@ async fn handle(
             let why = describe_reason(&reason);
             bot.log("warn", format!("断开连接: {why}"));
             bot.alive.store(false, Ordering::Relaxed);
+            bot.release_client();
             bot.push_offline(&describe_reason(&reason));
         }
         Event::ConnectionFailed(e) => {
             bot.log("error", format!("连接失败: {e}"));
             bot.alive.store(false, Ordering::Relaxed);
+            bot.release_client();
             bot.push_offline(&e.to_string());
         }
         Event::Tick => {
