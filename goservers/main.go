@@ -101,11 +101,11 @@ type UserData struct {
 	// 正常用户在 FanVerify 那边是 1 或 2，0 只会由人工改库产生。
 	FanLevel int64 `json:"fan_level"`
 	// Level 给前端展示用，取自同一份数据，不单独落库
-	Level                        int64  `json:"level"`
-	Tag                          string `json:"tag"`
-	LastLoginTime                string `json:"last_login_time"`
-	Status                       string `json:"status"`      // "ok" or "ban"
-	StatusInfo                   string `json:"status_info"` // reason
+	Level         int64  `json:"level"`
+	Tag           string `json:"tag"`
+	LastLoginTime string `json:"last_login_time"`
+	Status        string `json:"status"`      // "ok" or "ban"
+	StatusInfo    string `json:"status_info"` // reason
 }
 
 // BotData represents a Minecraft bot bound to a user.
@@ -122,6 +122,49 @@ type BotData struct {
 	LastExitReason string `json:"last_exit_reason"`
 	LastExitType   string `json:"last_exit_type"`
 	LastExitTime   string `json:"last_exit_time"`
+
+	// LoginPassword 是新账号（无简幻通绑定）注册本地账号时用的密码，
+	// 用来自动登录。**永远不要**序列化给前端 —— 所以标了 `json:"-"`。
+	//
+	// 明文存是有意的：机器人得把原密码发给游戏服务器，单向哈希用不了。
+	LoginPassword string `json:"-"`
+
+	// AccountKind 说明这个游戏账号在老/新哪一套流程上。
+	// 空 = 未知（升级前的老数据），'bound' = 绑过简幻通，'local' = 本地注册。
+	AccountKind string `json:"account_kind"`
+}
+
+// 账号类型。存进 bots.account_kind。
+const (
+	// AccountKindUnknown 是升级前的老数据：不知道它绑没绑简幻通。
+	AccountKindUnknown = ""
+	// AccountKindBound 是老账号 —— 绑过简幻通，可以用验证码验证。
+	AccountKindBound = "bound"
+	// AccountKindLocal 是新账号 —— 没绑过，只能 /reg 注册本地账号。
+	AccountKindLocal = "local"
+)
+
+// setBotAccount 记住一个机器人的账号类型和（本地账号的）登录密码。
+//
+// 只更新非空的部分：验证流程分两步走（先认类型、再注册），中间那次调用
+// 不该把上一次存好的密码抹掉。
+func setBotAccount(db *sql.DB, username, kind, password string) error {
+	if kind == "" && password == "" {
+		return nil
+	}
+	sets := []string{}
+	args := []interface{}{}
+	if kind != "" {
+		sets = append(sets, "account_kind = ?")
+		args = append(args, kind)
+	}
+	if password != "" {
+		sets = append(sets, "login_password = ?")
+		args = append(args, password)
+	}
+	args = append(args, username)
+	_, err := db.Exec("UPDATE bots SET "+strings.Join(sets, ", ")+" WHERE username = ?", args...)
+	return err
 }
 
 // saveBotExitReason 把上次退出原因写回 bots 表
@@ -472,6 +515,9 @@ func main() {
 	// 「有人开着控制台页面」时才有效：控制台一关，连接断开、协程退出，
 	// 机器人掉线后再也没有人管它 —— 而「自动重连」本来应该是常驻能力。
 	go autoReconnectLoop(db, envVars["AUTO_RECONNECT_INTERVAL"])
+	// 自动登录：把「进程在、但卡在验证界面」的机器人送进游戏。
+	// 和上面的重连巡护分开跑 —— 拉进程和过验证是两种失败、两套退避。
+	go autoLoginLoop(db, envVars["AUTO_LOGIN_INTERVAL"])
 
 	// 常驻订阅 JS 节点的全局事件流，把位置/维度/服务器/邦国信息落库并
 	// 推给浏览器。前端只开一条 /ws/api/stream，切页面不断开。
@@ -851,7 +897,7 @@ func main() {
 			log.Printf("[OTP] fanverify raw response (http %d): %s", otpResp.StatusCode, string(otpBody))
 
 			var otpData struct {
-				Success bool `json:"success"`
+				Success bool   `json:"success"`
 				Error   string `json:"error"`
 				Data    struct {
 					Otp string `json:"otp"`
@@ -1325,12 +1371,12 @@ func main() {
 		}
 
 		type botItem struct {
-			BotName        string `json:"bot_name"`
+			BotName       string `json:"bot_name"`
 			CreateTime    string `json:"create_time"`
-			DSL            bool   `json:"DSL"`
-			Status         string `json:"status"`
-			AutoRestore    bool   `json:"auto_restore"`
-			AutoReconnect  bool   `json:"auto_reconnect"`
+			DSL           bool   `json:"DSL"`
+			Status        string `json:"status"`
+			AutoRestore   bool   `json:"auto_restore"`
+			AutoReconnect bool   `json:"auto_reconnect"`
 			// 实时状态缓存（位置/维度/所在服务器/邦国信息）
 			StatusJSON     string `json:"status_json"`
 			StatusTime     string `json:"status_time"`
@@ -1534,19 +1580,179 @@ func main() {
 			return
 		}
 
-		// Start bot via WS and monitor events
+		// 启动机器人，读它的欢迎语 —— 由此判断这是老账号还是新账号。
+		//
+		// 两条路的差别（服务器实际给的提示语）：
+		//
+		//   老账号：欢迎回来！您绑定的简幻通UID是: 102448
+		//           直接输入 6 位验证码，或使用 /login <密码> 完成验证
+		//
+		//   新账号：欢迎来到服务器！
+		//           绑定简幻通账号: /auth <简幻通UID> <验证码>
+		//           注册本地账号: /reg <密码> <重复密码>
+		//
+		// 新账号**没有** uid 那句，所以原来「读 uid → 发验证码」这条路
+		// 走不通，必须改走 /reg。
 		client := InitWSClient()
-		chat, uid, err := client.StartBotAndDetect(req.BotName, 120*time.Second)
+		chat, uid, kind, err := client.StartBotAndDetectKind(req.BotName, 120*time.Second)
 		if err != nil {
 			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "启动或监控失败: " + err.Error()})
 			return
 		}
 
+		if kind == AccountNew {
+			// 新账号：告诉前端「这个号还没注册，需要用户给个密码」。
+			//
+			// 这里**不**顺手注册 —— 密码得用户自己定。前端拿到 needs_register
+			// 就弹密码框，然后调 /api/registerbot 走第二步。
+			//
+			// 不自动生成随机密码的理由：那个密码是用户以后在游戏里登录
+			// 自己账号用的，他必须知道。替他瞎编一个等于把这个游戏账号
+			// 锁在一个谁也记不住的字符串上。
+			_ = setBotAccount(globalDB, req.BotName, AccountKindLocal, "")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"code":            "200",
+				"needs_register":  true,
+				"bot_simpass_uid": "",
+				"server":          "auth",
+				"chat":            chat,
+				"message":         "这是一个新账号（还没有绑定简幻通）。请设置一个密码，我们会用它把机器人的游戏账号注册成本地账号，以后也会用它自动登录。",
+			})
+			return
+		}
+
+		_ = setBotAccount(globalDB, req.BotName, AccountKindBound, "")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"code":            "200",
+			"needs_register":  false,
 			"bot_simpass_uid": uid,
 			"server":          "auth",
 			"chat":            chat,
+		})
+	})
+
+	// --- POST /api/registerbot : 新账号注册本地账号 ---
+	//
+	// 新账号（没绑简幻通）没法走验证码那条路，只能让机器人自己 /reg。
+	// 密码由用户在网页上填 —— 注册成功即归属确认，因为这个密码只有用户知道，
+	// 而且它以后就是这台机器人自动登录的凭据。
+	mux.HandleFunc("/api/registerbot", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 405, "msg": "method not allowed"})
+			return
+		}
+
+		var req struct {
+			AccessToken string `json:"access_token"`
+			BotName     string `json:"bot_name"`
+			Password    string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "invalid json"})
+			return
+		}
+		req.AccessToken = extractAccessToken(r, req.AccessToken)
+		if req.AccessToken == "" || req.BotName == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "msg": "access_token and bot_name required"})
+			return
+		}
+
+		// 密码校验放前面，省得白启一次机器人。
+		//
+		// 下限取 6：服务器插件自己的要求通常就是长度，太短的会直接被拒。
+		// 这里先拦一道是为了给用户一句人话，而不是让他等 120 秒再看到
+		// 一句「注册失败」。
+		if len([]rune(req.Password)) < 6 {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "message": "密码至少 6 个字符"})
+			return
+		}
+
+		token, err := jwt.Parse(req.AccessToken, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+		claims, _ := token.Claims.(jwt.MapClaims)
+		jhtUID, _ := claims["jht_uid"].(string)
+		if jhtUID == "" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 401, "message": "无效的access_token"})
+			return
+		}
+
+		// 和 verifycode 一样要校验归属：验证可能持续上百秒，期间机器人
+		// 可能被他人重新认领。不校验的话 A 提交的密码会替 B 坐实归属。
+		vbot, verr := findBotByUsername(globalDB, req.BotName)
+		if verr != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "message": "db error"})
+			return
+		}
+		if vbot == nil || !canControlBot(jhtUID, vbot) {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 403, "message": "此机器人已不属于你（可能已被其他用户重新认领），请回到列表重新确认归属"})
+			return
+		}
+
+		// 密码是敏感信息，不要打进日志。
+		client := InitWSClient()
+		chat, err := client.SendRegAndDetect(req.BotName, req.Password, 120*time.Second)
+		if err != nil {
+			errMsg := err.Error()
+			if errMsg == "reg_failed" {
+				if stopErr := client.StopBot(req.BotName); stopErr != nil {
+					log.Printf("[WS] stopbot error: %v", stopErr)
+				}
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "message": "注册失败：" + chat})
+				return
+			}
+			if errMsg == "bad_password" {
+				if stopErr := client.StopBot(req.BotName); stopErr != nil {
+					log.Printf("[WS] stopbot error: %v", stopErr)
+				}
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": 400, "message": "服务器不接受这个密码：" + chat})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 502, "message": "注册失败: " + errMsg})
+			return
+		}
+
+		// 注册成功 → 存密码 + 标 confirmed。
+		//
+		// 先存密码再改状态：反过来的话，如果存密码失败，这台机器人会带着
+		// confirmed 却没有密码 —— 下次掉线就再也自动登录不了，而用户以为
+		// 已经配置好了。
+		if perr := setBotAccount(globalDB, req.BotName, AccountKindLocal, req.Password); perr != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "message": "注册成功但保存密码失败: " + perr.Error()})
+			return
+		}
+
+		// 带 belong 条件写入，并检查是否真的改中（同 verifycode）。
+		affected, uerr := updateBotStatus(globalDB, req.BotName, jhtUID, "confirmed")
+		if uerr != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "message": "注册成功但保存状态失败: " + uerr.Error()})
+			return
+		}
+		if affected == 0 {
+			log.Printf("[register] %s 注册成功，但归属已变更，未标记 confirmed", req.BotName)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"code":    409,
+				"message": "游戏内注册已成功，但此机器人刚刚被其他用户重新认领，归属已变更。请回到列表确认当前归属后重新操作。",
+				"chat":    chat,
+			})
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"code":    "200",
+			"message": "注册成功，机器人已确认归属",
+			"chat":    chat,
 		})
 	})
 
@@ -2900,6 +3106,20 @@ func migrate(db *sql.DB) error {
 	db.Exec("ALTER TABLE bots ADD COLUMN last_exit_reason TEXT DEFAULT ''")
 	db.Exec("ALTER TABLE bots ADD COLUMN last_exit_type TEXT DEFAULT ''")
 	db.Exec("ALTER TABLE bots ADD COLUMN last_exit_time TEXT DEFAULT ''")
+	// login_password: 新账号（无简幻通绑定）注册本地账号时用的密码。
+	//
+	// 存下来是为了**自动登录** —— 服务器每次都要机器人重新验证，
+	// 有密码才能一连上就自己 /login，用户不用守着。
+	//
+	// 明文存是有意的取舍：机器人必须能把原密码发给服务器，任何单向哈希
+	// 都用不了。这个库本来就只跑在服务端、且已经存着 JWT 和接口密钥，
+	// 再加一层「解密时又要一把钥匙」的加密，边际收益抵不上复杂度。
+	db.Exec("ALTER TABLE bots ADD COLUMN login_password TEXT DEFAULT ''")
+	// account_kind: 这个游戏账号是老账号（绑过简幻通）还是新账号（本地注册）。
+	//
+	// 'bound' / 'local' / ''（未知，老数据）。
+	// 分出来才知道该用 /login 自动登录，还是得先引导用户走 /reg。
+	db.Exec("ALTER TABLE bots ADD COLUMN account_kind TEXT DEFAULT ''")
 	return nil
 }
 
@@ -2977,6 +3197,138 @@ func autoReconnectLoop(db *sql.DB, intervalEnv string) {
 			log.Printf("[AUTO-RECONNECT] %s 已重新拉起", name)
 		}
 	}
+}
+
+// autoLoginLoop 常驻巡护：发现机器人停在「请验证」界面就替它登录。
+//
+// ## 为什么需要它
+//
+// 服务器每次连接都要求重新验证（SimpPass：120 秒内完成，否则踢出）。
+// 只把机器人「拉起来」是不够的 —— 它会卡在验证界面，什么也做不了，
+// 用户看到「在线」但其实是个僵尸。
+//
+// 老账号有两条路：让用户给 6 位验证码（要人守着），或者 /login <密码>。
+// 新账号更直接：注册时设的本地密码就是登录凭据。
+//
+// 两种账号都能用密码自动登录 —— 前提是用户给机器人设过密码
+// （新账号走 /reg 时存的，老账号可以由用户在游戏里 /login 一次之后
+// 由我们记下来）。所以这里只处理「库里存了 login_password」的机器人。
+//
+// ## 和 autoReconnectLoop 的分工
+//
+// autoReconnectLoop 负责「把进程拉起来」，这个负责「把它送进游戏」。
+// 合并成一个循环会让退避逻辑互相干扰：拉起是网络问题、登录是密码问题，
+// 两种失败的退避节奏完全不同。
+func autoLoginLoop(db *sql.DB, intervalEnv string) {
+	interval := 20 * time.Second
+	if v := strings.TrimSpace(intervalEnv); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 5*time.Second {
+			interval = d
+		}
+	}
+
+	// 每台机器人单独记退避，理由同 autoReconnectLoop：密码错了不该
+	// 每 20 秒猛敲一次。
+	type loginState struct {
+		lastAttempt time.Time
+		fails       int
+	}
+	states := make(map[string]*loginState)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	log.Printf("[AUTO-LOGIN] 巡护已启动，检查间隔 %s", interval)
+
+	for range ticker.C {
+		names, err := autoLoginCandidates(db)
+		if err != nil {
+			log.Printf("[AUTO-LOGIN] 查询失败: %v", err)
+			continue
+		}
+		if len(names) == 0 {
+			continue
+		}
+
+		client := InitWSClient()
+		for _, name := range names {
+			st := states[name]
+			if st == nil {
+				st = &loginState{}
+				states[name] = st
+			}
+			backoff := interval
+			for i := 0; i < st.fails && i < 4; i++ {
+				backoff *= 2
+			}
+			if !st.lastAttempt.IsZero() && time.Since(st.lastAttempt) < backoff {
+				continue
+			}
+
+			// ping 一下。进程都没起来的话，登录无从谈起 —— 那是
+			// autoReconnectLoop 的活。
+			online, err := client.GetBotStatus(name)
+			if err != nil || !online {
+				continue
+			}
+
+			pw, err := botLoginPassword(db, name)
+			if err != nil || pw == "" {
+				continue
+			}
+
+			st.lastAttempt = time.Now()
+			// 密码不进日志。
+			log.Printf("[AUTO-LOGIN] %s 尝试自动登录", name)
+			chat, err := client.SendLoginAndDetect(name, pw, 30*time.Second)
+			if err != nil {
+				st.fails++
+				// 失败原因里可能有服务器回复，但**不含密码**。
+				log.Printf("[AUTO-LOGIN] %s 登录失败（连续第 %d 次）: %v / %s", name, st.fails, err, chat)
+				continue
+			}
+			st.fails = 0
+			log.Printf("[AUTO-LOGIN] %s 自动登录成功", name)
+		}
+	}
+}
+
+// autoLoginCandidates 列出「该尝试自动登录」的机器人。
+//
+// 条件：
+//   - status='confirmed'：还没验证通过的机器人不该自动登录（它连密码都没有）
+//   - manual_stop=0：用户主动下线的别去碰
+//   - login_password 非空：没密码无从登起
+//
+// 刻意**不**看 auto_reconnect：那个开关管的是「进程掉了要不要拉起来」，
+// 而这里是「进程在、但卡在验证界面」。用户关掉自动重连往往只是不想让它
+// 反复重启，不代表他想每次都被那个验证界面卡住。
+func autoLoginCandidates(db *sql.DB) ([]string, error) {
+	rows, err := db.Query(
+		`SELECT username FROM bots
+		 WHERE status = 'confirmed'
+		   AND COALESCE(manual_stop, 0) = 0
+		   AND COALESCE(login_password, '') != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			continue
+		}
+		names = append(names, n)
+	}
+	return names, rows.Err()
+}
+
+// botLoginPassword 取某个机器人存的登录密码。
+func botLoginPassword(db *sql.DB, username string) (string, error) {
+	var pw string
+	err := db.QueryRow("SELECT COALESCE(login_password, '') FROM bots WHERE username = ?", username).Scan(&pw)
+	return pw, err
 }
 
 // isAdminUser 判定管理员。

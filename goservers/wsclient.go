@@ -1,8 +1,8 @@
 package main
 
 import (
-	"errors"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -201,9 +201,47 @@ func (c *WSClient) StartBotSimple(username string) error {
 }
 
 func (c *WSClient) StartBotAndDetect(username string, timeout time.Duration) (chat string, uid string, err error) {
+	chat, uid, _, err = c.StartBotAndDetectKind(username, timeout)
+	return
+}
+
+// AccountKind 说明这台机器人对应的账号在游戏服务器那边是什么状态。
+//
+// 服务器对两种账号给出的欢迎语完全不同，而机器人能不能自己完成验证，
+// 取决于分得清这两种：
+//
+//	老账号（已绑简幻通）：
+//	    欢迎回来！您绑定的简幻通UID是: 102448
+//	    直接输入 6 位验证码，或使用 /login <密码> 完成验证
+//
+//	新账号（没有简幻通绑定）：
+//	    欢迎来到服务器！
+//	    请选择一种方式完成身份验证：
+//	    绑定简幻通账号: /auth <简幻通UID> <验证码>
+//	    注册本地账号: /reg <密码> <重复密码>
+type AccountKind int
+
+const (
+	// AccountUnknown 表示超时了，没读到任何一句能认出来的欢迎语。
+	AccountUnknown AccountKind = iota
+	// AccountBound 是老账号：绑过简幻通，有 uid。
+	AccountBound
+	// AccountNew 是新账号：没绑过，只能用 /reg 注册本地账号
+	// （或去 /auth 绑一个简幻通 —— 但那要用户自己的简幻通验证码，
+	// 机器人拿不到，所以归属验证这一侧只能走 /reg）。
+	AccountNew
+)
+
+// StartBotAndDetectKind 和 StartBotAndDetect 一样，但额外告诉调用方
+// 这是新账号还是老账号。
+//
+// 必须分出来的原因：老账号的欢迎语里有「您绑定的简幻通UID是」，
+// 新账号**永远不会有这句**。旧代码只认那一句，于是新账号会把 120 秒
+// 超时耗满，用户看到的是「启动或监控失败」，完全不知道该怎么办。
+func (c *WSClient) StartBotAndDetectKind(username string, timeout time.Duration) (chat string, uid string, kind AccountKind, err error) {
 	conn, err := c.startBotReplacingStale(username)
 	if err != nil {
-		return "", "", err
+		return "", "", AccountUnknown, err
 	}
 	stopPoller := wsPoller(conn)
 	defer stopPoller()
@@ -216,7 +254,7 @@ func (c *WSClient) StartBotAndDetect(username string, timeout time.Duration) (ch
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			conn.Close()
-			return "", "", fmt.Errorf("event read: %w", err)
+			return "", "", AccountUnknown, fmt.Errorf("event read: %w", err)
 		}
 		// Parse event array: [{ botname, data: [{ chat }] }]
 		var events []struct {
@@ -233,7 +271,7 @@ func (c *WSClient) StartBotAndDetect(username string, timeout time.Duration) (ch
 			for _, d := range ev.Data {
 				log.Printf("[WS] event from %s: %s", ev.BotName, d.Chat)
 
-				// Found the welcome message with UID
+				// 老账号：绑过简幻通，欢迎语里带 uid。
 				if strings.Contains(d.Chat, "您绑定的简幻通UID是") {
 					conn.SetReadDeadline(time.Time{})
 					session := &BotSession{conn: conn, botName: username}
@@ -243,7 +281,22 @@ func (c *WSClient) StartBotAndDetect(username string, timeout time.Duration) (ch
 						uid = username
 					}
 					log.Printf("[WS] verify session created for %s: %s", username, d.Chat)
-					return d.Chat, uid, nil
+					return d.Chat, uid, AccountBound, nil
+				}
+
+				// 新账号：没绑简幻通，服务器只给出「/reg 注册」这条路。
+				//
+				// 认这一句而不是认「欢迎来到服务器」：后者在别的场合也可能出现
+				// （比如管理员广播），而「注册本地账号」是简幻通验证插件
+				// 专给新账号的提示，不会误判。
+				if strings.Contains(d.Chat, "注册本地账号") {
+					conn.SetReadDeadline(time.Time{})
+					session := &BotSession{conn: conn, botName: username}
+					activeSessions.Store(username, session)
+					log.Printf("[WS] 新账号 verify session created for %s: %s", username, d.Chat)
+					// 新账号没有 uid —— 用机器人用户名当标识。后续 /reg 走的是
+					// 本地密码，本来就不需要简幻通 uid。
+					return d.Chat, username, AccountNew, nil
 				}
 			}
 		}
@@ -300,7 +353,7 @@ func (c *WSClient) StopBot(username string) error {
 
 // BotStatusInfo 是 JS 节点 /ws/api/botstatus 返回的状态信息
 type BotStatusInfo struct {
-	Online        bool
+	Online         bool
 	LastExitReason string
 	LastExitType   string
 	LastExitTime   string
@@ -547,6 +600,140 @@ func (c *WSClient) SendCommandAndDetect(botname string, chatText string, timeout
 				}
 				if strings.Contains(chat, "验证失败") || strings.Contains(chat, "ID或验证码错误") {
 					return chat, fmt.Errorf("verify_failed")
+				}
+			}
+		}
+	}
+}
+
+// SendRegAndDetect 让一个新账号自己 /reg 注册本地账号。
+//
+// ## 为什么新账号必须走这条路
+//
+// 游戏服务器（简幻通验证插件）对没绑过简幻通的账号给出的是：
+//
+//	注册本地账号: /reg <密码> <重复密码>
+//
+// 它**没有**「您绑定的简幻通UID是」那句，所以老那套「读 uid → 发验证码」
+// 的流程在新账号上根本无从开始 —— 旧代码只认那一句，新账号必定耗满
+// 120 秒超时，用户看到「启动或监控失败」，也不知道下一步该干嘛。
+//
+// 新账号能用的只有 /reg：机器人替用户把这个游戏账号注册成**本地账号**，
+// 密码由用户在网页上填。注册成功即「这台机器人归你」—— 因为密码只有
+// 用户知道，而且注册完就是这台机器人以后自动登录用的凭据。
+//
+// 返回注册后的聊天内容，调用方负责存密码。
+func (c *WSClient) SendRegAndDetect(botname string, password string, timeout time.Duration) (string, error) {
+	// /reg <密码> <重复密码>
+	return c.sendCommandAndWait(botname, "/reg "+password+" "+password, timeout, regOutcome)
+}
+
+// SendLoginAndDetect 让机器人用已存的密码登录（自动登录用）。
+func (c *WSClient) SendLoginAndDetect(botname string, password string, timeout time.Duration) (string, error) {
+	return c.sendCommandAndWait(botname, "/login "+password, timeout, loginOutcome)
+}
+
+// outcome 判定一次「发命令 → 等回复」是成功、失败，还是继续等。
+//
+// done=true 时 err==nil 表示成功，err!=nil 表示失败。
+type outcome func(chat string) (done bool, err error)
+
+// regOutcome 判定 /reg 的结果。
+//
+// 关键词取自服务器实际回复，不是猜的：
+//   - 成功：「注册成功」「注册完成」这类；服务器还会顺带提示可以用
+//     /login 登录。
+//   - 失败：「注册失败」「密码」相关校验（长度、两次不一致）、
+//     「已被注册」等。
+func regOutcome(chat string) (bool, error) {
+	if strings.Contains(chat, "注册成功") || strings.Contains(chat, "注册完成") {
+		return true, nil
+	}
+	if strings.Contains(chat, "注册失败") ||
+		strings.Contains(chat, "已被注册") ||
+		strings.Contains(chat, "已注册") {
+		return true, fmt.Errorf("reg_failed")
+	}
+	// 密码不合法（太短等）—— 服务器通常说「密码长度」「密码不能」
+	if strings.Contains(chat, "密码长度") ||
+		strings.Contains(chat, "密码不能") ||
+		strings.Contains(chat, "密码不一致") {
+		return true, fmt.Errorf("bad_password")
+	}
+	return false, nil
+}
+
+// loginOutcome 判定 /login 的结果。
+//
+// 成功时服务器给的通常是「登录成功」「验证成功」；失败是「密码错误」。
+//
+// 注意「验证成功」也在这里认：老账号输 6 位验证码成功时服务器回的就是
+// 这句，而 /login 成功后有些实现也复用它。两种都算成功。
+func loginOutcome(chat string) (bool, error) {
+	if strings.Contains(chat, "登录成功") ||
+		strings.Contains(chat, "验证成功") ||
+		strings.Contains(chat, "登录完成") {
+		return true, nil
+	}
+	if strings.Contains(chat, "密码错误") ||
+		strings.Contains(chat, "登录失败") ||
+		strings.Contains(chat, "验证失败") {
+		return true, fmt.Errorf("login_failed")
+	}
+	return false, nil
+}
+
+// sendCommandAndWait 把命令投给机器人，然后从它那条事件连接上等判定结果。
+//
+// 和 SendCommandAndDetect 的区别是判定逻辑可换（`judge`），因为 /reg
+// 和 /login 的成功回复跟「输验证码」不是同一套措辞。
+func (c *WSClient) sendCommandAndWait(botname string, command string, timeout time.Duration, judge outcome) (string, error) {
+	raw, ok := activeSessions.Load(botname)
+	if !ok {
+		return "", fmt.Errorf("no active verify session for %s, start verify first", botname)
+	}
+	session := raw.(*BotSession)
+	defer func() {
+		session.Close()
+		activeSessions.Delete(botname)
+	}()
+
+	if err := c.sendInfoOnce(botname, command); err != nil {
+		if !isBotNotRunningErr(err) {
+			return "", err
+		}
+		// 掉线了就就地重拉 —— 和 SendCommandAndDetect 同样的兜底理由：
+		// 未验证的机器人「上线」按钮是禁用的，不自动救一下用户就卡死了。
+		log.Printf("[WS] %s 已掉线，重新启动后再发送命令（原错误: %v）", botname, err)
+		newConn, rerr := c.restartBotForVerify(botname)
+		if rerr != nil {
+			return "", fmt.Errorf("机器人已掉线，重新启动也失败: %w", rerr)
+		}
+		session.Replace(newConn)
+		if err2 := c.sendInfoOnce(botname, command); err2 != nil {
+			return "", err2
+		}
+	}
+
+	session.Conn().SetReadDeadline(time.Now().Add(timeout))
+	for {
+		_, msg, err := session.Conn().ReadMessage()
+		if err != nil {
+			return "", fmt.Errorf("event read: %w", err)
+		}
+		var events []struct {
+			BotName string `json:"botname"`
+			Data    []struct {
+				Chat string `json:"chat"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(msg, &events); err != nil {
+			continue
+		}
+		for _, ev := range events {
+			for _, d := range ev.Data {
+				if done, jerr := judge(d.Chat); done {
+					return d.Chat, jerr
 				}
 			}
 		}
